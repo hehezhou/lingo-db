@@ -45,6 +45,12 @@ target_link_libraries(sql-to-mlir PUBLIC ${LIBS} MLIRSQLFrontend ${COMMON_LIBS} 
 set_target_properties(sql-to-mlir PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 target_compile_definitions(sql-to-mlir PRIVATE ${COMPILE_DEFS})
 
+# subop-print-steps
+add_executable(subop-print-steps subop-print-steps.cpp)
+target_link_libraries(subop-print-steps PUBLIC ${LIBS} ${COMMON_LIBS})
+set_target_properties(subop-print-steps PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+target_compile_definitions(subop-print-steps PRIVATE ${COMPILE_DEFS})
+
 # run-mlir
 add_executable(run-mlir run-mlir.cpp)
 target_link_libraries(run-mlir PUBLIC ${COMMON_LIBS})
