@@ -366,17 +366,6 @@ static uint64_t hashCombineU64(uint64_t a, uint64_t b) {
    return static_cast<uint64_t>(llvm::hash_combine(a, b));
 }
 
-static uint64_t hashAttr(mlir::Attribute a) {
-   if (!a) return 0;
-   // mlir::hash_value(Attribute) is pointer-like and not stable across MLIRContexts.
-   // Use a printed form (with some normalization handled separately) for cross-module matching.
-   std::string s;
-   llvm::raw_string_ostream ss(s);
-   a.print(ss);
-   ss.flush();
-   return static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(s)));
-}
-
 static uint64_t hashType(mlir::Type t) {
    if (!t) return 0;
    // mlir::hash_value(Type) is pointer-like and not stable across MLIRContexts.
@@ -624,6 +613,25 @@ std::string normalizedSubopStateTypeFingerprint(subop::MemberManager& mm, mlir::
    if (auto st = mlir::dyn_cast<subop::SimpleStateType>(t)) {
       return std::string("simple_state{members=") + fingerprintSortedMemberPairs(mm, st.getValueMembers().getMembers()) + "}";
    }
+   if (auto hm = mlir::dyn_cast<subop::HashMapType>(t)) {
+      // Hash tables: normalize by key/value member *types* + lock flag.
+      // Member names are compiler-generated and unstable across MLIRContexts.
+      return std::string("hashmap{key_types=") + fingerprintMemberTypesMultiset(mm, hm.getKeyMembers().getMembers()) +
+             ",val_types=" + fingerprintMemberTypesMultiset(mm, hm.getValueMembers().getMembers()) +
+             ",lock=" + (hm.getWithLock() ? "1" : "0") + "}";
+   }
+   if (auto ht = mlir::dyn_cast<subop::PreAggrHtType>(t)) {
+      // Aggregate hash table: normalize by key/value member *types* + lock flag.
+      return std::string("optimistic_ht{key_types=") + fingerprintMemberTypesMultiset(mm, ht.getKeyMembers().getMembers()) +
+             ",val_types=" + fingerprintMemberTypesMultiset(mm, ht.getValueMembers().getMembers()) +
+             ",lock=" + (ht.getWithLock() ? "1" : "0") + "}";
+   }
+   if (auto frag = mlir::dyn_cast<subop::PreAggrHtFragmentType>(t)) {
+      // Aggregate table fragment: same normalization as the global table.
+      return std::string("optimistic_ht_fragment{key_types=") + fingerprintMemberTypesMultiset(mm, frag.getKeyMembers().getMembers()) +
+             ",val_types=" + fingerprintMemberTypesMultiset(mm, frag.getValueMembers().getMembers()) +
+             ",lock=" + (frag.getWithLock() ? "1" : "0") + "}";
+   }
    if (auto tbl = mlir::dyn_cast<subop::TableType>(t)) {
       return std::string("table{members=") + fingerprintSortedMemberPairs(mm, tbl.getMembers().getMembers()) +
              ",filtered=" + (tbl.getFiltered() ? "1" : "0") + "}";
@@ -631,7 +639,29 @@ std::string normalizedSubopStateTypeFingerprint(subop::MemberManager& mm, mlir::
    if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(t)) {
       return std::string("thread_local{") + normalizedSubopStateTypeFingerprint(mm, tl.getWrapped()) + "}";
    }
-   assert(0);
+   // Generic fallback for other subop state types: use the printed type form but normalize
+   // compiler-generated suffixes (e.g. "$<id>" and "_u_<id>") so that identical SQL compiled
+   // in different MLIRContexts can still match.
+   std::string s = typeFingerprint(t);
+   std::string out;
+   out.reserve(s.size());
+   for (size_t i = 0; i < s.size();) {
+      if (s[i] == '$') {
+         out.push_back('$');
+         i++;
+         while (i < s.size() && s[i] >= '0' && s[i] <= '9') i++;
+         continue;
+      }
+      if (i + 3 < s.size() && s[i] == '_' && s[i + 1] == 'u' && s[i + 2] == '_') {
+         out.append("_u_");
+         i += 3;
+         while (i < s.size() && s[i] >= '0' && s[i] <= '9') i++;
+         continue;
+      }
+      out.push_back(s[i]);
+      i++;
+   }
+   return out;
 }
 
 llvm::DenseMap<mlir::Value, std::string> buildTableDescrByTableState(mlir::ModuleOp moduleOp) {
@@ -754,6 +784,13 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
    llvm::SmallVector<StateMatchProfile, 128> profiles;
 
    for (auto s : states) {
+      // Only consider states that are constructed within this module (i.e., appear as execution_step results).
+      // External states (func arguments) and any other untracked values must never be treated as "constructed".
+      auto itCreated = createdAtByState.find(s);
+      if (itCreated == createdAtByState.end() || itCreated->second < 0) {
+         continue;
+      }
+
       // Skip thread_local states that are merged away into a global state.
       bool mergedAway = false;
       for (auto& kv : mergedFromThreadLocal) {
