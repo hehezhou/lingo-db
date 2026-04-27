@@ -21,6 +21,8 @@
 #include <cctype>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -86,71 +88,98 @@ int main(int argc, char** argv) {
    }
 
    // Usage:
-   // - subop-print-steps <db_dir> <sql_file>
-   // - subop-print-steps <db_dir> <json_file_or_dash>
-   assert(argc >= 3);
+   // - subop-print-steps <db_dir> <sql_or_json>
+   // - subop-print-steps <db_dir> <sql_file_a> <sql_file_b>
+   assert(argc == 3 || argc == 4);
    std::string dbDir = argv[1];
-   std::string input = argv[2];
 
    lingodb::compiler::support::eval::init();
    std::shared_ptr<lingodb::catalog::Catalog> catalog = lingodb::catalog::Catalog::create(dbDir, false);
 
-   auto fileOrErr = llvm::MemoryBuffer::getFileOrSTDIN(input);
-   assert(!fileOrErr.getError());
-
-   auto buf = (*fileOrErr)->getBuffer();
    llvm::SmallVector<std::string, 16> queries;
-
-   // Experimental parsing rule:
-   // - If the input starts with '{', treat it as JSON and assert it contains a "queries"/"sql" array.
-   // - Otherwise, treat it as a plain SQL string.
-   size_t off = 0;
-   while (off < buf.size() && std::isspace(static_cast<unsigned char>(buf[off]))) off++;
-   if (off < buf.size() && buf[off] == '{') {
-      auto parsed = llvm::json::parse(buf);
-      assert(parsed && "failed to parse JSON input");
-      auto* obj = parsed->getAsObject();
-      assert(obj && "JSON input must be an object");
-      const llvm::json::Array& arr = getQueriesArray(*obj);
-      for (auto& v : arr) {
-         auto s = v.getAsString();
-         assert(s && "query array entries must be strings");
-         queries.push_back(s->str());
+   if (argc == 4) {
+      for (int fi = 2; fi <= 3; fi++) {
+         auto fileOrErr = llvm::MemoryBuffer::getFile(argv[fi]);
+         assert(!fileOrErr.getError());
+         queries.push_back((*fileOrErr)->getBuffer().str());
       }
-      assert(!queries.empty() && "query array must not be empty");
    } else {
-      queries.push_back(buf.str());
+      std::string input = argv[2];
+      auto fileOrErr = llvm::MemoryBuffer::getFileOrSTDIN(input);
+      assert(!fileOrErr.getError());
+
+      auto buf = (*fileOrErr)->getBuffer();
+
+      // Experimental parsing rule:
+      // - If the input starts with '{', treat it as JSON and assert it contains a "queries"/"sql" array.
+      // - Otherwise, treat it as a plain SQL string.
+      size_t off = 0;
+      while (off < buf.size() && std::isspace(static_cast<unsigned char>(buf[off]))) off++;
+      if (off < buf.size() && buf[off] == '{') {
+         auto parsed = llvm::json::parse(buf);
+         assert(parsed && "failed to parse JSON input");
+         auto* obj = parsed->getAsObject();
+         assert(obj && "JSON input must be an object");
+         const llvm::json::Array& arr = getQueriesArray(*obj);
+         for (auto& v : arr) {
+            auto s = v.getAsString();
+            assert(s && "query array entries must be strings");
+            queries.push_back(s->str());
+         }
+         assert(!queries.empty() && "query array must not be empty");
+      } else {
+         queries.push_back(buf.str());
+      }
    }
+
+   struct QueryRun {
+      std::unique_ptr<mlir::MLIRContext> ctx;
+      std::unique_ptr<lingodb::execution::Frontend> frontend;
+      mlir::ModuleOp module;
+   };
+   std::vector<QueryRun> runs;
+   runs.reserve(queries.size());
 
    for (size_t i = 0; i < queries.size(); i++) {
       std::string sql = queries[i];
 
-      mlir::MLIRContext ctx;
-      lingodb::execution::initializeContext(ctx, /*includeLLVM*/ false);
+      QueryRun run;
+      run.ctx = std::make_unique<mlir::MLIRContext>();
+      lingodb::execution::initializeContext(*run.ctx, /*includeLLVM*/ false);
 
-      auto frontend = lingodb::execution::createSQLFrontend();
-      frontend->setCatalog(catalog.get());
-      frontend->setContext(&ctx);
-      frontend->loadFromString(sql);
+      run.frontend = lingodb::execution::createSQLFrontend();
+      run.frontend->setCatalog(catalog.get());
+      run.frontend->setContext(run.ctx.get());
+      run.frontend->loadFromString(sql);
 
-      auto& feErr = frontend->getError();
+      auto& feErr = run.frontend->getError();
       assert(!feErr);
 
-      mlir::ModuleOp* moduleOpPtr = frontend->getModule();
+      mlir::ModuleOp* moduleOpPtr = run.frontend->getModule();
       assert(moduleOpPtr);
+      run.module = *moduleOpPtr;
 
-      runPasses(*moduleOpPtr, catalog.get());
+      runPasses(run.module, catalog.get());
+      runs.push_back(std::move(run));
 
       // 1) Print SubOp layer IR (previous json-sql-to-subop output).
       llvm::outs() << "\n// ============================\n";
       llvm::outs() << "// query[" << i << "] subop layer\n";
       llvm::outs() << "// ============================\n";
-      moduleOpPtr->print(llvm::outs());
+      runs.back().module.print(llvm::outs());
       llvm::outs() << "\n";
 
       // 2) Print execution-step/state debug (previous subop-print-steps output).
-      lingodb::compiler::dialect::subop::printExecutionSteps(*moduleOpPtr, llvm::outs());
+      lingodb::compiler::dialect::subop::printExecutionSteps(runs.back().module, llvm::outs());
       llvm::outs() << "\n";
+   }
+
+   if (runs.size() >= 2) {
+      llvm::SmallVector<std::pair<int, mlir::ModuleOp>, 8> qmods;
+      for (size_t i = 0; i < runs.size(); i++) {
+         qmods.push_back({static_cast<int>(i), runs[i].module});
+      }
+      lingodb::compiler::dialect::subop::printCrossQueryStateMatches(qmods, llvm::outs());
    }
    return 0;
 }
