@@ -28,7 +28,10 @@ bool isCreateLike(mlir::Operation& op) {
    return mlir::isa<
       subop::CreateThreadLocalOp,
       subop::CreateHeapOp,
-      subop::GenericCreateOp>(op);
+      subop::GenericCreateOp,
+      subop::CreateFrom,
+      subop::CreateSimpleStateOp,
+      subop::CreateArrayOp>(op);
 }
 
 bool isStateType(mlir::Type t) {
@@ -97,7 +100,6 @@ mlir::Value canonicalizeStateValue(subop::ExecutionStepOp step, mlir::Value v) {
          return canonicalizeStateValue(step, candidate);
       }
       assert(0 && "unresolved nested-region block argument: no matching parent operand");
-      return v;
    }
    auto inputs = step.getInputs();
    auto idx = ba.getArgNumber();
@@ -346,8 +348,19 @@ std::string joinSortedStrings(llvm::ArrayRef<std::string> xs) {
 
 static std::string sanitizeBaseName(llvm::StringRef name) {
    auto dollar = name.find('$');
-   if (dollar == llvm::StringRef::npos) return name.str();
-   return name.substr(0, dollar).str();
+   llvm::StringRef base = name;
+   if (dollar != llvm::StringRef::npos) {
+      base = name.substr(0, dollar);
+   }
+   // ColumnManager / other passes may uniquify names as "<base>_u_<n>".
+   auto pos = base.rfind("_u_");
+   if (pos == llvm::StringRef::npos) return base.str();
+   llvm::StringRef tail = base.substr(pos + 3);
+   if (tail.empty()) return base.str();
+   for (char c : tail) {
+      if (c < '0' || c > '9') return base.str();
+   }
+   return base.substr(0, pos).str();
 }
 
 static std::string sanitizeScopeName(llvm::StringRef scope) {
@@ -696,14 +709,7 @@ struct StateMatchProfile {
    std::string typeFingerprintStr;
 };
 
-llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
-   int queryId,
-   mlir::ModuleOp moduleOp,
-   const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState) {
-   auto* dialect = moduleOp.getContext()->getLoadedDialect<subop::SubOperatorDialect>();
-   assert(dialect && "subop dialect must be loaded to fingerprint members");
-   subop::MemberManager& memberManager = dialect->getMemberManager();
-
+struct ModuleMatchAndReuseAnalysis {
    struct StateInfo {
       int createdAt = -1;
       llvm::SmallSet<int, 16> reads;
@@ -715,85 +721,123 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
    llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>> rwByStep;
    llvm::DenseMap<mlir::Value, int> createdAtByState;
    llvm::DenseMap<mlir::Value, mlir::Value> mergedFromThreadLocal;
+   llvm::DenseMap<mlir::Value, llvm::SmallSet<int, 16>> writesByState;
+   llvm::SmallVector<mlir::Value, 64> statesSorted;
+   ModuleReuseInfo reuse;
+};
 
-   auto recordState = [&](mlir::Value v) -> StateInfo& { return stateInfo[v]; };
+static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp moduleOp) {
+   ModuleMatchAndReuseAnalysis a;
+   auto recordState = [&](mlir::Value v) -> ModuleMatchAndReuseAnalysis::StateInfo& { return a.stateInfo[v]; };
 
    size_t idx = 0;
    moduleOp.walk([&](subop::ExecutionStepOp step) {
       int stepIdx = static_cast<int>(idx++);
-      stepByIndex[stepIdx] = step;
+      a.stepByIndex[stepIdx] = step;
 
       bool tableRef = isExternalTableRefStep(step);
       bool createOnly = isCreateOnlyExecutionStep(step);
 
+      // 1) Record creation/writes for step results (state values).
       for (auto r : step.getResults()) {
-         if (!isStateType(r.getType()) && !isThreadLocalOfStateType(r.getType())) {
-            continue;
-         }
+         if (!isStateType(r.getType()) && !isThreadLocalOfStateType(r.getType())) continue;
          auto& info = recordState(r);
-         if (info.createdAt < 0) {
-            info.createdAt = stepIdx;
-         }
-         createdAtByState[r] = info.createdAt;
-         if (!createOnly && !tableRef) {
-            info.writes.insert(stepIdx);
-         }
+         if (info.createdAt < 0) info.createdAt = stepIdx;
+         a.createdAtByState[r] = info.createdAt;
+         if (!createOnly && !tableRef) info.writes.insert(stepIdx);
       }
 
+      // 2) Analyze read/write usage inside the step body.
       auto rw = analyzeStepStateRW(step);
-      rwByStep[stepIdx] = rw;
+      a.rwByStep[stepIdx] = rw;
+
+      ModuleReuseInfo::StepRW re;
+      re.step = step;
+
       for (auto it : rw) {
          auto& info = recordState(it.first);
          if (info.createdAt < 0 && isFuncBlockArgument(it.first)) {
             info.createdAt = -2; // external (func argument)
-            createdAtByState[it.first] = info.createdAt;
+            a.createdAtByState[it.first] = info.createdAt;
          }
-         if (it.second.read) info.reads.insert(stepIdx);
-         if (it.second.write) info.writes.insert(stepIdx);
+         if (it.second.read) {
+            info.reads.insert(stepIdx);
+            re.reads.push_back(it.first);
+         }
+         if (it.second.write) {
+            info.writes.insert(stepIdx);
+            re.writes.push_back(it.first);
+            a.reuse.writerStepsByState[it.first].push_back(step);
+         }
       }
-   });
 
-   moduleOp.walk([&](subop::ExecutionStepOp step) {
+      // 3) Collect merge pairing in the same pass.
       auto& block = step.getSubOps().front();
       for (auto& op : block.without_terminator()) {
          auto merge = mlir::dyn_cast<subop::MergeOp>(op);
          if (!merge) continue;
          mlir::Value in = canonicalizeStateValueDeep(merge.getThreadLocal());
          mlir::Value out = canonicalizeStateValueDeep(merge.getResult());
-         mergedFromThreadLocal[out] = in;
+         a.mergedFromThreadLocal[out] = in;
+         a.reuse.mergedFromThreadLocal[out] = in;
       }
+
+      // 4) Register create-only steps for any canonical state key they return.
+      if (isCreateOnlyExecutionStep(step)) {
+         llvm::SmallVector<mlir::Value, 4> keys;
+         for (mlir::Value r : step.getResults()) if (r) keys.push_back(r);
+         if (auto ret = mlir::dyn_cast<subop::ExecutionStepReturnOp>(block.getTerminator())) {
+            for (mlir::Value o : ret.getOperands()) if (o) keys.push_back(o);
+         }
+         for (mlir::Value r : keys) {
+            mlir::Value key = canonicalizeStateValueDeep(r);
+            if (!a.reuse.createOnlyStepForState.contains(key)) a.reuse.createOnlyStepForState.insert({key, step});
+            if (key != r && !a.reuse.createOnlyStepForState.contains(r)) a.reuse.createOnlyStepForState.insert({r, step});
+         }
+      }
+
+      a.reuse.steps.push_back(std::move(re));
    });
 
-   llvm::DenseMap<mlir::Value, llvm::SmallSet<int, 16>> writesByState;
-   for (auto& it : stateInfo) {
-      writesByState[it.first] = it.second.writes;
+   // Materialize writesByState and a stable sorted state list for matching.
+   for (auto& it : a.stateInfo) {
+      a.writesByState[it.first] = it.second.writes;
+      a.statesSorted.push_back(it.first);
    }
-
-   llvm::SmallVector<mlir::Value, 64> states;
-   states.reserve(stateInfo.size());
-   for (auto& it : stateInfo) {
-      states.push_back(it.first);
-   }
-   llvm::sort(states, [&](mlir::Value a, mlir::Value b) {
-      int ca = stateInfo[a].createdAt;
-      int cb = stateInfo[b].createdAt;
-      if (ca != cb) return ca < cb;
-      return a.getAsOpaquePointer() < b.getAsOpaquePointer();
+   llvm::sort(a.statesSorted, [&](mlir::Value x, mlir::Value y) {
+      int cx = a.stateInfo[x].createdAt;
+      int cy = a.stateInfo[y].createdAt;
+      if (cx != cy) return cx < cy;
+      return x.getAsOpaquePointer() < y.getAsOpaquePointer();
    });
+   return a;
+}
+
+llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
+   int queryId,
+   mlir::ModuleOp moduleOp,
+   const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState) {
+   auto* dialect = moduleOp.getContext()->getLoadedDialect<subop::SubOperatorDialect>();
+   assert(dialect && "subop dialect must be loaded to fingerprint members");
+   subop::MemberManager& memberManager = dialect->getMemberManager();
+
+   auto a = analyzeModuleForMatchAndReuse(moduleOp);
 
    llvm::SmallVector<StateMatchProfile, 128> profiles;
 
-   for (auto s : states) {
+   for (auto s : a.statesSorted) {
       // Only consider states that are constructed within this module (i.e., appear as execution_step results).
       // External states (func arguments) and any other untracked values must never be treated as "constructed".
-      auto itCreated = createdAtByState.find(s);
-      if (itCreated == createdAtByState.end() || itCreated->second < 0) {
+      auto itCreated = a.createdAtByState.find(s);
+      if (itCreated == a.createdAtByState.end() || itCreated->second < 0) {
          continue;
       }
 
       // Skip thread_local states that are merged away into a global state.
+      // We treat the merge result (global state) as the reusable state; the thread_local is
+      // just an intermediate construction artifact and should not be reused/cached directly.
       bool mergedAway = false;
-      for (auto& kv : mergedFromThreadLocal) {
+      for (auto& kv : a.mergedFromThreadLocal) {
          if (kv.second == s) {
             mergedAway = true;
             break;
@@ -801,13 +845,13 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
       }
       if (mergedAway) continue;
 
-      auto stepIdxs = getConstructionStepIndicesForState(s, createdAtByState, writesByState, mergedFromThreadLocal);
+      auto stepIdxs = getConstructionStepIndicesForState(s, a.createdAtByState, a.writesByState, a.mergedFromThreadLocal);
 
       llvm::SmallVector<uint64_t, 16> stepHashes;
       stepHashes.reserve(stepIdxs.size());
       for (int si : stepIdxs) {
-         auto itS = stepByIndex.find(si);
-         assert(itS != stepByIndex.end());
+         auto itS = a.stepByIndex.find(si);
+         assert(itS != a.stepByIndex.end());
          StepDagHasher hasher;
          hasher.step = itS->second;
          hasher.tableDescrByTableState = &tableDescrByTableState;
@@ -821,7 +865,7 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
       uint64_t constructionHash = 0;
       for (auto h : stepHashes) constructionHash = hashCombineU64(constructionHash, h);
 
-      auto prereqs = getPrereqStatesForConstructionSteps(stepIdxs, s, rwByStep);
+      auto prereqs = getPrereqStatesForConstructionSteps(stepIdxs, s, a.rwByStep);
       llvm::SmallVector<std::string, 8> depTokens;
       llvm::DenseMap<mlir::Value, llvm::SmallVector<std::string, 8>> depMemo;
       llvm::DenseSet<mlir::Value> visiting;
@@ -834,22 +878,27 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
             if (!visiting.insert(st).second) return false;
 
             llvm::SmallVector<std::string, 8> local;
-            auto itC = createdAtByState.find(st);
-            if (itC == createdAtByState.end()) return false;
-            auto stSteps = getConstructionStepIndicesForState(st, createdAtByState, writesByState, mergedFromThreadLocal);
-            auto stPrereqs = getPrereqStatesForConstructionSteps(stSteps, st, rwByStep);
+            auto itC = a.createdAtByState.find(st);
+            if (itC == a.createdAtByState.end()) return false;
+            auto stSteps = getConstructionStepIndicesForState(st, a.createdAtByState, a.writesByState, a.mergedFromThreadLocal);
+            auto stPrereqs = getPrereqStatesForConstructionSteps(stSteps, st, a.rwByStep);
             for (auto p : stPrereqs) {
                // Ignore pure create-only prerequisite states.
-               if (auto itPC = createdAtByState.find(p); itPC != createdAtByState.end()) {
-                  auto itPS = stepByIndex.find(itPC->second);
-                  if (itPS != stepByIndex.end() && isCreateOnlyExecutionStep(itPS->second)) {
+               if (auto itPC = a.createdAtByState.find(p); itPC != a.createdAtByState.end()) {
+                  auto itPS = a.stepByIndex.find(itPC->second);
+                  if (itPS != a.stepByIndex.end() && isCreateOnlyExecutionStep(itPS->second)) {
                      continue;
                   }
                }
                if (isTableStateValue(p)) {
                   auto itD = tableDescrByTableState.find(p);
-                  assert(itD != tableDescrByTableState.end() && "table state must have external descr mapping");
-                  local.push_back(std::string("table:") + itD->second);
+                  if (itD != tableDescrByTableState.end()) {
+                     local.push_back(std::string("table:") + itD->second);
+                  } else {
+                     // Some pipelines may introduce table-typed values that are not direct get_external results.
+                     // Fall back to a stable, type-based token so identical shapes can still match cross-query.
+                     local.push_back(std::string("table_type:") + normalizedSubopStateTypeFingerprint(memberManager, p.getType()));
+                  }
                   continue;
                }
                if (mlir::isa<subop::ResultTableType>(p.getType())) {
@@ -878,13 +927,30 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
       llvm::sort(depTokens);
       depTokens.erase(std::unique(depTokens.begin(), depTokens.end()), depTokens.end());
 
+      // Hard constraint: if any construction step writes multiple states, this state must not participate in matching.
+      // (We cannot safely delete only the "write side" without affecting other written states.)
+      bool multiWrite = false;
+      for (int si : stepIdxs) {
+         auto itRW = a.rwByStep.find(si);
+         assert(itRW != a.rwByStep.end());
+         unsigned writeCount = 0;
+         for (auto kv : itRW->second) {
+            if (kv.second.write) writeCount++;
+            if (writeCount > 1) break;
+         }
+         if (writeCount > 1) {
+            multiWrite = true;
+            break;
+         }
+      }
+
       StateMatchProfile prof;
       prof.queryId = queryId;
       prof.value = s;
       // If a state truly depends only on external tables, it may have an empty dep token set
       // when all intermediate prereqs are internal create-only states.
       // We still want to match it.
-      prof.eligible = ok;
+      prof.eligible = ok && !multiWrite;
       prof.depTokensSorted.assign(depTokens.begin(), depTokens.end());
       prof.constructionStepHashes.assign(stepHashes.begin(), stepHashes.end());
       prof.constructionHash = constructionHash;
@@ -896,6 +962,10 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
 }
 
 } // anonymous
+
+mlir::Value canonicalizeStateValueForReuse(mlir::Value v) {
+   return canonicalizeStateValueDeep(v);
+}
 
 void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
    struct StateInfo {
@@ -1150,6 +1220,85 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
    }
 }
 
+namespace {
+template <typename GroupOp>
+static void printExecutionGroupStepLines(GroupOp group, llvm::raw_ostream& os, llvm::StringRef whereLabel) {
+   if (group.getSubOps().empty()) return;
+   mlir::Block& body = group.getSubOps().front();
+   os << "// --- " << whereLabel << " ---\n";
+   unsigned ord = 0;
+   for (mlir::Operation& op : body.without_terminator()) {
+      if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(&op)) {
+         os << "//   [" << ord << "] execution_step inner_ops:";
+         for (mlir::Operation& inner : step.getSubOps().front().without_terminator()) {
+            os << " " << inner.getName().getStringRef();
+         }
+         os << " | step_inputs:";
+         for (mlir::Value in : step.getInputs()) {
+            os << " ";
+            if (auto* def = in.getDefiningOp()) {
+               os << def->getName().getStringRef();
+               if (auto defStep = mlir::dyn_cast<subop::ExecutionStepOp>(def)) {
+                  if (auto* defGroupOp = defStep->getParentOp()) {
+                     if (auto encEg = mlir::dyn_cast<subop::ExecutionGroupOp>(defGroupOp)) {
+                        unsigned srcOrd = 0;
+                        for (mlir::Operation& o : encEg.getSubOps().front().without_terminator()) {
+                           if (&o == def) {
+                              os << "[step " << srcOrd << "]";
+                              break;
+                           }
+                           ++srcOrd;
+                        }
+                     } else if (auto encNeg = mlir::dyn_cast<subop::NestedExecutionGroupOp>(defGroupOp)) {
+                        unsigned srcOrd = 0;
+                        for (mlir::Operation& o : encNeg.getSubOps().front().without_terminator()) {
+                           if (&o == def) {
+                              os << "[nested_step " << srcOrd << "]";
+                              break;
+                           }
+                           ++srcOrd;
+                        }
+                     }
+                  }
+               }
+            } else if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(in)) {
+               if (mlir::Operation* regParent = ba.getOwner()->getParentOp()) {
+                  os << "arg@" << regParent->getName() << "#" << ba.getArgNumber();
+               } else {
+                  os << "block_arg";
+               }
+            } else {
+               os << "?";
+            }
+         }
+         os << "\n";
+         // Nested lowering uses a fresh ordinal space per nested_execution_group.
+         step->walk([&](subop::NestedExecutionGroupOp nested) {
+            printExecutionGroupStepLines(nested, os, "nested_execution_group(under outer step)");
+            return mlir::WalkResult::skip();
+         });
+      } else {
+         os << "//   [" << ord << "] " << op.getName() << " (non-execution_step)\n";
+      }
+      ++ord;
+   }
+}
+} // namespace
+
+void printTopLevelExecutionStepLayout(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
+   os << "\n// ==== execution_step layout (block order == SubOp lowering ordinal) ====\n";
+   os << "// Note: use the same indices as stderr from SubOpToControlFlow (per execution_group / nested group).\n";
+   for (mlir::func::FuncOp func : moduleOp.getOps<mlir::func::FuncOp>()) {
+      if (func.isDeclaration()) continue;
+      os << "// func @" << func.getName() << "\n";
+      for (mlir::Operation& top : func.front()) {
+         if (auto group = mlir::dyn_cast<subop::ExecutionGroupOp>(&top)) {
+            printExecutionGroupStepLines(group, os, "execution_group @main pipeline");
+         }
+      }
+   }
+}
+
 void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> queries, llvm::raw_ostream& os) {
    assert(queries.size() >= 2 && "need at least two modules to compare");
 
@@ -1177,6 +1326,39 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
    os << "// States with any other prereq state are skipped.\n";
    os << "// Match key: sorted dep tokens + construction fingerprints + result type fingerprint.\n";
    os << "// Match key: sorted dep tokens + constructionHash + result type fingerprint.\n";
+
+   // Debug helper: print eligible optimistic_ht_fragment-like profiles per query (capped).
+   {
+      os << "\n// ==== debug: eligible optimistic_ht_fragment profiles (capped) ====\n";
+      size_t cap = 20;
+      for (auto& m : models) {
+         size_t printedDbg = 0;
+         for (auto& p : m.profiles) {
+            std::string ty;
+            llvm::raw_string_ostream tss(ty);
+            p.value.getType().print(tss);
+            tss.flush();
+            if (ty.find("optimistic_ht_fragment") == std::string::npos) continue;
+
+            std::string deps = joinSortedStrings(p.depTokensSorted);
+            os << "//   query[" << m.id << "] ";
+            mlir::OpPrintingFlags dbgFlags;
+            p.value.printAsOperand(os, dbgFlags);
+            os << " eligible=" << (p.eligible ? "true" : "false");
+            os << " type=" << ty;
+            os << " deps=" << deps;
+            os << " h=" << p.constructionHash;
+            os << "\n";
+            if (++printedDbg >= cap) {
+               os << "//   ... truncated (max " << cap << ") ...\n";
+               break;
+            }
+         }
+         if (printedDbg == 0) {
+            os << "//   query[" << m.id << "] (none)\n";
+         }
+      }
+   }
 
    // O(n^2) pair enumeration. Time is not important; avoids building giant string keys.
    llvm::SmallVector<const StateMatchProfile*, 256> all;
@@ -1213,6 +1395,74 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       }
    }
    if (printed == 0) os << "// (no matches)\n";
+}
+
+ModuleReuseInfo collectModuleReuseInfo(mlir::ModuleOp moduleOp) {
+   return analyzeModuleForMatchAndReuse(moduleOp).reuse;
+}
+
+llvm::SmallVector<CrossQueryStateMatchPair, 64>
+collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> queries) {
+   assert(queries.size() >= 2 && "need at least two modules to compare");
+
+   struct QueryModel {
+      int id = -1;
+      mlir::ModuleOp module;
+      llvm::DenseMap<mlir::Value, std::string> tableDescr;
+      llvm::SmallVector<StateMatchProfile, 128> profiles;
+   };
+
+   llvm::SmallVector<QueryModel, 4> models;
+   models.reserve(queries.size());
+   for (auto& q : queries) {
+      QueryModel m;
+      m.id = q.first;
+      m.module = q.second;
+      m.tableDescr = buildTableDescrByTableState(m.module);
+      m.profiles = buildStateMatchProfiles(m.id, m.module, m.tableDescr);
+      models.push_back(std::move(m));
+   }
+
+   llvm::SmallVector<const StateMatchProfile*, 256> all;
+   for (auto& m : models) {
+      for (auto& p : m.profiles) {
+         if (!p.eligible) continue;
+         all.push_back(&p);
+      }
+   }
+
+   auto makeKeyStr = [](const StateMatchProfile& p) -> std::string {
+      std::string deps;
+      for (auto& d : p.depTokensSorted) {
+         if (!deps.empty()) deps.push_back('|');
+         deps.append(d);
+      }
+      return deps + "@@type=" + p.typeFingerprintStr + "@@h=" + std::to_string(p.constructionHash);
+   };
+
+   llvm::SmallVector<CrossQueryStateMatchPair, 64> out;
+   for (size_t i = 0; i < all.size(); i++) {
+      for (size_t j = i + 1; j < all.size(); j++) {
+         auto* a = all[i];
+         auto* b = all[j];
+         if (a->queryId == b->queryId) continue;
+         if (a->constructionHash != b->constructionHash) continue;
+         if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
+         if (a->depTokensSorted != b->depTokensSorted) continue;
+
+         std::string k = makeKeyStr(*a);
+         uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
+
+         CrossQueryStateMatchPair p;
+         p.queryA = a->queryId;
+         p.queryB = b->queryId;
+         p.stateA = a->value;
+         p.stateB = b->value;
+         p.cacheKey = cacheKey;
+         out.push_back(p);
+      }
+   }
+   return out;
 }
 
 } // namespace lingodb::compiler::dialect::subop

@@ -490,6 +490,19 @@ def SetResultOp : SubOperator_Op<"set_result"> {
     let arguments = (ins I32Attr:$result_id, AnyType : $state);
     let assemblyFormat = [{ $result_id $state `:` type($state)  attr-dict }];
 }
+
+def CacheGetOp : SubOperator_Op<"cache_get", [Pure]> {
+    let summary = "load a cached state by key";
+    let arguments = (ins I64Attr:$key);
+    let results = (outs AnyType:$res);
+    let assemblyFormat = [{ $key `:` type($res) attr-dict }];
+}
+
+def CachePutOp : SubOperator_Op<"cache_put"> {
+    let summary = "store a state into cache by key";
+    let arguments = (ins I64Attr:$key, AnyType:$state);
+    let assemblyFormat = [{ $key $state `:` type($state) attr-dict }];
+}
 def CreateThreadLocalOp : SubOperator_Op<"create_thread_local", [Pure]> {
     let summary = "create new thread local";
     let results = (outs ThreadLocal : $res);

@@ -1,5 +1,7 @@
 #include "lingodb/runtime/ExecutionContext.h"
 #include <cassert>
+#include <mutex>
+#include <unordered_map>
 
 void lingodb::runtime::ExecutionContext::setResult(uint32_t id, uint8_t* ptr) {
    auto* context = getCurrentExecutionContext();
@@ -14,6 +16,24 @@ void lingodb::runtime::ExecutionContext::clearResult(uint32_t id) {
 void lingodb::runtime::ExecutionContext::setTupleCount(uint32_t id, int64_t tupleCount) {
    auto* context = getCurrentExecutionContext();
    context->tupleCounts[id] = tupleCount;
+}
+
+namespace {
+std::mutex gCachedStatesMutex;
+std::unordered_map<uint64_t, uint8_t*> gCachedStates;
+} // namespace
+
+void lingodb::runtime::ExecutionContext::putCachedState(uint64_t key, uint8_t* ptr) {
+   assert(ptr && "putCachedState requires non-null ptr");
+   std::lock_guard<std::mutex> lock(gCachedStatesMutex);
+   gCachedStates[key] = ptr;
+}
+
+uint8_t* lingodb::runtime::ExecutionContext::getCachedState(uint64_t key) {
+   std::lock_guard<std::mutex> lock(gCachedStatesMutex);
+   auto it = gCachedStates.find(key);
+   assert(it != gCachedStates.end() && "getCachedState: missing key (cache not populated?)");
+   return it->second;
 }
 
 lingodb::runtime::ExecutionContext::~ExecutionContext() {

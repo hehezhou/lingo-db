@@ -3,6 +3,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <cstdint>
 #include <unordered_set>
 
 #include "ConcurrentMap.h"
@@ -97,6 +98,8 @@ class ExecutionContext {
    static uint8_t* allocStateRaw(size_t size);
    static void clearResult(uint32_t id);
    static void setTupleCount(uint32_t id, int64_t tupleCount);
+   static void putCachedState(uint64_t key, uint8_t* ptr);
+   static uint8_t* getCachedState(uint64_t key);
    void registerState(const State& s) {
       perWorkerStates[lingodb::scheduler::currentWorkerId()].push_back(s);
    }

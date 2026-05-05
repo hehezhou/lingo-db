@@ -46,6 +46,9 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
+#include "llvm/Support/raw_ostream.h"
+
+#include <iostream>
 #include <stack>
 using namespace mlir;
 
@@ -1341,6 +1344,57 @@ class GetExternalTableLowering : public SubOpConversionPattern<subop::GetExterna
       mlir::Value description = rewriter.create<util::CreateConstVarLen>(op->getLoc(), util::VarLen32Type::get(rewriter.getContext()), op.getDescrAttr());
       rewriter.replaceOp(op, rt::DataSource::get(rewriter, op->getLoc())({description})[0]);
       return mlir::success();
+   }
+};
+
+class CacheGetLowering : public SubOpConversionPattern<subop::CacheGetOp> {
+   public:
+   using SubOpConversionPattern<subop::CacheGetOp>::SubOpConversionPattern;
+
+   LogicalResult matchAndRewrite(subop::CacheGetOp op, OpAdaptor adaptor, SubOpRewriter& rewriter) const override {
+      mlir::Location loc = op->getLoc();
+      mlir::Value key = rewriter.create<mlir::arith::ConstantIntOp>(loc, op.getKey(), rewriter.getI64Type());
+      mlir::Value raw = rt::ExecutionContext::getCachedState(rewriter, loc)({key})[0];
+      mlir::Type dstTy = typeConverter->convertType(op.getType());
+      assert(dstTy && "cache_get result type must convert");
+      raw = rewriter.create<util::GenericMemrefCastOp>(loc, dstTy, raw);
+      rewriter.replaceOp(op, raw);
+      return success();
+   }
+};
+
+class CachePutLowering : public SubOpConversionPattern<subop::CachePutOp> {
+   public:
+   using SubOpConversionPattern<subop::CachePutOp>::SubOpConversionPattern;
+
+   LogicalResult matchAndRewrite(subop::CachePutOp op, OpAdaptor adaptor, SubOpRewriter& rewriter) const override {
+      mlir::Location loc = op->getLoc();
+      mlir::Value key = rewriter.create<mlir::arith::ConstantIntOp>(loc, op.getKey(), rewriter.getI64Type());
+      mlir::Value st = adaptor.getState();
+      // Inside execution_step regions, mapped values are usually already lowered to util types, but
+      // cache_put steps injected at the SubOp layer may still see subop state types. GenericMemrefCast
+      // requires util.ref operands; bridge through UnrealizedConversionCast (lowered elsewhere).
+      if (!mlir::isa<util::RefType, util::BufferType>(st.getType())) {
+         mlir::Type lowered = typeConverter->convertType(op.getState().getType());
+         assert(lowered && "cache_put state type must be convertible");
+         st = rewriter.create<mlir::UnrealizedConversionCastOp>(loc, mlir::TypeRange{lowered}, mlir::ValueRange{st})
+                 .getResult(0);
+      }
+      mlir::Value ptr;
+      if (auto bufTy = mlir::dyn_cast<util::BufferType>(st.getType())) {
+         auto storageRefTy = util::RefType::get(rewriter.getContext(), bufTy.getT());
+         ptr = rewriter.create<util::BufferGetRef>(loc, storageRefTy, st);
+         ptr = rewriter.create<util::GenericMemrefCastOp>(
+            loc, util::RefType::get(rewriter.getContext(), rewriter.getI8Type()), ptr);
+      } else {
+         assert(mlir::isa<util::RefType>(st.getType()) &&
+                "cache_put lowering expects util.ref or util.buffer storage");
+         ptr = rewriter.create<util::GenericMemrefCastOp>(
+            loc, util::RefType::get(rewriter.getContext(), rewriter.getI8Type()), st);
+      }
+      rt::ExecutionContext::putCachedState(rewriter, loc)({key, ptr});
+      rewriter.eraseOp(op);
+      return success();
    }
 };
 class GenerateLowering : public SubOpConversionPattern<subop::GenerateOp> {
@@ -4231,6 +4285,9 @@ PatternList getCPUPatternList(TypeConverter& typeConverter, mlir::MLIRContext* c
    //external
    patterns.insertPattern<GetExternalTableLowering>(typeConverter, ctxt);
    patterns.insertPattern<GetExternalHashIndexLowering>(typeConverter, ctxt);
+   // cache (cross-query reuse)
+   patterns.insertPattern<CacheGetLowering>(typeConverter, ctxt);
+   patterns.insertPattern<CachePutLowering>(typeConverter, ctxt);
    //ResultTable
    patterns.insertPattern<CreateTableLowering>(typeConverter, ctxt);
    patterns.insertPattern<MaterializeTableLowering>(typeConverter, ctxt);
@@ -4335,16 +4392,58 @@ void handleExecutionStepCPU(PatternList& patternList, subop::ExecutionStepOp ste
    // llvm::dbgs() << "[CPU] HANDLING STEP " << step << "\n";
    SubOpRewriter rewriter(patternList, step, mapping);
 
+   unsigned inputOrdinal = 0;
    for (auto [param, arg, isThreadLocal] : llvm::zip(step.getInputs(), step.getSubOps().front().getArguments(), step.getIsThreadLocal())) {
-      mlir::Value input = mapping.lookup(param);
+      mlir::Value input = mapping.lookupOrNull(param);
+      if (!input) {
+         size_t execStepOrdinal = 0;
+         for (mlir::Operation& o : executionGroup.getSubOps().front().without_terminator()) {
+            auto es = mlir::dyn_cast<subop::ExecutionStepOp>(&o);
+            if (!es) continue;
+            if (es.getOperation() == step.getOperation()) break;
+            ++execStepOrdinal;
+         }
+         mlir::OpPrintingFlags pf;
+         llvm::errs() << "[SubOpToControlFlow] IRMapping missing value for execution_step operand:\n"
+                      << "  execution_step ordinal in execution_group (0-based): " << execStepOrdinal << "\n"
+                      << "  execution_step input operand index: " << inputOrdinal << "\n"
+                      << "  missing param value: ";
+         param.printAsOperand(llvm::errs(), pf);
+         llvm::errs() << " : ";
+         param.getType().print(llvm::errs());
+         llvm::errs() << "\n";
+         if (auto* def = param.getDefiningOp()) {
+            llvm::errs() << "  defining op (" << def->getName() << "):\n";
+            def->print(llvm::errs(), pf);
+            llvm::errs() << "\n";
+         } else if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(param)) {
+            llvm::errs() << "  param is block argument #" << ba.getArgNumber() << " of block in region owned by: ";
+            if (auto* po = ba.getOwner()->getParentOp()) {
+               po->print(llvm::errs(), pf);
+            } else {
+               llvm::errs() << "(null parent op)";
+            }
+            llvm::errs() << "\n";
+         }
+         llvm::errs() << "  inner ops (body order, for quick grep vs printTopLevelExecutionStepLayout): ";
+         for (auto& inner : step.getSubOps().front().without_terminator()) {
+            llvm::errs() << inner.getName() << " ";
+         }
+         llvm::errs() << "\n";
+         llvm::errs() << "  failing execution_step op:\n";
+         step->print(llvm::errs(), pf);
+         llvm::errs() << "\n";
+         llvm_unreachable("SubOp lowering: IRMapping miss (details on stderr)");
+      }
       if (!mlir::cast<mlir::BoolAttr>(isThreadLocal).getValue()) {
          rewriter.map(arg, input);
       } else {
          mlir::OpBuilder b(executionGroup);
-         mlir::Value threadLocal = rt::ThreadLocal::getLocal(b, b.getUnknownLoc())({mapping.lookup(param)})[0];
+         mlir::Value threadLocal = rt::ThreadLocal::getLocal(b, b.getUnknownLoc())({input})[0];
          threadLocal = b.create<util::GenericMemrefCastOp>(threadLocal.getLoc(), typeConverter.convertType(arg.getType()), threadLocal);
          rewriter.map(arg, threadLocal);
       }
+      ++inputOrdinal;
    }
    llvm::SmallVector<mlir::Operation*> ops;
    for (auto& op : step.getSubOps().front()) {
