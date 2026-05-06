@@ -99,6 +99,18 @@ static relalg::ColumnSet getRequired(Operator op, llvm::DenseMap<Operator, relal
    return res;
 }
 
+static void lowerCardinalityEstimates(mlir::Operation* from, mlir::Operation* to) {
+   // Keep this intentionally narrow: we only lower CE-related hints that are used by queryopt.
+   static constexpr llvm::StringLiteral kAttrs[] = {"rows", "total_rows", "selectivity"};
+   for (auto key : kAttrs) {
+      if (from->hasAttr(key)) to->setAttr(key, from->getAttr(key));
+   }
+}
+
+static void lowerCardinalityEstimates(mlir::Operation* from, mlir::Value toStream) {
+   if (auto* def = toStream.getDefiningOp()) lowerCardinalityEstimates(from, def);
+}
+
 class BaseTableLowering : public OpConversionPattern<relalg::BaseTableOp> {
    const RequiredColumnsMap& requiredColumns;
 
@@ -133,7 +145,8 @@ class BaseTableLowering : public OpConversionPattern<relalg::BaseTableOp> {
       bool hasFilters = !externalDatasourceProperty.filterDescriptions.empty();
       auto tableRefType = subop::TableType::get(rewriter.getContext(), createStateMembersAttr(rewriter.getContext(), members), hasFilters);
       mlir::Value tableRef = rewriter.create<subop::GetExternalOp>(baseTableOp->getLoc(), tableRefType, rewriter.getStringAttr(scanDescription));
-      rewriter.replaceOpWithNewOp<subop::ScanOp>(baseTableOp, tableRef, createColumnDefMemberMappingAttr(rewriter.getContext(), defMapping));
+      auto scan = rewriter.replaceOpWithNewOp<subop::ScanOp>(baseTableOp, tableRef, createColumnDefMemberMappingAttr(rewriter.getContext(), defMapping));
+      lowerCardinalityEstimates(baseTableOp.getOperation(), scan.getOperation());
       return success();
    }
 };
@@ -262,11 +275,7 @@ class SelectionLowering : public OpConversionPattern<relalg::SelectionOp> {
 
    LogicalResult matchAndRewrite(relalg::SelectionOp selectionOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       auto repl = translateSelection(adaptor.getRel(), selectionOp.getPredicate(), rewriter, selectionOp->getLoc());
-      if (auto* definingOp = repl.getDefiningOp()) {
-         if (selectionOp->hasAttr("selectivity")) {
-            definingOp->setAttr("selectivity", selectionOp->getAttr("selectivity"));
-         }
-      }
+      lowerCardinalityEstimates(selectionOp.getOperation(), repl);
       rewriter.replaceOp(selectionOp, repl);
 
       return success();
@@ -296,6 +305,7 @@ class MapLowering : public OpConversionPattern<relalg::MapOp> {
       }
       auto mapOp2 = rewriter.replaceOpWithNewOp<subop::MapOp>(mapOp, tuples::TupleStreamType::get(rewriter.getContext()), adaptor.getRel(), mapOp.getComputedCols(), helper.getColRefs());
       mapOp2.getFn().push_back(helper.getMapBlock());
+      lowerCardinalityEstimates(mapOp.getOperation(), mapOp2.getOperation());
       return success();
    }
 };
@@ -304,7 +314,8 @@ class RenamingLowering : public OpConversionPattern<relalg::RenamingOp> {
    using OpConversionPattern<relalg::RenamingOp>::OpConversionPattern;
 
    LogicalResult matchAndRewrite(relalg::RenamingOp renamingOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
-      rewriter.replaceOpWithNewOp<subop::RenamingOp>(renamingOp, tuples::TupleStreamType::get(rewriter.getContext()), adaptor.getRel(), renamingOp.getColumns());
+      auto renamed = rewriter.replaceOpWithNewOp<subop::RenamingOp>(renamingOp, tuples::TupleStreamType::get(rewriter.getContext()), adaptor.getRel(), renamingOp.getColumns());
+      lowerCardinalityEstimates(renamingOp.getOperation(), renamed.getOperation());
       return success();
    }
 };
@@ -314,6 +325,7 @@ class ProjectionAllLowering : public OpConversionPattern<relalg::ProjectionOp> {
 
    LogicalResult matchAndRewrite(relalg::ProjectionOp projectionOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       if (projectionOp.getSetSemantic() == relalg::SetSemantic::distinct) return failure();
+      lowerCardinalityEstimates(projectionOp.getOperation(), adaptor.getRel());
       rewriter.replaceOp(projectionOp, adaptor.getRel());
       return success();
    }
@@ -387,6 +399,7 @@ class ProjectionDistinctLowering : public OpConversionPattern<relalg::Projection
       }
       mlir::Value scan = rewriter.create<subop::ScanOp>(loc, state, createColumnDefMemberMappingAttr(context, defMapping));
 
+      lowerCardinalityEstimates(projectionOp.getOperation(), scan);
       rewriter.replaceOp(projectionOp, scan);
       return success();
    }
@@ -510,6 +523,7 @@ class ConstRelationLowering : public OpConversionPattern<relalg::ConstRelationOp
          }
          rewriter.create<tuples::ReturnOp>(loc);
       }
+      lowerCardinalityEstimates(constRelationOp.getOperation(), generateOp.getOperation());
       rewriter.replaceOp(constRelationOp, generateOp.getRes());
       return success();
    }
@@ -627,7 +641,8 @@ class UnionAllLowering : public OpConversionPattern<relalg::UnionOp> {
       auto loc = unionOp->getLoc();
       mlir::Value left = mapColsToNullable(adaptor.getLeft(), rewriter, loc, unionOp.getMapping(), 0);
       mlir::Value right = mapColsToNullable(adaptor.getRight(), rewriter, loc, unionOp.getMapping(), 1);
-      rewriter.replaceOpWithNewOp<subop::UnionOp>(unionOp, mlir::ValueRange({left, right}));
+      auto u = rewriter.replaceOpWithNewOp<subop::UnionOp>(unionOp, mlir::ValueRange({left, right}));
+      lowerCardinalityEstimates(unionOp.getOperation(), u.getOperation());
       return success();
    }
 };
@@ -720,6 +735,7 @@ class UnionDistinctLowering : public OpConversionPattern<relalg::UnionOp> {
 
       mlir::Value scan = rewriter.create<subop::ScanOp>(loc, state, createColumnDefMemberMappingAttr(rewriter.getContext(), defMapping));
 
+      lowerCardinalityEstimates(projectionOp.getOperation(), scan);
       rewriter.replaceOp(projectionOp, scan);
       return success();
    }
@@ -1310,9 +1326,11 @@ class CrossProductLowering : public OpConversionPattern<relalg::CrossProductOp> 
       : OpConversionPattern<relalg::CrossProductOp>(typeConverter, context), requiredColumns(requiredColumns) {}
 
    LogicalResult matchAndRewrite(relalg::CrossProductOp crossProductOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
-      rewriter.replaceOp(crossProductOp, translateNL(adaptor.getRight(), adaptor.getLeft(), false, false, mlir::ArrayAttr(), mlir::ArrayAttr(), mlir::ArrayAttr(), requiredColumns.lookup(mlir::cast<Operator>(crossProductOp.getLeft().getDefiningOp())), rewriter, crossProductOp, [](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
-                            return v;
-                         }));
+      auto res = translateNL(adaptor.getRight(), adaptor.getLeft(), false, false, mlir::ArrayAttr(), mlir::ArrayAttr(), mlir::ArrayAttr(), requiredColumns.lookup(mlir::cast<Operator>(crossProductOp.getLeft().getDefiningOp())), rewriter, crossProductOp, [](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
+         return v;
+      });
+      lowerCardinalityEstimates(crossProductOp.getOperation(), res);
+      rewriter.replaceOp(crossProductOp, res);
       return success();
    }
 };
@@ -1330,9 +1348,11 @@ class InnerJoinNLLowering : public OpConversionPattern<relalg::InnerJoinOp> {
       auto rightHash = innerJoinOp->getAttrOfType<mlir::ArrayAttr>("rightHash");
       auto leftHash = innerJoinOp->getAttrOfType<mlir::ArrayAttr>("leftHash");
       auto nullsEqual = innerJoinOp->getAttrOfType<mlir::ArrayAttr>("nullsEqual");
-      rewriter.replaceOp(innerJoinOp, translateNL(adaptor.getRight(), adaptor.getLeft(), useHash, useIndexNestedLoop, nullsEqual, rightHash, leftHash, requiredColumns.lookup(mlir::cast<Operator>(innerJoinOp.getLeft().getDefiningOp())), rewriter, innerJoinOp, [loc, &innerJoinOp](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
-                            return translateSelection(v, innerJoinOp.getPredicate(), rewriter, loc);
-                         }));
+      auto res = translateNL(adaptor.getRight(), adaptor.getLeft(), useHash, useIndexNestedLoop, nullsEqual, rightHash, leftHash, requiredColumns.lookup(mlir::cast<Operator>(innerJoinOp.getLeft().getDefiningOp())), rewriter, innerJoinOp, [loc, &innerJoinOp](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
+         return translateSelection(v, innerJoinOp.getPredicate(), rewriter, loc);
+      });
+      lowerCardinalityEstimates(innerJoinOp.getOperation(), res);
+      rewriter.replaceOp(innerJoinOp, res);
       return success();
    }
 };
@@ -1353,11 +1373,13 @@ class SemiJoinLowering : public OpConversionPattern<relalg::SemiJoinOp> {
       auto nullsEqual = semiJoinOp->getAttrOfType<mlir::ArrayAttr>("nullsEqual");
 
       if (!reverse) {
-         rewriter.replaceOp(semiJoinOp, translateNL(adaptor.getLeft(), adaptor.getRight(), useHash, useIndexNestedLoop, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(semiJoinOp.getRight().getDefiningOp())), rewriter, semiJoinOp, [loc, &semiJoinOp](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
-                               auto filtered = translateSelection(v, semiJoinOp.getPredicate(), rewriter, loc);
-                               auto [markerDefAttr, markerRefAttr] = createColumn(rewriter.getI1Type(), "marker", "marker");
-                               return rewriter.create<subop::FilterOp>(loc, anyTuple(filtered, markerDefAttr, rewriter, loc), subop::FilterSemantic::all_true, rewriter.getArrayAttr({markerRefAttr}));
-                            }));
+         auto res = translateNL(adaptor.getLeft(), adaptor.getRight(), useHash, useIndexNestedLoop, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(semiJoinOp.getRight().getDefiningOp())), rewriter, semiJoinOp, [loc, &semiJoinOp](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
+            auto filtered = translateSelection(v, semiJoinOp.getPredicate(), rewriter, loc);
+            auto [markerDefAttr, markerRefAttr] = createColumn(rewriter.getI1Type(), "marker", "marker");
+            return rewriter.create<subop::FilterOp>(loc, anyTuple(filtered, markerDefAttr, rewriter, loc), subop::FilterSemantic::all_true, rewriter.getArrayAttr({markerRefAttr}));
+         });
+         lowerCardinalityEstimates(semiJoinOp.getOperation(), res);
+         rewriter.replaceOp(semiJoinOp, res);
       } else {
          auto [flagAttrDef, flagAttrRef] = createColumn(rewriter.getI1Type(), "materialized", "marker");
          auto [_, scan] = translateNLWithMarker(adaptor.getLeft(), adaptor.getRight(), useHash, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(semiJoinOp.getLeft().getDefiningOp())), rewriter, loc, flagAttrDef, [loc, &semiJoinOp](mlir::Value v, mlir::Value, mlir::ConversionPatternRewriter& rewriter, tuples::ColumnRefAttr ref, Member flagMember) -> mlir::Value {
@@ -1367,7 +1389,8 @@ class SemiJoinLowering : public OpConversionPattern<relalg::SemiJoinOp> {
             rewriter.create<subop::ScatterOp>(loc, afterBool, ref, createColumnRefMemberMappingAttr(rewriter.getContext(), {{flagMember, markerRefAttr}}));
             return {};
          });
-         rewriter.replaceOpWithNewOp<subop::FilterOp>(semiJoinOp, scan, subop::FilterSemantic::all_true, rewriter.getArrayAttr({flagAttrRef}));
+         auto f = rewriter.replaceOpWithNewOp<subop::FilterOp>(semiJoinOp, scan, subop::FilterSemantic::all_true, rewriter.getArrayAttr({flagAttrRef}));
+         lowerCardinalityEstimates(semiJoinOp.getOperation(), f.getOperation());
       }
       return success();
    }
@@ -1389,10 +1412,12 @@ class MarkJoinLowering : public OpConversionPattern<relalg::MarkJoinOp> {
       auto nullsEqual = markJoinOp->getAttrOfType<mlir::ArrayAttr>("nullsEqual");
 
       if (!reverse) {
-         rewriter.replaceOp(markJoinOp, translateNL(adaptor.getLeft(), adaptor.getRight(), useHash, useIndexNestedLoop, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(markJoinOp.getRight().getDefiningOp())), rewriter, markJoinOp, [loc, &markJoinOp](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
-                               auto filtered = translateSelection(v, markJoinOp.getPredicate(), rewriter, loc);
-                               return anyTuple(filtered, markJoinOp.getMarkattr(), rewriter, loc);
-                            }));
+         auto res = translateNL(adaptor.getLeft(), adaptor.getRight(), useHash, useIndexNestedLoop, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(markJoinOp.getRight().getDefiningOp())), rewriter, markJoinOp, [loc, &markJoinOp](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
+            auto filtered = translateSelection(v, markJoinOp.getPredicate(), rewriter, loc);
+            return anyTuple(filtered, markJoinOp.getMarkattr(), rewriter, loc);
+         });
+         lowerCardinalityEstimates(markJoinOp.getOperation(), res);
+         rewriter.replaceOp(markJoinOp, res);
       } else {
          auto [_, scan] = translateNLWithMarker(adaptor.getLeft(), adaptor.getRight(), useHash, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(markJoinOp.getLeft().getDefiningOp())), rewriter, loc, markJoinOp.getMarkattr(), [loc, &markJoinOp](mlir::Value v, mlir::Value, mlir::ConversionPatternRewriter& rewriter, tuples::ColumnRefAttr ref, Member flagMember) -> mlir::Value {
             auto filtered = translateSelection(v, markJoinOp.getPredicate(), rewriter, loc);
@@ -1401,6 +1426,7 @@ class MarkJoinLowering : public OpConversionPattern<relalg::MarkJoinOp> {
             rewriter.create<subop::ScatterOp>(loc, afterBool, ref, createColumnRefMemberMappingAttr(rewriter.getContext(), {{flagMember, markerRefAttr}}));
             return {};
          });
+         lowerCardinalityEstimates(markJoinOp.getOperation(), scan);
          rewriter.replaceOp(markJoinOp, scan);
       }
       return success();
@@ -1423,11 +1449,13 @@ class AntiSemiJoinLowering : public OpConversionPattern<relalg::AntiSemiJoinOp> 
       auto nullsEqual = antiSemiJoinOp->getAttrOfType<mlir::ArrayAttr>("nullsEqual");
 
       if (!reverse) {
-         rewriter.replaceOp(antiSemiJoinOp, translateNL(adaptor.getLeft(), adaptor.getRight(), useHash, useIndexNestedLoop, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(antiSemiJoinOp.getRight().getDefiningOp())), rewriter, antiSemiJoinOp, [loc, &antiSemiJoinOp](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
-                               auto filtered = translateSelection(v, antiSemiJoinOp.getPredicate(), rewriter, loc);
-                               auto [markerDefAttr, markerRefAttr] = createColumn(rewriter.getI1Type(), "marker", "marker");
-                               return rewriter.create<subop::FilterOp>(loc, anyTuple(filtered, markerDefAttr, rewriter, loc), subop::FilterSemantic::none_true, rewriter.getArrayAttr({markerRefAttr}));
-                            }));
+         auto res = translateNL(adaptor.getLeft(), adaptor.getRight(), useHash, useIndexNestedLoop, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(antiSemiJoinOp.getRight().getDefiningOp())), rewriter, antiSemiJoinOp, [loc, &antiSemiJoinOp](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
+            auto filtered = translateSelection(v, antiSemiJoinOp.getPredicate(), rewriter, loc);
+            auto [markerDefAttr, markerRefAttr] = createColumn(rewriter.getI1Type(), "marker", "marker");
+            return rewriter.create<subop::FilterOp>(loc, anyTuple(filtered, markerDefAttr, rewriter, loc), subop::FilterSemantic::none_true, rewriter.getArrayAttr({markerRefAttr}));
+         });
+         lowerCardinalityEstimates(antiSemiJoinOp.getOperation(), res);
+         rewriter.replaceOp(antiSemiJoinOp, res);
       } else {
          auto [flagAttrDef, flagAttrRef] = createColumn(rewriter.getI1Type(), "materialized", "marker");
          auto [_, scan] = translateNLWithMarker(adaptor.getLeft(), adaptor.getRight(), useHash, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(antiSemiJoinOp.getLeft().getDefiningOp())), rewriter, loc, flagAttrDef, [loc, &antiSemiJoinOp](mlir::Value v, mlir::Value, mlir::ConversionPatternRewriter& rewriter, tuples::ColumnRefAttr ref, Member flagMember) -> mlir::Value {
@@ -1437,7 +1465,8 @@ class AntiSemiJoinLowering : public OpConversionPattern<relalg::AntiSemiJoinOp> 
             rewriter.create<subop::ScatterOp>(loc, afterBool, ref, createColumnRefMemberMappingAttr(rewriter.getContext(), {{flagMember, markerRefAttr}}));
             return {};
          });
-         rewriter.replaceOpWithNewOp<subop::FilterOp>(antiSemiJoinOp, scan, subop::FilterSemantic::none_true, rewriter.getArrayAttr({flagAttrRef}));
+         auto f = rewriter.replaceOpWithNewOp<subop::FilterOp>(antiSemiJoinOp, scan, subop::FilterSemantic::none_true, rewriter.getArrayAttr({flagAttrRef}));
+         lowerCardinalityEstimates(antiSemiJoinOp.getOperation(), f.getOperation());
       }
       return success();
    }
@@ -1477,7 +1506,8 @@ class FullOuterJoinLowering : public OpConversionPattern<relalg::FullOuterJoinOp
       auto noMatches = rewriter.create<subop::FilterOp>(loc, scan, subop::FilterSemantic::none_true, rewriter.getArrayAttr({flagAttrRef}));
       auto mappedNullable = mapColsToNullable(noMatches, rewriter, loc, fullOuterJoinOp.getMapping(), 0, rightColumns);
       auto mappedNull = mapColsToNull(mappedNullable, rewriter, loc, fullOuterJoinOp.getMapping(), leftColumns);
-      rewriter.replaceOpWithNewOp<subop::UnionOp>(fullOuterJoinOp, mlir::ValueRange{stream, mappedNull});
+      auto u = rewriter.replaceOpWithNewOp<subop::UnionOp>(fullOuterJoinOp, mlir::ValueRange{stream, mappedNull});
+      lowerCardinalityEstimates(fullOuterJoinOp.getOperation(), u.getOperation());
 
       return success();
    }
@@ -1499,14 +1529,16 @@ class OuterJoinLowering : public OpConversionPattern<relalg::OuterJoinOp> {
       auto nullsEqual = outerJoinOp->getAttrOfType<mlir::ArrayAttr>("nullsEqual");
 
       if (!reverse) {
-         rewriter.replaceOp(outerJoinOp, translateNL(adaptor.getLeft(), adaptor.getRight(), useHash, useIndexNestedLoop, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(outerJoinOp.getRight().getDefiningOp())), rewriter, outerJoinOp, [loc, &outerJoinOp](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
-                               auto filtered = translateSelection(v, outerJoinOp.getPredicate(), rewriter, loc);
-                               auto [markerDefAttr, markerRefAttr] = createColumn(rewriter.getI1Type(), "marker", "marker");
-                               Value filteredNoMatch = rewriter.create<subop::FilterOp>(loc, anyTuple(filtered, markerDefAttr, rewriter, loc), subop::FilterSemantic::none_true, rewriter.getArrayAttr({markerRefAttr}));
-                               auto mappedNull = mapColsToNull(filteredNoMatch, rewriter, loc, outerJoinOp.getMapping());
-                               auto mappedNullable = mapColsToNullable(filtered, rewriter, loc, outerJoinOp.getMapping());
-                               return rewriter.create<subop::UnionOp>(loc, mlir::ValueRange{mappedNullable, mappedNull});
-                            }));
+         auto res = translateNL(adaptor.getLeft(), adaptor.getRight(), useHash, useIndexNestedLoop, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(outerJoinOp.getRight().getDefiningOp())), rewriter, outerJoinOp, [loc, &outerJoinOp](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
+            auto filtered = translateSelection(v, outerJoinOp.getPredicate(), rewriter, loc);
+            auto [markerDefAttr, markerRefAttr] = createColumn(rewriter.getI1Type(), "marker", "marker");
+            Value filteredNoMatch = rewriter.create<subop::FilterOp>(loc, anyTuple(filtered, markerDefAttr, rewriter, loc), subop::FilterSemantic::none_true, rewriter.getArrayAttr({markerRefAttr}));
+            auto mappedNull = mapColsToNull(filteredNoMatch, rewriter, loc, outerJoinOp.getMapping());
+            auto mappedNullable = mapColsToNullable(filtered, rewriter, loc, outerJoinOp.getMapping());
+            return rewriter.create<subop::UnionOp>(loc, mlir::ValueRange{mappedNullable, mappedNull});
+         });
+         lowerCardinalityEstimates(outerJoinOp.getOperation(), res);
+         rewriter.replaceOp(outerJoinOp, res);
       } else {
          auto [flagAttrDef, flagAttrRef] = createColumn(rewriter.getI1Type(), "materialized", "marker");
          auto [stream, scan] = translateNLWithMarker(adaptor.getLeft(), adaptor.getRight(), useHash, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(outerJoinOp.getLeft().getDefiningOp())), rewriter, loc, flagAttrDef, [loc, &outerJoinOp](mlir::Value v, mlir::Value, mlir::ConversionPatternRewriter& rewriter, tuples::ColumnRefAttr ref, Member flagMember) -> mlir::Value {
@@ -1520,7 +1552,8 @@ class OuterJoinLowering : public OpConversionPattern<relalg::OuterJoinOp> {
          });
          auto noMatches = rewriter.create<subop::FilterOp>(loc, scan, subop::FilterSemantic::none_true, rewriter.getArrayAttr({flagAttrRef}));
          auto mappedNull = mapColsToNull(noMatches, rewriter, loc, outerJoinOp.getMapping());
-         rewriter.replaceOpWithNewOp<subop::UnionOp>(outerJoinOp, mlir::ValueRange{stream, mappedNull});
+         auto u = rewriter.replaceOpWithNewOp<subop::UnionOp>(outerJoinOp, mlir::ValueRange{stream, mappedNull});
+         lowerCardinalityEstimates(outerJoinOp.getOperation(), u.getOperation());
       }
       return success();
    }
@@ -1556,16 +1589,19 @@ class SingleJoinLowering : public OpConversionPattern<relalg::SingleJoinOp> {
          auto afterLookupLeft = rewriter.create<subop::LookupOp>(loc, tuples::TupleStreamType::get(rewriter.getContext()), adaptor.getLeft(), constantState, rewriter.getArrayAttr({}), entryDefLeft);
          auto gathered = rewriter.create<subop::GatherOp>(loc, afterLookupLeft, entryRefLeft, helper.createStateColumnMapping());
          auto mappedNullable = mapColsToNullable(gathered.getRes(), rewriter, loc, singleJoinOp.getMapping());
+         lowerCardinalityEstimates(singleJoinOp.getOperation(), mappedNullable);
          rewriter.replaceOp(singleJoinOp, mappedNullable);
       } else if (!reverse) {
-         rewriter.replaceOp(singleJoinOp, translateNL(adaptor.getLeft(), adaptor.getRight(), useHash, useIndexNestedLoop, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(singleJoinOp.getRight().getDefiningOp())), rewriter, singleJoinOp, [loc, &singleJoinOp](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
-                               auto filtered = translateSelection(v, singleJoinOp.getPredicate(), rewriter, loc);
-                               auto [markerDefAttr, markerRefAttr] = createColumn(rewriter.getI1Type(), "marker", "marker");
-                               Value filteredNoMatch = rewriter.create<subop::FilterOp>(loc, anyTuple(filtered, markerDefAttr, rewriter, loc), subop::FilterSemantic::none_true, rewriter.getArrayAttr({markerRefAttr}));
-                               auto mappedNull = mapColsToNull(filteredNoMatch, rewriter, loc, singleJoinOp.getMapping());
-                               auto mappedNullable = mapColsToNullable(filtered, rewriter, loc, singleJoinOp.getMapping());
-                               return rewriter.create<subop::UnionOp>(loc, mlir::ValueRange{mappedNullable, mappedNull});
-                            }));
+         auto res = translateNL(adaptor.getLeft(), adaptor.getRight(), useHash, useIndexNestedLoop, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(singleJoinOp.getRight().getDefiningOp())), rewriter, singleJoinOp, [loc, &singleJoinOp](mlir::Value v, mlir::ConversionPatternRewriter& rewriter) -> mlir::Value {
+            auto filtered = translateSelection(v, singleJoinOp.getPredicate(), rewriter, loc);
+            auto [markerDefAttr, markerRefAttr] = createColumn(rewriter.getI1Type(), "marker", "marker");
+            Value filteredNoMatch = rewriter.create<subop::FilterOp>(loc, anyTuple(filtered, markerDefAttr, rewriter, loc), subop::FilterSemantic::none_true, rewriter.getArrayAttr({markerRefAttr}));
+            auto mappedNull = mapColsToNull(filteredNoMatch, rewriter, loc, singleJoinOp.getMapping());
+            auto mappedNullable = mapColsToNullable(filtered, rewriter, loc, singleJoinOp.getMapping());
+            return rewriter.create<subop::UnionOp>(loc, mlir::ValueRange{mappedNullable, mappedNull});
+         });
+         lowerCardinalityEstimates(singleJoinOp.getOperation(), res);
+         rewriter.replaceOp(singleJoinOp, res);
       } else {
          auto [flagAttrDef, flagAttrRef] = createColumn(rewriter.getI1Type(), "materialized", "marker");
          auto [stream, scan] = translateNLWithMarker(adaptor.getLeft(), adaptor.getRight(), useHash, nullsEqual, leftHash, rightHash, requiredColumns.lookup(mlir::cast<Operator>(singleJoinOp.getLeft().getDefiningOp())), rewriter, loc, flagAttrDef, [loc, &singleJoinOp](mlir::Value v, mlir::Value, mlir::ConversionPatternRewriter& rewriter, tuples::ColumnRefAttr ref, Member flagMember) -> mlir::Value {
@@ -1579,7 +1615,8 @@ class SingleJoinLowering : public OpConversionPattern<relalg::SingleJoinOp> {
          });
          auto noMatches = rewriter.create<subop::FilterOp>(loc, scan, subop::FilterSemantic::none_true, rewriter.getArrayAttr({flagAttrRef}));
          auto mappedNull = mapColsToNull(noMatches, rewriter, loc, singleJoinOp.getMapping());
-         rewriter.replaceOpWithNewOp<subop::UnionOp>(singleJoinOp, mlir::ValueRange{stream, mappedNull});
+         auto u = rewriter.replaceOpWithNewOp<subop::UnionOp>(singleJoinOp, mlir::ValueRange{stream, mappedNull});
+         lowerCardinalityEstimates(singleJoinOp.getOperation(), u.getOperation());
       }
       return success();
    }
@@ -1612,7 +1649,8 @@ class LimitLowering : public OpConversionPattern<relalg::LimitOp> {
       auto createHeapOp = rewriter.create<subop::CreateHeapOp>(loc, heapType, rewriter.getArrayAttr(sortByMembers));
       createHeapOp.getRegion().getBlocks().push_back(block);
       rewriter.create<subop::MaterializeOp>(loc, adaptor.getRel(), createHeapOp.getRes(), helper.createColumnstateMapping());
-      rewriter.replaceOpWithNewOp<subop::ScanOp>(limitOp, createHeapOp.getRes(), helper.createStateColumnMapping());
+      auto scan = rewriter.replaceOpWithNewOp<subop::ScanOp>(limitOp, createHeapOp.getRes(), helper.createStateColumnMapping());
+      lowerCardinalityEstimates(limitOp.getOperation(), scan.getOperation());
       return success();
    }
 };
@@ -1682,6 +1720,7 @@ class SortLowering : public OpConversionPattern<relalg::SortOp> {
       auto sortedView = createSortedView(rewriter, vector, sortOp.getSortspecs(), loc, helper);
       auto scanOp = rewriter.replaceOpWithNewOp<subop::ScanOp>(sortOp, sortedView, helper.createStateColumnMapping());
       scanOp->setAttr("sequential", rewriter.getUnitAttr());
+      lowerCardinalityEstimates(sortOp.getOperation(), scanOp.getOperation());
       return success();
    }
 };
@@ -1735,6 +1774,7 @@ class TopKLowering : public OpConversionPattern<relalg::TopKOp> {
       rewriter.create<subop::MaterializeOp>(loc, adaptor.getRel(), createHeapOp.getRes(), helper.createColumnstateMapping());
       auto scanOp = rewriter.replaceOpWithNewOp<subop::ScanOp>(topk, createHeapOp.getRes(), helper.createStateColumnMapping());
       scanOp->setAttr("sequential", rewriter.getUnitAttr());
+      lowerCardinalityEstimates(topk.getOperation(), scanOp.getOperation());
       return success();
    }
 };
@@ -1752,7 +1792,9 @@ class TmpLowering : public OpConversionPattern<relalg::TmpOp> {
       rewriter.create<subop::MaterializeOp>(tmpOp->getLoc(), adaptor.getRel(), vector, helper.createColumnstateMapping());
       std::vector<mlir::Value> results;
       for (size_t i = 0; i < tmpOp.getNumResults(); i++) {
-         results.push_back(rewriter.create<subop::ScanOp>(tmpOp->getLoc(), vector, helper.createStateColumnMapping()));
+         auto scan = rewriter.create<subop::ScanOp>(tmpOp->getLoc(), vector, helper.createStateColumnMapping());
+         lowerCardinalityEstimates(tmpOp.getOperation(), scan.getOperation());
+         results.push_back(scan);
       }
       rewriter.replaceOp(tmpOp, results);
       return success();
@@ -2943,7 +2985,8 @@ class GroupJoinLowering : public OpConversionPattern<relalg::GroupJoinOp> {
       if (groupJoinOp.getBehavior() == relalg::GroupJoinBehavior::inner) {
          scan = rewriter.create<subop::FilterOp>(loc, scan, subop::FilterSemantic::all_true, rewriter.getArrayAttr(marker));
       }
-      rewriter.replaceOpWithNewOp<subop::RenamingOp>(groupJoinOp, scan, rewriter.getArrayAttr(renameRightDefs));
+      auto renamed = rewriter.replaceOpWithNewOp<subop::RenamingOp>(groupJoinOp, scan, rewriter.getArrayAttr(renameRightDefs));
+      lowerCardinalityEstimates(groupJoinOp.getOperation(), renamed.getOperation());
       return success();
    }
 };
