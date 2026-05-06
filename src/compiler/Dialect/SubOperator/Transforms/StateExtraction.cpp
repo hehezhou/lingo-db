@@ -944,13 +944,20 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
          }
       }
 
+      // New constraint: if a state has no writer steps and is not a merge result (global <- thread_local),
+      // do not reuse it. (These are typically pure create-only or view-like values that would require
+      // special handling; this experimental project prefers to skip them.)
+      bool hasWriter = a.reuse.writerStepsByState.contains(s);
+      bool isMergeResult = a.mergedFromThreadLocal.contains(s);
+      bool hasWriterOrIsMergeResult = hasWriter || isMergeResult;
+
       StateMatchProfile prof;
       prof.queryId = queryId;
       prof.value = s;
       // If a state truly depends only on external tables, it may have an empty dep token set
       // when all intermediate prereqs are internal create-only states.
       // We still want to match it.
-      prof.eligible = ok && !multiWrite;
+      prof.eligible = ok && !multiWrite && hasWriterOrIsMergeResult;
       prof.depTokensSorted.assign(depTokens.begin(), depTokens.end());
       prof.constructionStepHashes.assign(stepHashes.begin(), stepHashes.end());
       prof.constructionHash = constructionHash;

@@ -19,12 +19,6 @@ struct ReusePlanRewriteResult {
    size_t numTargetsQuery0 = 0;
    size_t numTargetsQuery1 = 0;
    size_t numTargetsQuery0Mapped = 0;
-   /// `execution_step` ops present after `addSsaPredecessorSteps` but not in the state-closure core
-   /// (`collectCreateAndWriteStepsForStates`); nonzero means the SSA worklist found extra steps.
-   size_t numStepOpsAddedOnlyBySsaPredecessorClosure = 0;
-   /// When `numStepOpsAddedOnlyBySsaPredecessorClosure > 0`, multi-line `// ...` report (per-step
-   /// detail + aggregate histogram) for debugging; printed by tools after the scalar count.
-   std::string ssaExtraClosureStepsReport;
 };
 
 // Three-stage pipeline:

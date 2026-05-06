@@ -279,10 +279,6 @@ int main(int argc, char** argv) {
    llvm::outs() << "\n// reuse_targets: query[0]=" << rewriteRes.numTargetsQuery0
                   << " query[1]=" << rewriteRes.numTargetsQuery1 << "\n";
    llvm::outs() << "\n// reuse_targets_q0_mapped: " << rewriteRes.numTargetsQuery0Mapped << "\n";
-   llvm::outs() << "\n// step_ops_added_only_by_ssa_predecessor_closure: "
-                << rewriteRes.numStepOpsAddedOnlyBySsaPredecessorClosure << "\n";
-   if (!rewriteRes.ssaExtraClosureStepsReport.empty())
-      llvm::outs() << rewriteRes.ssaExtraClosureStepsReport;
 
    // Optional heavy debug printing (can be huge / sometimes crashes when IR is malformed).
    // Enable via env var: LINGODB_REUSE_PRINT_REWRITTEN=1
