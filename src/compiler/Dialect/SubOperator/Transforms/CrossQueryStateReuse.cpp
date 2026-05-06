@@ -95,6 +95,12 @@ static llvm::DenseSet<mlir::Value> expandNeededStatesFromTargets(llvm::ArrayRef<
 
    for (size_t qi = 0; qi < queue.size(); ++qi) {
       mlir::Value s = queue[qi];
+
+      if (auto itM = findReuseMap(reuse.mergedFromThreadLocal, s);
+          itM != reuse.mergedFromThreadLocal.end()) {
+         enqueue(itM->second);
+      }
+
       auto itW = findReuseMap(reuse.writerStepsByState, s);
       if (itW == reuse.writerStepsByState.end()) continue;
       for (ExecutionStepOp w : itW->second) {
@@ -102,10 +108,6 @@ static llvm::DenseSet<mlir::Value> expandNeededStatesFromTargets(llvm::ArrayRef<
          for (mlir::Value r : rw->reads) {
             enqueue(r);
          }
-      }
-      if (auto itM = findReuseMap(reuse.mergedFromThreadLocal, s);
-          itM != reuse.mergedFromThreadLocal.end()) {
-         enqueue(itM->second);
       }
    }
    return needed;
