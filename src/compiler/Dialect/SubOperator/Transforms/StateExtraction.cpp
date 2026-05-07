@@ -2,6 +2,8 @@
 
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorDialect.h"
 #include "lingodb/compiler/Dialect/TupleStream/TupleStreamDialect.h"
+#include "lingodb/runtime/ExternalDataSourceProperty.h"
+#include "lingodb/utility/Serialization.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Attributes.h"
@@ -13,6 +15,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_set>
+#include <sstream>
 #include <llvm/ADT/SmallSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/DenseSet.h>
@@ -23,6 +27,90 @@
 namespace lingodb::compiler::dialect::subop {
 
 namespace {
+
+static std::string normalizeExternalDataSourceDescrHex(llvm::StringRef hexDescr) {
+   using lingodb::runtime::ExternalDatasourceProperty;
+   using lingodb::runtime::FilterDescription;
+   using lingodb::runtime::FilterOp;
+
+   ExternalDatasourceProperty ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(hexDescr);
+
+   // Normalize mapping order.
+   llvm::SmallVector<ExternalDatasourceProperty::Mapping, 8> mapping(ds.mapping.begin(), ds.mapping.end());
+   llvm::sort(mapping, [](const auto& a, const auto& b) {
+      return a.memberName < b.memberName;
+   });
+
+   // Normalize filters: de-duplicate then sort by a stable key.
+   std::unordered_set<FilterDescription> uniq;
+   llvm::SmallVector<FilterDescription, 8> filters;
+   for (auto& f : ds.filterDescriptions) {
+      if (!uniq.insert(f).second) continue;
+      filters.push_back(f);
+   }
+   auto filterOpToStr = [](FilterOp op) -> const char* {
+      switch (op) {
+         case FilterOp::EQ: return "EQ";
+         case FilterOp::NEQ: return "NEQ";
+         case FilterOp::LT: return "LT";
+         case FilterOp::LTE: return "LTE";
+         case FilterOp::GT: return "GT";
+         case FilterOp::GTE: return "GTE";
+         case FilterOp::NOTNULL: return "NOTNULL";
+         case FilterOp::IN: return "IN";
+      }
+      return "UNKNOWN";
+   };
+   auto filterValueToStr = [](const FilterDescription& f) -> std::string {
+      std::string out;
+      std::ostringstream os;
+      // value
+      os << "v=";
+      std::visit([&](auto const& v) { os << v; }, f.value);
+      // values (for IN)
+      os << ";vs=";
+      std::visit([&](auto const& vs) {
+         os << "[";
+         for (size_t i = 0; i < vs.size(); i++) {
+            if (i) os << ",";
+            os << vs[i];
+         }
+         os << "]";
+      }, f.values);
+      out = os.str();
+      return out;
+   };
+   llvm::sort(filters, [&](const FilterDescription& a, const FilterDescription& b) {
+      if (a.columnName != b.columnName) return a.columnName < b.columnName;
+      if (a.columnId != b.columnId) return a.columnId < b.columnId;
+      if (a.op != b.op) return static_cast<uint8_t>(a.op) < static_cast<uint8_t>(b.op);
+      auto av = filterValueToStr(a);
+      auto bv = filterValueToStr(b);
+      return av < bv;
+   });
+
+   // Render to a stable string that we still use for matching (for now).
+   std::string s;
+   llvm::raw_string_ostream ss(s);
+   ss << "table=" << ds.tableName;
+   ss << ";index=" << ds.index;
+   ss << ";indexType=" << ds.indexType;
+   ss << ";mapping=[";
+   for (size_t i = 0; i < mapping.size(); i++) {
+      if (i) ss << ",";
+      ss << mapping[i].memberName << "->" << mapping[i].identifier;
+   }
+   ss << "]";
+   ss << ";filters=[";
+   for (size_t i = 0; i < filters.size(); i++) {
+      if (i) ss << ",";
+      ss << filters[i].columnName << "#" << filters[i].columnId << ":" << filterOpToStr(filters[i].op) << "{"
+         << filterValueToStr(filters[i]) << "}";
+   }
+   ss << "]";
+   ss.flush();
+   return s;
+}
 
 bool isCreateLike(mlir::Operation& op) {
    return mlir::isa<
@@ -694,7 +782,7 @@ llvm::DenseMap<mlir::Value, std::string> buildTableDescrByTableState(mlir::Modul
       assert(found && "table_ref step must contain get_external");
       assert(step.getNumResults() == 1 && "table_ref step must return one value");
       mlir::Value t = step.getResult(0);
-      tableDescr[t] = geOp.getDescr().str();
+      tableDescr[t] = normalizeExternalDataSourceDescrHex(geOp.getDescr());
    });
    return tableDescr;
 }
