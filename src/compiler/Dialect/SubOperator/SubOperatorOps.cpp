@@ -19,6 +19,13 @@ using namespace lingodb::compiler::dialect;
 
 namespace {
 
+/// Operand type may be `!subop.thread_local<...>`; the wrapped type is the `State` carrying members.
+static subop::State getStateTypeForWrittenMembers(mlir::Type stateTy) {
+   if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(stateTy))
+      return mlir::cast<subop::State>(tl.getWrapped());
+   return mlir::cast<subop::State>(stateTy);
+}
+
 tuples::ColumnManager& getColumnManager(::mlir::OpAsmParser& parser) {
    return parser.getBuilder().getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
 }
@@ -1287,7 +1294,7 @@ mlir::Operation* subop::ScatterOp::cloneSubOp(mlir::OpBuilder& builder, mlir::IR
    return newOp;
 }
 llvm::SmallVector<subop::Member> subop::LookupOrInsertOp::getWrittenMembers() {
-   return mlir::cast<subop::State>(getState().getType()).getMembers().getMembers();
+   return getStateTypeForWrittenMembers(getState().getType()).getMembers().getMembers();
 }
 mlir::Operation* subop::LookupOrInsertOp::cloneSubOp(mlir::OpBuilder& builder, mlir::IRMapping& mapping, subop::ColumnMapping& columnMapping) {
    auto newOp = builder.create<LookupOrInsertOp>(this->getLoc(), mapping.lookupOrDefault(getStream()), mapping.lookupOrDefault(getState()), columnMapping.remap(getKeys()), columnMapping.clone(getRef()));
@@ -1297,7 +1304,7 @@ mlir::Operation* subop::LookupOrInsertOp::cloneSubOp(mlir::OpBuilder& builder, m
    return newOp;
 }
 llvm::SmallVector<subop::Member> subop::InsertOp::getWrittenMembers() {
-   return mlir::cast<subop::State>(getState().getType()).getMembers().getMembers();
+   return getStateTypeForWrittenMembers(getState().getType()).getMembers().getMembers();
 }
 
 mlir::Operation* subop::InsertOp::cloneSubOp(mlir::OpBuilder& builder, mlir::IRMapping& mapping, subop::ColumnMapping& columnMapping) {

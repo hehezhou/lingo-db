@@ -2,6 +2,7 @@
 #define LINGODB_COMPILER_DIALECT_SUBOPERATOR_TRANSFORMS_STATEEXTRACTION_H
 
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorOps.h"
+#include "lingodb/runtime/ExternalDataSourceProperty.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include <llvm/Support/raw_ostream.h>
@@ -57,6 +58,10 @@ struct ModuleReuseInfo {
    /// `execution_step` that returns it. Used when `writerStepsByState` has no entry for pure
    /// `subop.create` / `create_thread_local` producers.
    llvm::DenseMap<mlir::Value, subop::ExecutionStepOp> createOnlyStepForState;
+
+   /// Canonical external table state (`!subop.table`) -> decoded external datasource property
+   /// (parsed from `subop.get_external` `descr` hex string).
+   llvm::DenseMap<mlir::Value, lingodb::runtime::ExternalDatasourceProperty> externalDatasourceByTableState;
 };
 
 ModuleReuseInfo collectModuleReuseInfo(mlir::ModuleOp moduleOp);

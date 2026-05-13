@@ -1,6 +1,7 @@
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/StateExtraction.h"
 
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorDialect.h"
+#include "lingodb/compiler/Dialect/SubOperator/SubOperatorOps.h"
 #include "lingodb/compiler/Dialect/TupleStream/TupleStreamDialect.h"
 #include "lingodb/runtime/ExternalDataSourceProperty.h"
 #include "lingodb/utility/Serialization.h"
@@ -22,6 +23,7 @@
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/StringMap.h>
+#include <llvm/ADT/StringRef.h>
 #include <llvm/Support/raw_ostream.h>
 
 namespace lingodb::compiler::dialect::subop {
@@ -139,10 +141,60 @@ static bool isFuncBlockArgument(mlir::Value v) {
    return mlir::isa_and_nonnull<mlir::func::FuncOp>(owner->getParentOp());
 }
 
+/// Cross-query reuse may extend value/buffer members with `filter_pred$0` while nested regions still
+/// refer to the pre-extension type; treat those as compatible for mapping block args to operands.
+static mlir::Type stripTrailingFilterPredMember(mlir::Type t) {
+   auto* d = t.getContext()->getLoadedDialect<subop::SubOperatorDialect>();
+   if (!d) return t;
+   const auto& mm = d->getMemberManager();
+   auto isPred = [&](subop::Member m) {
+      return llvm::StringRef(mm.getName(m)).contains("filter_pred");
+   };
+   auto* ctx = t.getContext();
+   if (auto buf = mlir::dyn_cast<subop::BufferType>(t)) {
+      auto mems = buf.getMembers().getMembers();
+      if (mems.empty() || !isPred(mems.back())) return t;
+      llvm::SmallVector<subop::Member> pref(mems.begin(), mems.end() - 1);
+      return subop::BufferType::get(ctx, subop::StateMembersAttr::get(ctx, std::move(pref)));
+   }
+   if (auto hm = mlir::dyn_cast<subop::HashMapType>(t)) {
+      auto vals = hm.getValueMembers().getMembers();
+      if (vals.empty() || !isPred(vals.back())) return t;
+      llvm::SmallVector<subop::Member> pref(vals.begin(), vals.end() - 1);
+      auto newVals = subop::StateMembersAttr::get(ctx, std::move(pref));
+      return subop::HashMapType::get(ctx, hm.getKeyMembers(), newVals, hm.getWithLock());
+   }
+   if (auto fr = mlir::dyn_cast<subop::PreAggrHtFragmentType>(t)) {
+      auto vals = fr.getValueMembers().getMembers();
+      if (vals.empty() || !isPred(vals.back())) return t;
+      llvm::SmallVector<subop::Member> pref(vals.begin(), vals.end() - 1);
+      auto newVals = subop::StateMembersAttr::get(ctx, std::move(pref));
+      return subop::PreAggrHtFragmentType::get(ctx, fr.getKeyMembers(), newVals, fr.getWithLock());
+   }
+   if (auto ht = mlir::dyn_cast<subop::PreAggrHtType>(t)) {
+      auto vals = ht.getValueMembers().getMembers();
+      if (vals.empty() || !isPred(vals.back())) return t;
+      llvm::SmallVector<subop::Member> pref(vals.begin(), vals.end() - 1);
+      auto newVals = subop::StateMembersAttr::get(ctx, std::move(pref));
+      return subop::PreAggrHtType::get(ctx, ht.getKeyMembers(), newVals, ht.getWithLock());
+   }
+   return t;
+}
+
 static bool canMapBlockArgToOperandByType(mlir::Type operandTy, mlir::Type argTy) {
    if (operandTy == argTy) return true;
+   if (stripTrailingFilterPredMember(operandTy) == stripTrailingFilterPredMember(argTy)) return true;
    if (auto tl = mlir::dyn_cast_or_null<subop::ThreadLocalType>(operandTy)) {
-      return tl.getWrapped() == argTy;
+      mlir::Type w = tl.getWrapped();
+      if (w == argTy || stripTrailingFilterPredMember(w) == stripTrailingFilterPredMember(argTy) ||
+          w == stripTrailingFilterPredMember(argTy) || stripTrailingFilterPredMember(w) == argTy)
+         return true;
+   }
+   if (auto tl = mlir::dyn_cast_or_null<subop::ThreadLocalType>(argTy)) {
+      mlir::Type w = tl.getWrapped();
+      if (w == operandTy || stripTrailingFilterPredMember(w) == stripTrailingFilterPredMember(operandTy) ||
+          w == stripTrailingFilterPredMember(operandTy) || stripTrailingFilterPredMember(w) == operandTy)
+         return true;
    }
    return false;
 }
@@ -187,7 +239,9 @@ mlir::Value canonicalizeStateValue(subop::ExecutionStepOp step, mlir::Value v) {
       if (candidate) {
          return canonicalizeStateValue(step, candidate);
       }
-      assert(0 && "unresolved nested-region block argument: no matching parent operand");
+      // No parent operand matches (e.g. state threaded only through `subop.map` region args).
+      // Keep the value so `getMembersForStateValue` can still classify the type; reuse keys may be less canonical.
+      return v;
    }
    auto inputs = step.getInputs();
    auto idx = ba.getArgNumber();
@@ -825,6 +879,24 @@ static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp 
 
       bool tableRef = isExternalTableRefStep(step);
       bool createOnly = isCreateOnlyExecutionStep(step);
+
+      // 0) Record decoded external datasource property for table_ref steps.
+      if (tableRef) {
+         auto& block = step.getSubOps().front();
+         subop::GetExternalOp geOp;
+         for (auto& op : block.without_terminator()) {
+            if (auto g = mlir::dyn_cast<subop::GetExternalOp>(&op)) {
+               geOp = g;
+               break;
+            }
+         }
+         assert(geOp && "table_ref step must contain get_external");
+         assert(step.getNumResults() == 1 && "table_ref step must return one value");
+         mlir::Value t = canonicalizeStateValueDeep(step.getResult(0));
+         // Decode once and keep it for downstream rewrites (filter delaying etc.).
+         a.reuse.externalDatasourceByTableState[t] =
+            lingodb::utility::deserializeFromHexString<lingodb::runtime::ExternalDatasourceProperty>(geOp.getDescr());
+      }
 
       // 1) Record creation/writes for step results (state values).
       for (auto r : step.getResults()) {

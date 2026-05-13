@@ -23,8 +23,13 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Transforms/Passes.h"
+
+#include "lingodb/compiler/Dialect/DB/IR/DBOps.h"
+#include "lingodb/compiler/Dialect/util/UtilOps.h"
 
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/MemoryBuffer.h>
@@ -115,8 +120,73 @@ static void executeFromSubOpLayer(mlir::ModuleOp subopModule,
    {
       mlir::PassManager lowerDBPm(subopModule.getContext());
       lowerDBPm.enableVerifier(true);
+      // Help downstream pipelines by reconciling unrealized casts early.
+      lowerDBPm.addPass(mlir::createReconcileUnrealizedCastsPass());
+      // Experimental: fold `util.generic_memref_cast` + unrealized conversion into a single
+      // `util.generic_memref_cast` to the final type.
+      struct FixGenericMemrefCastTargets
+         : public mlir::PassWrapper<FixGenericMemrefCastTargets, mlir::OperationPass<mlir::ModuleOp>> {
+         void runOnOperation() override {
+            auto module = getOperation();
+            module.walk([&](mlir::UnrealizedConversionCastOp castOp) {
+               if (castOp.getNumOperands() != 1 || castOp.getNumResults() != 1) return;
+               auto gmc = castOp.getOperand(0).getDefiningOp<lingodb::compiler::dialect::util::GenericMemrefCastOp>();
+               if (!gmc) return;
+               // Only rewrite if the cast result is a util.ref-like type (usually nested ref/tuple).
+               mlir::Type dstT = castOp.getResult(0).getType();
+               llvm::SmallString<64> s;
+               {
+                  llvm::raw_svector_ostream os(s);
+                  dstT.print(os);
+               }
+               if (!llvm::StringRef(s).contains("!util.ref")) return;
+
+               mlir::OpBuilder b(gmc);
+               auto newCast = b.create<lingodb::compiler::dialect::util::GenericMemrefCastOp>(gmc.getLoc(), dstT, gmc.getVal());
+               castOp.getResult(0).replaceAllUsesWith(newCast.getRes());
+               castOp.erase();
+               // erase old gmc if dead
+               if (gmc->use_empty()) gmc.erase();
+            });
+         }
+      };
+      lowerDBPm.addPass(std::make_unique<FixGenericMemrefCastTargets>());
+      struct FixUnrealizedScalarCasts
+         : public mlir::PassWrapper<FixUnrealizedScalarCasts, mlir::OperationPass<mlir::ModuleOp>> {
+         void runOnOperation() override {
+            auto module = getOperation();
+            module.walk([&](mlir::UnrealizedConversionCastOp castOp) {
+               if (castOp.getNumOperands() != 1 || castOp.getNumResults() != 1) return;
+               mlir::Value in = castOp.getOperand(0);
+               mlir::Type srcT = in.getType();
+               mlir::Type dstT = castOp.getResult(0).getType();
+               // Only handle scalar casts; util.ref and tuples are handled by other conversions.
+               llvm::SmallString<64> s1, s2;
+               {
+                  llvm::raw_svector_ostream os(s1);
+                  srcT.print(os);
+               }
+               {
+                  llvm::raw_svector_ostream os(s2);
+                  dstT.print(os);
+               }
+               if (llvm::StringRef(s1).contains("!util.ref") || llvm::StringRef(s2).contains("!util.ref")) return;
+               if (llvm::StringRef(s1).contains("tuple<") || llvm::StringRef(s2).contains("tuple<")) return;
+
+               mlir::OpBuilder b(castOp);
+               auto dbCast = b.create<lingodb::compiler::dialect::db::CastOp>(castOp.getLoc(), dstT, in);
+               castOp.getResult(0).replaceAllUsesWith(dbCast.getRes());
+               castOp.erase();
+            });
+         }
+      };
+      // Experimental: turn remaining unrealized scalar casts into explicit db.cast ops.
+      lowerDBPm.addPass(std::make_unique<FixUnrealizedScalarCasts>());
       db::createLowerDBPipeline(lowerDBPm);
-      assert(succeeded(lowerDBPm.run(subopModule)));
+      if (failed(lowerDBPm.run(subopModule))) {
+         subopModule.dump();
+         assert(0 && "lowerDBPm failed (dumped module above)");
+      }
    }
 
    // Lower Arrow ops to std.
@@ -276,6 +346,11 @@ int main(int argc, char** argv) {
    }
    auto rewriteRes = lingodb::compiler::dialect::subop::rewritePlansWithSyntheticQuery0(
       runs[0].module, runs[1].module, firstPair);
+   if (mlir::failed(mlir::verify(runs[0].module)) || mlir::failed(mlir::verify(runs[1].module)) ||
+       (rewriteRes.query0 && mlir::failed(mlir::verify(*rewriteRes.query0)))) {
+      llvm::errs() << "subop-print-steps: MLIR verification failed after cross-query reuse rewrite\n";
+      return 1;
+   }
    llvm::outs() << "\n// reuse_targets: query[0]=" << rewriteRes.numTargetsQuery0
                   << " query[1]=" << rewriteRes.numTargetsQuery1 << "\n";
    llvm::outs() << "\n// reuse_targets_q0_mapped: " << rewriteRes.numTargetsQuery0Mapped << "\n";
@@ -316,6 +391,11 @@ int main(int argc, char** argv) {
    // Execute query0 first, then the original queries.
    // Use a shared ExecutionContext so cache_get/cache_put pointers remain valid across the
    // synthetic producer run and the consumer queries.
+   const bool skipExecute = (std::getenv("LINGODB_SKIP_EXECUTE") != nullptr);
+   if (skipExecute) {
+      llvm::outs() << "\n// (LINGODB_SKIP_EXECUTE set: skipping JIT execution)\n";
+      return 0;
+   }
    auto sharedExecCtx = session->createExecutionContext();
    auto runOne = [&](mlir::ModuleOp mod, const std::string& label) {
       llvm::outs() << "\n// ============================\n";

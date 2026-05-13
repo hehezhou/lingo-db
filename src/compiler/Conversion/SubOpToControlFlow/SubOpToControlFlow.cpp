@@ -2529,14 +2529,20 @@ class MaterializeHeapLowering : public SubOpTupleStreamConsumerConversionPattern
    public:
    using SubOpTupleStreamConsumerConversionPattern<subop::MaterializeOp>::SubOpTupleStreamConsumerConversionPattern;
 
+   static subop::HeapType getHeapTypeForMaterializeState(mlir::Type stateTy) {
+      if (auto h = mlir::dyn_cast_or_null<subop::HeapType>(stateTy)) return h;
+      if (auto tl = mlir::dyn_cast_or_null<subop::ThreadLocalType>(stateTy))
+         return mlir::dyn_cast_or_null<subop::HeapType>(tl.getWrapped());
+      return {};
+   }
+
    LogicalResult match(subop::MaterializeOp materializeOp) const override {
-      auto heapType = mlir::dyn_cast_or_null<subop::HeapType>(materializeOp.getState().getType());
-      if (!heapType) return failure();
-      return success();
+      return success(getHeapTypeForMaterializeState(materializeOp.getState().getType()) != nullptr);
    }
 
    void rewrite(subop::MaterializeOp materializeOp, OpAdaptor adaptor, SubOpRewriter& rewriter, ColumnMapping& mapping) const override {
-      auto heapType = mlir::cast<subop::HeapType>(materializeOp.getState().getType());
+      auto heapType = getHeapTypeForMaterializeState(materializeOp.getState().getType());
+      assert(heapType && "match() should guarantee heap or thread_local<heap>");
       EntryStorageHelper storageHelper(materializeOp, heapType.getMembers(), heapType.hasLock(), typeConverter);
       mlir::Value ref;
       rewriter.atStartOf(&rewriter.getCurrentStreamLoc()->getParentOfType<mlir::func::FuncOp>().getFunctionBody().front(), [&](SubOpRewriter& rewriter) {
@@ -2552,14 +2558,20 @@ class MaterializeVectorLowering : public SubOpTupleStreamConsumerConversionPatte
    public:
    using SubOpTupleStreamConsumerConversionPattern<subop::MaterializeOp>::SubOpTupleStreamConsumerConversionPattern;
 
+   static subop::BufferType getBufferTypeForMaterializeState(mlir::Type stateTy) {
+      if (auto b = mlir::dyn_cast_or_null<subop::BufferType>(stateTy)) return b;
+      if (auto tl = mlir::dyn_cast_or_null<subop::ThreadLocalType>(stateTy))
+         return mlir::dyn_cast_or_null<subop::BufferType>(tl.getWrapped());
+      return {};
+   }
+
    LogicalResult match(subop::MaterializeOp materializeOp) const override {
-      auto bufferType = mlir::dyn_cast_or_null<subop::BufferType>(materializeOp.getState().getType());
-      if (!bufferType) return failure();
-      return success();
+      return success(getBufferTypeForMaterializeState(materializeOp.getState().getType()) != nullptr);
    }
 
    void rewrite(subop::MaterializeOp materializeOp, OpAdaptor adaptor, SubOpRewriter& rewriter, ColumnMapping& mapping) const override {
-      auto bufferType = mlir::cast<subop::BufferType>(materializeOp.getState().getType());
+      auto bufferType = getBufferTypeForMaterializeState(materializeOp.getState().getType());
+      assert(bufferType && "match() should guarantee buffer or thread_local<buffer>");
       EntryStorageHelper storageHelper(materializeOp, bufferType.getMembers(), bufferType.hasLock(), typeConverter);
       mlir::Value ref = rt::GrowingBuffer::insert(rewriter, materializeOp->getLoc())({adaptor.getState()})[0];
       storageHelper.storeFromColumns(materializeOp.getMapping(), mapping, ref, rewriter, materializeOp->getLoc());
@@ -3091,13 +3103,21 @@ class InsertMultiMapLowering : public SubOpTupleStreamConsumerConversionPattern<
 class LookupPreAggrHtFragment : public SubOpTupleStreamConsumerConversionPattern<subop::LookupOrInsertOp> {
    public:
    using SubOpTupleStreamConsumerConversionPattern<subop::LookupOrInsertOp>::SubOpTupleStreamConsumerConversionPattern;
+
+   static subop::PreAggrHtFragmentType getFragmentTypeForState(mlir::Type st) {
+      if (auto f = mlir::dyn_cast<subop::PreAggrHtFragmentType>(st)) return f;
+      if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(st))
+         return mlir::dyn_cast<subop::PreAggrHtFragmentType>(tl.getWrapped());
+      return {};
+   }
+
    LogicalResult match(subop::LookupOrInsertOp lookupOp) const override {
-      if (!mlir::isa<subop::PreAggrHtFragmentType>(lookupOp.getState().getType())) return failure();
-      return success();
+      return success(getFragmentTypeForState(lookupOp.getState().getType()) != nullptr);
    }
 
    void rewrite(subop::LookupOrInsertOp lookupOp, OpAdaptor adaptor, SubOpRewriter& rewriter, ColumnMapping& mapping) const override {
-      subop::PreAggrHtFragmentType fragmentType = mlir::cast<subop::PreAggrHtFragmentType>(lookupOp.getState().getType());
+      auto fragmentType = getFragmentTypeForState(lookupOp.getState().getType());
+      assert(fragmentType && "match() should guarantee fragment or thread_local<fragment>");
       EntryStorageHelper keyStorageHelper(lookupOp, fragmentType.getKeyMembers(), false, typeConverter);
       EntryStorageHelper valStorageHelper(lookupOp, fragmentType.getValueMembers(), fragmentType.hasLock(), typeConverter);
       auto lookupKey = mapping.resolve(lookupOp, lookupOp.getKeys());
@@ -3185,13 +3205,21 @@ class LookupPreAggrHtFragment : public SubOpTupleStreamConsumerConversionPattern
 class LookupHashMapLowering : public SubOpTupleStreamConsumerConversionPattern<subop::LookupOrInsertOp> {
    public:
    using SubOpTupleStreamConsumerConversionPattern<subop::LookupOrInsertOp>::SubOpTupleStreamConsumerConversionPattern;
+
+   static subop::HashMapType getHashMapTypeForState(mlir::Type st) {
+      if (auto hm = mlir::dyn_cast<subop::HashMapType>(st)) return hm;
+      if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(st))
+         return mlir::dyn_cast<subop::HashMapType>(tl.getWrapped());
+      return {};
+   }
+
    LogicalResult match(subop::LookupOrInsertOp lookupOp) const override {
-      if (!mlir::isa<subop::HashMapType>(lookupOp.getState().getType())) return failure();
-      return success();
+      return success(getHashMapTypeForState(lookupOp.getState().getType()) != nullptr);
    }
 
    void rewrite(subop::LookupOrInsertOp lookupOp, OpAdaptor adaptor, SubOpRewriter& rewriter, ColumnMapping& mapping) const override {
-      subop::HashMapType htStateType = mlir::cast<subop::HashMapType>(lookupOp.getState().getType());
+      auto htStateType = getHashMapTypeForState(lookupOp.getState().getType());
+      assert(htStateType && "match() should guarantee hashmap or thread_local<hashmap>");
       EntryStorageHelper keyStorageHelper(lookupOp, htStateType.getKeyMembers(), false, typeConverter);
       EntryStorageHelper valStorageHelper(lookupOp, htStateType.getValueMembers(), htStateType.hasLock(), typeConverter);
       auto lookupKey = mapping.resolve(lookupOp, lookupOp.getKeys());
