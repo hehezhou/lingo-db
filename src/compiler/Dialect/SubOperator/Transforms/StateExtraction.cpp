@@ -26,14 +26,18 @@
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/raw_ostream.h>
 
-namespace lingodb::compiler::dialect::subop {
+namespace {
 
-llvm::SmallVector<int, 16> getPrereqConstructionStepIndices(
-   mlir::Value state,
-   llvm::ArrayRef<int> hashConstructionStepIndices,
-   const llvm::DenseMap<mlir::Value, mlir::Value>& mergedFromThreadLocal,
-   const llvm::DenseMap<mlir::Value, int>& createdAtByState,
-   const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex);
+llvm::SmallVector<int, 16> sortedUniqueStepIndices(llvm::ArrayRef<int> stepIndices) {
+   llvm::SmallVector<int, 16> out(stepIndices.begin(), stepIndices.end());
+   llvm::sort(out);
+   out.erase(std::unique(out.begin(), out.end()), out.end());
+   return out;
+}
+
+} // namespace
+
+namespace lingodb::compiler::dialect::subop {
 
 namespace {
 
@@ -360,31 +364,16 @@ llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRW(subop::ExecutionStepOp s
          continue;
       }
 
-      // `materialize` always writes its state operand. `getWrittenMembers()` returns mapping
-      // members which may not `intersectMembers` with `getMembersForStateValue(state)` when
-      // Member identities differ from the state's type members — then we miss `write`, and
-      // passes that rely on `writerStepsByState` (e.g. `cache_put` placement for cross-query
-      // reuse) can insert `cache_put` before the table is actually filled (SIGSEGV at runtime).
+      // `materialize`: always mark state written; skip generic member-intersection (sink vs stream).
       if (auto mat = mlir::dyn_cast<subop::MaterializeOp>(&op)) {
          mlir::Value stv = mat.getState();
          if (isStateType(stv.getType()) || isThreadLocalOfStateType(stv.getType())) {
             res[canonicalizeStateValueDeep(stv)].write = true;
          }
-         // `getWrittenMembers()` names sink-side state members; those column refs often overlap the
-         // *source* table stream's member set. The generic loop below would then mark the table as
-         // `write` in the same step as the real buffer write → spurious multi-writer steps and
-         // `multiWrite` disqualifies merge-produced join buffers for cross-query reuse.
-         mlir::Value stream = mat.getStream();
-         if (isStateType(stream.getType()) || isThreadLocalOfStateType(stream.getType())) {
-            res[canonicalizeStateValueDeep(stream)].read = true;
-         }
          continue;
       }
+      // `create_hash_indexed_view`: only reads source buffer; generic loop would mark buffer written.
       if (auto hiv = mlir::dyn_cast<subop::CreateHashIndexedView>(&op)) {
-         // `getWrittenMembers()` returns HIV-side link/hash members; those intersect the *source*
-         // buffer's member set, so the generic loop would spuriously mark the buffer as written here.
-         // That records the HIV step in `writesByState[buffer]`, widens construction/prereq analysis
-         // onto the join step, and prereqs pick up the HIV value → `collectDeps` fails for merge buffers.
          mlir::Value src = hiv.getSource();
          if (isStateType(src.getType()) || isThreadLocalOfStateType(src.getType())) {
             res[canonicalizeStateValueDeep(src)].read = true;
@@ -1066,17 +1055,6 @@ static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp 
    return a;
 }
 
-/// True if \p v is the `thread_local` operand of some `subop.merge` (paired with the merged global state).
-/// For cross-query *match* deps we treat that pair as one logical state: the thread_local side must not
-/// force a spurious "depends on internal state" failure, nor an extra dep token.
-static bool isThreadLocalMergePartner(mlir::Value v,
-                                      const llvm::DenseMap<mlir::Value, mlir::Value>& mergedFromThreadLocal) {
-   for (auto& kv : mergedFromThreadLocal) {
-      if (kv.second == v) return true;
-   }
-   return false;
-}
-
 llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
    int queryId,
    mlir::ModuleOp moduleOp,
@@ -1086,6 +1064,9 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
    subop::MemberManager& memberManager = dialect->getMemberManager();
 
    auto a = analyzeModuleForMatchAndReuse(moduleOp);
+
+   llvm::DenseSet<mlir::Value> threadLocalMergePartners;
+   for (auto& kv : a.mergedFromThreadLocal) threadLocalMergePartners.insert(kv.second);
 
    llvm::SmallVector<StateMatchProfile, 128> profiles;
 
@@ -1097,21 +1078,10 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
          continue;
       }
 
-      // Skip thread_local states that are merged away into a global state.
-      // We treat the merge result (global state) as the reusable state; the thread_local is
-      // just an intermediate construction artifact and should not be reused/cached directly.
-      bool mergedAway = false;
-      for (auto& kv : a.mergedFromThreadLocal) {
-         if (kv.second == s) {
-            mergedAway = true;
-            break;
-         }
-      }
-      if (mergedAway) continue;
+      if (threadLocalMergePartners.contains(s)) continue;
 
       auto stepIdxs = getConstructionStepIndicesForState(s, a.createdAtByState, a.writesByState, a.mergedFromThreadLocal);
-      auto prereqStepIdxs =
-         getPrereqConstructionStepIndices(s, stepIdxs, a.mergedFromThreadLocal, a.createdAtByState, a.stepByIndex);
+      auto prereqStepIdxs = sortedUniqueStepIndices(stepIdxs);
 
       llvm::SmallVector<uint64_t, 16> stepHashes;
       stepHashes.reserve(stepIdxs.size());
@@ -1136,7 +1106,7 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
       for (auto pv : prereqs) prereqSeen.insert(pv);
       for (int si : prereqStepIdxs) {
          auto itSt = a.stepByIndex.find(si);
-         if (itSt == a.stepByIndex.end()) continue;
+         assert(itSt != a.stepByIndex.end());
          appendNestedStateOperandsAsPrereqs(itSt->second, s, prereqSeen, prereqs);
       }
 
@@ -1149,20 +1119,20 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
                out.append(itM->second.begin(), itM->second.end());
                return true;
             }
-            if (!visiting.insert(st).second) return false;
+            assert(visiting.insert(st).second && "state dep graph must be acyclic");
 
             llvm::SmallVector<std::string, 8> local;
             auto itC = a.createdAtByState.find(st);
-            if (itC == a.createdAtByState.end()) return false;
+            assert(itC != a.createdAtByState.end());
             auto stHashSteps = getConstructionStepIndicesForState(st, a.createdAtByState, a.writesByState, a.mergedFromThreadLocal);
-            auto stRwSteps = getPrereqConstructionStepIndices(st, stHashSteps, a.mergedFromThreadLocal, a.createdAtByState, a.stepByIndex);
+            auto stRwSteps = sortedUniqueStepIndices(stHashSteps);
             llvm::SmallVector<mlir::Value, 8> stPrereqs =
                getPrereqStatesForConstructionSteps(stRwSteps, st, a.rwByStep);
             llvm::DenseSet<mlir::Value> nestedSeen;
             for (auto pv : stPrereqs) nestedSeen.insert(pv);
             for (int si : stRwSteps) {
                auto itSt = a.stepByIndex.find(si);
-               if (itSt == a.stepByIndex.end()) continue;
+               assert(itSt != a.stepByIndex.end());
                appendNestedStateOperandsAsPrereqs(itSt->second, st, nestedSeen, stPrereqs);
             }
             for (auto p : stPrereqs) {
@@ -1193,10 +1163,7 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
                   if (!collectDeps(p, local)) return false;
                   continue;
                }
-               // `subop.merge` pairs (global, thread_local): same logical state; ignore the TL operand here.
-               if (isThreadLocalMergePartner(p, a.mergedFromThreadLocal)) {
-                  continue;
-               }
+               if (threadLocalMergePartners.contains(p)) continue;
                // Merge **result** (global side): same logical construction unit as the TL operand. Downstream
                // states (e.g. `hash_indexed_view` built only from the merged buffer) must not treat this
                // global `State` as an opaque internal edge — fold to that value's own construction deps.
@@ -1211,10 +1178,8 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
                   if (!collectDeps(p, local)) return false;
                   continue;
                }
-               if (mlir::isa<subop::State>(p.getType())) {
-                  return false;
-               }
-               return false;
+               if (mlir::isa<subop::State>(p.getType())) return false;
+               llvm_unreachable("collectDeps: unexpected prereq value type");
             }
 
             visiting.erase(st);
@@ -1277,26 +1242,6 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
 }
 
 } // anonymous
-
-llvm::SmallVector<int, 16> getPrereqConstructionStepIndices(
-   mlir::Value state,
-   llvm::ArrayRef<int> hashConstructionStepIndices,
-   const llvm::DenseMap<mlir::Value, mlir::Value>& mergedFromThreadLocal,
-   const llvm::DenseMap<mlir::Value, int>& createdAtByState,
-   const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex) {
-   (void)state;
-   (void)mergedFromThreadLocal;
-   (void)createdAtByState;
-   (void)stepByIndex;
-   // Historically, merge-produced states widened this to every execution_step between the paired
-   // thread_local's creation and the merge. That pulls unrelated states (heap / RT / join) into
-   // prereq discovery via `appendNestedStateOperandsAsPrereqs`, which blocks join-buffer reuse.
-   // Keep prereq discovery aligned with the construction-step set used for construction hashing.
-   llvm::SmallVector<int, 16> out(hashConstructionStepIndices.begin(), hashConstructionStepIndices.end());
-   llvm::sort(out);
-   out.erase(std::unique(out.begin(), out.end()), out.end());
-   return out;
-}
 
 mlir::Value canonicalizeStateValueForReuse(mlir::Value v) {
    return canonicalizeStateValueDeep(v);
@@ -1450,23 +1395,14 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
       return a.getAsOpaquePointer() < b.getAsOpaquePointer();
    });
 
+   llvm::DenseSet<mlir::Value> threadLocalMergePartners;
+   for (auto& kv : mergedFromThreadLocal) threadLocalMergePartners.insert(kv.second);
+
    for (auto s : states) {
-      // If this is a thread_local that is merged into some global state, don't print it separately.
-      // The merged global state's construction will include the thread_local side steps.
-      bool isThreadLocalMergedAway = false;
-      for (auto& kv : mergedFromThreadLocal) {
-         if (kv.second == s) {
-            isThreadLocalMergedAway = true;
-            break;
-         }
-      }
-      if (isThreadLocalMergedAway) {
-         continue;
-      }
+      if (threadLocalMergePartners.contains(s)) continue;
 
       auto stepIdxs = getConstructionStepIndicesForState(s, createdAtByState, writesByState, mergedFromThreadLocal);
-      auto prereqStepIdxs =
-         getPrereqConstructionStepIndices(s, stepIdxs, mergedFromThreadLocal, createdAtByState, stepByIndex);
+      auto prereqStepIdxs = sortedUniqueStepIndices(stepIdxs);
       os << "\n// -- state ";
       s.printAsOperand(os, flags);
       os << " : ";
@@ -1475,20 +1411,6 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
       os << "//   construction_steps: ";
       for (int si : stepIdxs) os << si << " ";
       os << "\n";
-      if (mergedFromThreadLocal.contains(s)) {
-         bool extra = false;
-         for (int si : prereqStepIdxs) {
-            if (!llvm::is_contained(stepIdxs, si)) {
-               extra = true;
-               break;
-            }
-         }
-         if (extra) {
-            os << "//   prereq_discovery_steps: ";
-            for (int si : prereqStepIdxs) os << si << " ";
-            os << "\n";
-         }
-      }
       if (auto it = mergedFromThreadLocal.find(s); it != mergedFromThreadLocal.end()) {
          os << "//   merged_from_thread_local: ";
          it->second.printAsOperand(os, flags);
@@ -1501,7 +1423,7 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
       for (auto pv : prereqs) prereqSeen.insert(pv);
       for (int si : prereqStepIdxs) {
          auto itSt = stepByIndex.find(si);
-         if (itSt == stepByIndex.end()) continue;
+         assert(itSt != stepByIndex.end());
          appendNestedStateOperandsAsPrereqs(itSt->second, s, prereqSeen, prereqs);
       }
       if (!prereqs.empty()) {

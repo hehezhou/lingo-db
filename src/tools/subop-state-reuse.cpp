@@ -417,22 +417,18 @@ int main(int argc, char** argv) {
    // Enable via env var: LINGODB_REUSE_PRINT_REWRITTEN=1
    const bool printRewritten = (std::getenv("LINGODB_REUSE_PRINT_REWRITTEN") != nullptr);
    if (printRewritten) {
-      llvm::outs() << "\n// ============================\n";
-      llvm::outs() << "// query[0] (synthetic) subop layer (post-rewrite)\n";
-      llvm::outs() << "// ============================\n";
-      if (rewriteRes.query0) {
+      if (rewriteRes.numTargetsQuery0Mapped > 0) {
+         assert(rewriteRes.query0);
+         llvm::outs() << "\n// ============================\n";
+         llvm::outs() << "// query[0] (synthetic) subop layer (post-rewrite)\n";
+         llvm::outs() << "// ============================\n";
          (*rewriteRes.query0)->print(llvm::outs());
-      } else {
-         llvm::outs() << "// (no synthetic module: cross-query rewrite skipped or returned early)\n";
+         llvm::outs() << "\n";
       }
-      llvm::outs() << "\n";
       llvm::outs() << "\n// ============================\n";
       llvm::outs() << "// Step layout vs SubOpToControlFlow stderr ordinal\n";
       llvm::outs() << "// ============================\n";
-      if (rewriteRes.numTargetsQuery0Mapped == 0 || !rewriteRes.query0) {
-         llvm::outs() << "// (synthetic query[0] has no cloned steps: reuse_targets_q0_mapped==0; "
-                          "see reuse_targets above. Layout below is from real query[0]/[1] modules.)\n";
-      } else {
+      if (rewriteRes.query0 && rewriteRes.numTargetsQuery0Mapped > 0) {
          llvm::outs() << "// query[0] (synthetic) — same indices as lowering uses for that module\n";
          lingodb::compiler::dialect::subop::printTopLevelExecutionStepLayout(*rewriteRes.query0, llvm::outs());
       }

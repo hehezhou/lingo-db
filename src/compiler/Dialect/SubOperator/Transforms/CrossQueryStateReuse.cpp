@@ -2976,23 +2976,19 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    llvm::SmallVector<CacheTarget, 64> targetsQ0;
    targetsQ0.reserve(targets0.size());
    for (auto& t : targets0) {
-      if (!t.state) continue;
+      assert(t.state && "reuse target state must be set");
       mlir::Value mapped = mapping.lookupOrNull(t.state);
-      if (!mapped) {
-         // If the matched state value is a canonical step input (BlockArgument), cache the value produced
-         // by the last writer step for this state.
-         if (!t.state.getDefiningOp()) {
-            if (auto itW = reuse0.writerStepsByState.find(t.state); itW != reuse0.writerStepsByState.end()) {
-               if (!itW->second.empty()) {
-                  auto lastWriter = itW->second.back();
-                  if (lastWriter.getNumResults() == 1) {
-                     mapped = mapping.lookupOrNull(lastWriter.getResult(0));
-                  }
+      if (!mapped && !t.state.getDefiningOp()) {
+         if (auto itW = reuse0.writerStepsByState.find(t.state); itW != reuse0.writerStepsByState.end()) {
+            if (!itW->second.empty()) {
+               auto lastWriter = itW->second.back();
+               if (lastWriter.getNumResults() == 1) {
+                  mapped = mapping.lookupOrNull(lastWriter.getResult(0));
                }
             }
          }
       }
-      if (!mapped) continue;
+      assert(mapped && "reuse target must map into synthetic query0 module");
       targetsQ0.push_back(CacheTarget{mapped, t.cacheKey});
    }
    res.numTargetsQuery0Mapped = targetsQ0.size();
