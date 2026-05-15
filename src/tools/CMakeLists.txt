@@ -45,11 +45,16 @@ target_link_libraries(sql-to-mlir PUBLIC ${LIBS} MLIRSQLFrontend ${COMMON_LIBS} 
 set_target_properties(sql-to-mlir PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 target_compile_definitions(sql-to-mlir PRIVATE ${COMPILE_DEFS})
 
-# subop-print-steps
-add_executable(subop-print-steps subop-print-steps.cpp)
-target_link_libraries(subop-print-steps PUBLIC ${LIBS} ${COMMON_LIBS})
-set_target_properties(subop-print-steps PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-target_compile_definitions(subop-print-steps PRIVATE ${COMPILE_DEFS})
+# subop-state-reuse: cross-query SubOp state reuse (IR/steps/matches + optional JIT execute)
+add_executable(subop-state-reuse subop-state-reuse.cpp)
+target_link_libraries(subop-state-reuse PUBLIC ${LIBS} ${COMMON_LIBS})
+set_target_properties(subop-state-reuse PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+target_compile_definitions(subop-state-reuse PRIVATE ${COMPILE_DEFS})
+add_custom_command(
+   TARGET subop-state-reuse POST_BUILD
+   COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:subop-state-reuse>
+           $<TARGET_FILE_DIR:subop-state-reuse>/subop-print-steps
+   COMMENT "Symlink subop-print-steps -> subop-state-reuse")
 
 # run-mlir
 add_executable(run-mlir run-mlir.cpp)

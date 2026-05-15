@@ -62,6 +62,9 @@ class ExecutionContext {
    std::vector<std::vector<State>> perWorkerStates;
    std::vector<Arena> stringArenas;
    Session& session;
+   /// Keys registered via `putCachedState` while this context was current; removed in `~ExecutionContext`
+   /// so the global cache does not retain pointers into freed `registerState` storage.
+   std::vector<uint64_t> cachedStateKeys;
 
    public:
    ExecutionContext(Session& session) : session(session) {
@@ -100,6 +103,9 @@ class ExecutionContext {
    static void setTupleCount(uint32_t id, int64_t tupleCount);
    static void putCachedState(uint64_t key, uint8_t* ptr);
    static uint8_t* getCachedState(uint64_t key);
+   /// Clears the experimental cross-query `cache_put` / `cache_get` map (not scoped to a single
+   /// `ExecutionContext`). Call when cached pointers are no longer valid (e.g. end of a tool run).
+   static void clearAllCachedStates();
    void registerState(const State& s) {
       perWorkerStates[lingodb::scheduler::currentWorkerId()].push_back(s);
    }

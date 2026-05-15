@@ -31,20 +31,46 @@
 #include "lingodb/compiler/Dialect/DB/IR/DBOps.h"
 #include "lingodb/compiler/Dialect/util/UtilOps.h"
 
+#include <llvm/ADT/StringRef.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <chrono>
 #include <cassert>
 #include <cctype>
 #include <cstdlib>
 #include <functional>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace {
+
+constexpr const char kToolName[] = "subop-state-reuse";
+
+/// Interpret \p envVar as an explicit boolean. Unset or empty → false.
+/// Tokens `0`, `false`, `no`, `off` (case-insensitive) → false so e.g. `LINGODB_*=0` does not enable the flag.
+/// Tokens `1`, `true`, `yes`, `on` → true.
+static bool envFlagEnabled(const char* envVar) {
+   const char* v = std::getenv(envVar);
+   if (!v || v[0] == '\0') return false;
+   llvm::StringRef s(v);
+   if (s.equals_insensitive("0") || s.equals_insensitive("false") || s.equals_insensitive("no") ||
+       s.equals_insensitive("off")) {
+      return false;
+   }
+   return s.equals_insensitive("1") || s.equals_insensitive("true") || s.equals_insensitive("yes") ||
+          s.equals_insensitive("on");
+}
+
+/// Elapsed milliseconds since \p start (same pattern as `LLVMBackends.cpp`).
+static double millisSince(std::chrono::high_resolution_clock::time_point start) {
+   auto end = std::chrono::high_resolution_clock::now();
+   return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+}
 
 const llvm::json::Array& getQueriesArray(const llvm::json::Object& obj) {
    if (auto* arr = obj.getArray("queries")) {
@@ -103,8 +129,14 @@ static void executeFromSubOpLayer(mlir::ModuleOp subopModule,
                                   lingodb::runtime::ExecutionContext* executionContext) {
    using namespace lingodb::compiler::dialect;
 
-   // Force sequential execution in this debug tool to reduce scheduler/parallelism sensitivity.
-   subopModule->setAttr("subop.sequential", mlir::UnitAttr::get(subopModule.getContext()));
+   // Default: keep `parallel` scan/map attrs from `runPasses` so JIT matches normal parallel lowering.
+   // Opt-in sequential debugging via `LINGODB_SUBOP_FORCE_SEQUENTIAL=1` (sets module attr + strips `parallel`).
+   if (envFlagEnabled("LINGODB_SUBOP_FORCE_SEQUENTIAL")) {
+      subopModule->setAttr("subop.sequential", mlir::UnitAttr::get(subopModule.getContext()));
+      subopModule.walk([&](mlir::Operation* op) {
+         if (op->hasAttr("parallel")) op->removeAttr("parallel");
+      });
+   }
 
    // From SubOp layer (after PrepareLoweringPass) to imperative lowering.
    {
@@ -200,6 +232,17 @@ static void executeFromSubOpLayer(mlir::ModuleOp subopModule,
       assert(succeeded(lowerArrowPm.run(subopModule)));
    }
 
+   // Cross-query reuse can leave a few `builtin.unrealized_conversion_cast` ops after dialect
+   // lowering; reconcile + canonicalize before LLVM translation (mirrors LLVMBackends.cpp).
+   {
+      mlir::PassManager tailPm(subopModule.getContext());
+      tailPm.enableVerifier(true);
+      tailPm.addPass(mlir::createReconcileUnrealizedCastsPass());
+      tailPm.addPass(lingodb::compiler::createCanonicalizerPass());
+      tailPm.addPass(mlir::createCSEPass());
+      assert(succeeded(tailPm.run(subopModule)));
+   }
+
    // Execute using default LLVM backend and print result.
    auto backend = std::shared_ptr<lingodb::execution::ExecutionBackend>(
       lingodb::execution::createDefaultLLVMBackend(/*optimize*/ true).release());
@@ -218,6 +261,7 @@ static void executeFromSubOpLayer(mlir::ModuleOp subopModule,
    };
 
    lingodb::scheduler::awaitEntryTask(std::make_unique<RunWithContextTask>(executionContext, [&]() {
+      lingodb::runtime::ExecutionContext::clearResult(0);
       backend->execute(subopModule, executionContext);
       printer->process(executionContext);
    }));
@@ -232,8 +276,8 @@ int main(int argc, char** argv) {
    }
 
    // Usage:
-   // - subop-print-steps <db_dir> <sql_or_json>
-   // - subop-print-steps <db_dir> <sql_file_a> <sql_file_b>
+   // - subop-state-reuse <db_dir> <sql_or_json>
+   // - subop-state-reuse <db_dir> <sql_file_a> <sql_file_b>
    assert(argc == 3 || argc == 4);
    std::string dbDir = argv[1];
 
@@ -287,6 +331,10 @@ int main(int argc, char** argv) {
    std::vector<QueryRun> runs;
    runs.reserve(queries.size());
 
+   double optimizationMs = 0;
+   llvm::SmallVector<double, 8> queryCompileMs;
+   queryCompileMs.reserve(queries.size());
+
    for (size_t i = 0; i < queries.size(); i++) {
       std::string sql = queries[i];
 
@@ -306,7 +354,13 @@ int main(int argc, char** argv) {
       assert(moduleOpPtr);
       run.module = *moduleOpPtr;
 
-      runPasses(run.module, catalog.get());
+      {
+         auto t0 = std::chrono::high_resolution_clock::now();
+         runPasses(run.module, catalog.get());
+         const double ms = millisSince(t0);
+         queryCompileMs.push_back(ms);
+         optimizationMs += ms;
+      }
       runs.push_back(std::move(run));
 
       // 1) Print SubOp layer IR (previous json-sql-to-subop output).
@@ -316,7 +370,7 @@ int main(int argc, char** argv) {
       runs.back().module.print(llvm::outs());
       llvm::outs() << "\n";
 
-      // 2) Print execution-step/state debug (previous subop-print-steps output).
+      // 2) Print execution-step/state debug.
       lingodb::compiler::dialect::subop::printExecutionSteps(runs.back().module, llvm::outs());
       llvm::outs() << "\n";
    }
@@ -344,11 +398,15 @@ int main(int argc, char** argv) {
          }
       }
    }
+   auto tRewrite = std::chrono::high_resolution_clock::now();
    auto rewriteRes = lingodb::compiler::dialect::subop::rewritePlansWithSyntheticQuery0(
       runs[0].module, runs[1].module, firstPair);
+   const double rewriteMs = millisSince(tRewrite);
+   optimizationMs += rewriteMs;
    if (mlir::failed(mlir::verify(runs[0].module)) || mlir::failed(mlir::verify(runs[1].module)) ||
        (rewriteRes.query0 && mlir::failed(mlir::verify(*rewriteRes.query0)))) {
-      llvm::errs() << "subop-print-steps: MLIR verification failed after cross-query reuse rewrite\n";
+      llvm::errs() << kToolName << ": MLIR verification failed after cross-query reuse rewrite"
+                   << " (optimization_ms=" << optimizationMs << ")\n";
       return 1;
    }
    llvm::outs() << "\n// reuse_targets: query[0]=" << rewriteRes.numTargetsQuery0
@@ -362,12 +420,16 @@ int main(int argc, char** argv) {
       llvm::outs() << "\n// ============================\n";
       llvm::outs() << "// query[0] (synthetic) subop layer (post-rewrite)\n";
       llvm::outs() << "// ============================\n";
-      (*rewriteRes.query0)->print(llvm::outs());
+      if (rewriteRes.query0) {
+         (*rewriteRes.query0)->print(llvm::outs());
+      } else {
+         llvm::outs() << "// (no synthetic module: cross-query rewrite skipped or returned early)\n";
+      }
       llvm::outs() << "\n";
       llvm::outs() << "\n// ============================\n";
       llvm::outs() << "// Step layout vs SubOpToControlFlow stderr ordinal\n";
       llvm::outs() << "// ============================\n";
-      if (rewriteRes.numTargetsQuery0Mapped == 0) {
+      if (rewriteRes.numTargetsQuery0Mapped == 0 || !rewriteRes.query0) {
          llvm::outs() << "// (synthetic query[0] has no cloned steps: reuse_targets_q0_mapped==0; "
                           "see reuse_targets above. Layout below is from real query[0]/[1] modules.)\n";
       } else {
@@ -394,25 +456,63 @@ int main(int argc, char** argv) {
    const bool skipExecute = (std::getenv("LINGODB_SKIP_EXECUTE") != nullptr);
    if (skipExecute) {
       llvm::outs() << "\n// (LINGODB_SKIP_EXECUTE set: skipping JIT execution)\n";
+      llvm::outs() << "\n// timing: optimization_ms=" << optimizationMs << " execution_ms=0 (skipped)\n";
       return 0;
    }
-   auto sharedExecCtx = session->createExecutionContext();
-   auto runOne = [&](mlir::ModuleOp mod, const std::string& label) {
-      llvm::outs() << "\n// ============================\n";
-      llvm::outs() << label << "\n";
-      llvm::outs() << "// ============================\n";
-      mlir::OwningOpRef<mlir::ModuleOp> execModule = mlir::cast<mlir::ModuleOp>(mod->clone());
-      executeFromSubOpLayer(*execModule, sharedExecCtx.get());
-      llvm::outs() << "\n";
-   };
-   // When cross-query rewrite could not map any donor state into the synthetic module, it only
-   // contains an empty execution_group shell — skip JIT for that shell.
-   if (rewriteRes.numTargetsQuery0Mapped > 0) {
-      runOne(*rewriteRes.query0, "// query[0] (synthetic) execute");
-   } else {
-      llvm::outs() << "\n// (skip synthetic execute: reuse_targets_q0_mapped==0)\n";
+   double executionMs = 0;
+   llvm::SmallVector<double, 8> executionMsPerRun;
+   // `putCachedState` stores raw pointers into memory registered on the **allocating**
+   // `ExecutionContext`. Destroying that context before consumers run leaves entries in the
+   // process-global `gCachedStates` map dangling. Use one context for synthetic + both consumers,
+   // then clear the global map after it goes out of scope.
+   {
+      lingodb::runtime::ExecutionContext::clearAllCachedStates();
+      auto sharedExecCtx = session->createExecutionContext();
+      auto runOne = [&](mlir::ModuleOp mod, const std::string& label) {
+         llvm::outs() << "\n// ============================\n";
+         llvm::outs() << label << "\n";
+         llvm::outs() << "// ============================\n";
+         mlir::OwningOpRef<mlir::ModuleOp> execModule = mlir::cast<mlir::ModuleOp>(mod->clone());
+         auto tExec = std::chrono::high_resolution_clock::now();
+         executeFromSubOpLayer(*execModule, sharedExecCtx.get());
+         const double oneMs = millisSince(tExec);
+         executionMs += oneMs;
+         executionMsPerRun.push_back(oneMs);
+         llvm::outs().flush();
+         std::cout.flush();
+         llvm::outs() << "\n";
+      };
+      // When cross-query rewrite could not map any donor state into the synthetic module, it only
+      // contains an empty execution_group shell — skip JIT for that shell.
+      if (rewriteRes.numTargetsQuery0Mapped > 0) {
+         runOne(*rewriteRes.query0, "// query[0] (synthetic) execute");
+      } else {
+         llvm::outs() << "\n// (skip synthetic execute: reuse_targets_q0_mapped==0)\n";
+      }
+      for (size_t i = 0; i < runs.size(); i++) {
+         runOne(runs[i].module, "// query[" + std::to_string(i) + "] execute");
+      }
    }
-   for (size_t i = 0; i < runs.size(); i++) {
-      runOne(runs[i].module, "// query[" + std::to_string(i) + "] execute");
+   lingodb::runtime::ExecutionContext::clearAllCachedStates();
+   llvm::outs() << "\n// timing_compile_ms: per_query=[";
+   for (size_t i = 0; i < queryCompileMs.size(); i++) {
+      if (i) llvm::outs() << ",";
+      llvm::outs() << queryCompileMs[i];
    }
+   llvm::outs() << "] rewrite=" << rewriteMs << " total_optimization_ms=" << optimizationMs << "\n";
+   llvm::outs() << "// timing_execution_ms: per_run=[";
+   for (size_t i = 0; i < executionMsPerRun.size(); i++) {
+      if (i) llvm::outs() << ",";
+      llvm::outs() << executionMsPerRun[i];
+   }
+   llvm::outs() << "] total_execution_ms=" << executionMs << "\n";
+   if (rewriteRes.numTargetsQuery0Mapped > 0 && executionMsPerRun.size() >= 3) {
+      double synthMs = executionMsPerRun[0];
+      double consumerMs = 0;
+      for (size_t i = 1; i < executionMsPerRun.size(); ++i) consumerMs += executionMsPerRun[i];
+      llvm::outs() << "// timing_note: synthetic_ms=" << synthMs
+                    << " consumers_only_ms=" << consumerMs << "\n";
+   }
+   llvm::outs() << "// timing: optimization_ms=" << optimizationMs << " execution_ms=" << executionMs << "\n";
+   return 0;
 }

@@ -25,8 +25,10 @@ std::unordered_map<uint64_t, uint8_t*> gCachedStates;
 
 void lingodb::runtime::ExecutionContext::putCachedState(uint64_t key, uint8_t* ptr) {
    assert(ptr && "putCachedState requires non-null ptr");
+   auto* ctx = getCurrentExecutionContext();
    std::lock_guard<std::mutex> lock(gCachedStatesMutex);
    gCachedStates[key] = ptr;
+   ctx->cachedStateKeys.push_back(key);
 }
 
 uint8_t* lingodb::runtime::ExecutionContext::getCachedState(uint64_t key) {
@@ -36,7 +38,19 @@ uint8_t* lingodb::runtime::ExecutionContext::getCachedState(uint64_t key) {
    return it->second;
 }
 
+void lingodb::runtime::ExecutionContext::clearAllCachedStates() {
+   std::lock_guard<std::mutex> lock(gCachedStatesMutex);
+   gCachedStates.clear();
+}
+
 lingodb::runtime::ExecutionContext::~ExecutionContext() {
+   {
+      std::lock_guard<std::mutex> lock(gCachedStatesMutex);
+      for (uint64_t key : cachedStateKeys) {
+         gCachedStates.erase(key);
+      }
+   }
+   cachedStateKeys.clear();
    for (auto threadLocal : perWorkerStates) {
       for (auto s : threadLocal) {
          s.freeFn(s.ptr);

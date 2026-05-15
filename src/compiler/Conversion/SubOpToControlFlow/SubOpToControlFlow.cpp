@@ -498,6 +498,16 @@ struct PatternList {
       patterns[uniquePtr->getOperationName()].push_back(std::move(uniquePtr));
    }
 };
+
+/// `is_thread_local` may be stale after IR rewrites (e.g. cross-query reuse replaces a merged pipeline
+/// state with `cache_get` while the attribute still says true). Only unwrap TLS when the SubOp operand
+/// is actually `!subop.thread_local<...>`.
+static bool executionStepOperandNeedsTlsUnwrap(mlir::Value stepOperand, mlir::Attribute isThreadLocalAttr) {
+   if (!mlir::cast<mlir::BoolAttr>(isThreadLocalAttr).getValue())
+      return false;
+   return mlir::isa<subop::ThreadLocalType>(stepOperand.getType());
+}
+
 class SubOpRewriter {
    PatternList& patternList;
    mlir::OpBuilder builder;
@@ -589,7 +599,7 @@ class SubOpRewriter {
          if (exclude && arg == exclude && arg.hasOneUse()) continue;
          mlir::Value input = outerMapping.lookup(param);
          mlir::Value value = create<util::LoadElementOp>(builder.getUnknownLoc(), input.getType(), contextPtr, offset++);
-         if (mlir::cast<mlir::BoolAttr>(isThreadLocal).getValue()) {
+         if (executionStepOperandNeedsTlsUnwrap(param, isThreadLocal)) {
             value = rt::ThreadLocal::getLocal(builder, builder.getUnknownLoc())({value})[0];
             value = create<util::GenericMemrefCastOp>(builder.getUnknownLoc(), typeConverter->convertType(arg.getType()), value);
          }
@@ -995,7 +1005,13 @@ class MaterializeTableLowering : public SubOpTupleStreamConsumerConversionPatter
 
    void rewrite(subop::MaterializeOp materializeOp, OpAdaptor adaptor, SubOpRewriter& rewriter, ColumnMapping& mapping) const override {
       auto stateType = mlir::cast<subop::ResultTableType>(materializeOp.getState().getType());
-      mlir::Value loaded = rewriter.create<util::LoadOp>(materializeOp->getLoc(), adaptor.getState());
+      mlir::Type wantRefTy = typeConverter->convertType(stateType);
+      assert(wantRefTy && "result_table must lower to a util ref type");
+      mlir::Value ptr = adaptor.getState();
+      if (ptr.getType() != wantRefTy) {
+         ptr = rewriter.create<util::GenericMemrefCastOp>(materializeOp->getLoc(), wantRefTy, ptr);
+      }
+      mlir::Value loaded = rewriter.create<util::LoadOp>(materializeOp->getLoc(), ptr);
       auto columnBuilders = rewriter.create<util::UnPackOp>(materializeOp->getLoc(), loaded);
       for (size_t i = 0; i < stateType.getMembers().getMembers().size(); i++) {
          auto attribute = materializeOp.getMapping().getColumnRef(stateType.getMembers().getMembers()[i]);
@@ -4080,7 +4096,16 @@ class NestedMapLowering : public SubOpTupleStreamConsumerConversionPattern<subop
             auto guard = rewriter.nest(outerMapping, step);
             for (auto [param, arg, isThreadLocal] : llvm::zip(step.getInputs(), step.getSubOps().front().getArguments(), step.getIsThreadLocal())) {
                mlir::Value input = outerMapping.lookup(param);
-               rewriter.map(arg, input);
+               if (!executionStepOperandNeedsTlsUnwrap(param, isThreadLocal)) {
+                  rewriter.map(arg, input);
+               } else {
+                  mlir::OpBuilder::InsertionGuard insertionGuard(rewriter);
+                  rewriter.operator mlir::OpBuilder&().setInsertionPoint(step);
+                  mlir::Location tlsLoc = mlir::UnknownLoc::get(rewriter.getContext());
+                  mlir::Value threadLocal = rt::ThreadLocal::getLocal(rewriter, tlsLoc)({input})[0];
+                  threadLocal = rewriter.create<util::GenericMemrefCastOp>(threadLocal.getLoc(), typeConverter->convertType(arg.getType()), threadLocal);
+                  rewriter.map(arg, threadLocal);
+               }
             }
             llvm::SmallVector<mlir::Operation*> ops;
             auto returnOp = mlir::cast<subop::ExecutionStepReturnOp>(step.getSubOps().front().getTerminator());
@@ -4463,7 +4488,7 @@ void handleExecutionStepCPU(PatternList& patternList, subop::ExecutionStepOp ste
          llvm::errs() << "\n";
          llvm_unreachable("SubOp lowering: IRMapping miss (details on stderr)");
       }
-      if (!mlir::cast<mlir::BoolAttr>(isThreadLocal).getValue()) {
+      if (!executionStepOperandNeedsTlsUnwrap(param, isThreadLocal)) {
          rewriter.map(arg, input);
       } else {
          mlir::OpBuilder b(executionGroup);

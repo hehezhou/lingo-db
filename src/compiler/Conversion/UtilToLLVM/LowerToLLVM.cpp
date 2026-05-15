@@ -28,6 +28,17 @@ static mlir::LLVM::LLVMStructType convertTuple(TupleType tupleType, const TypeCo
    return mlir::LLVM::LLVMStructType::getLiteral(tupleType.getContext(), types);
 }
 
+/// `util.ref<i8>` is the dialect's opaque pointer cell (see SubOpRewriter::barePtrType). The ref
+/// itself lowers to `!llvm.ptr`, but naively lowering the element type to `i8` makes load/store
+/// touch a single byte while allocation/size paths use pointer width — leaving
+/// `builtin.unrealized_conversion_cast` bridges (e.g. after cross-query `filter_pred$0` churn).
+static mlir::Type llvmTypeForOpaqueI8RefCell(mlir::Type elementType, mlir::MLIRContext* ctx) {
+   if (auto it = mlir::dyn_cast<mlir::IntegerType>(elementType))
+      if (it.getWidth() == 8)
+         return mlir::LLVM::LLVMPointerType::get(ctx);
+   return {};
+}
+
 class PackOpLowering : public OpConversionPattern<util::PackOp> {
    public:
    using OpConversionPattern<util::PackOp>::OpConversionPattern;
@@ -147,7 +158,9 @@ class AllocaOpLowering : public OpConversionPattern<util::AllocaOp> {
          int64_t staticSize = 1;
          entries = rewriter.create<mlir::LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(staticSize));
       }
-      auto elemType = typeConverter->convertType(genericMemrefType.getElementType());
+      mlir::Type elemType = llvmTypeForOpaqueI8RefCell(genericMemrefType.getElementType(), getContext());
+      if (!elemType)
+         elemType = typeConverter->convertType(genericMemrefType.getElementType());
       auto elemPtrType = mlir::LLVM::LLVMPointerType::get(getContext());
       mlir::Value allocatedElementPtr = rewriter.create<LLVM::AllocaOp>(loc, elemPtrType, elemType, entries, 0);
       rewriter.replaceOp(allocOp, allocatedElementPtr);
@@ -221,7 +234,9 @@ class StoreOpLowering : public OpConversionPattern<util::StoreOp> {
    using OpConversionPattern<util::StoreOp>::OpConversionPattern;
    LogicalResult matchAndRewrite(util::StoreOp op, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       Value elementPtr = adaptor.getRef();
-      auto elemType = typeConverter->convertType(op.getRef().getType().getElementType());
+      mlir::Type elemType = llvmTypeForOpaqueI8RefCell(op.getRef().getType().getElementType(), getContext());
+      if (!elemType)
+         elemType = typeConverter->convertType(op.getRef().getType().getElementType());
       if (adaptor.getIdx()) {
          elementPtr = rewriter.create<LLVM::GEPOp>(op->getLoc(), elementPtr.getType(), elemType, elementPtr, adaptor.getIdx());
       }
@@ -234,7 +249,9 @@ class LoadOpLowering : public OpConversionPattern<util::LoadOp> {
    using OpConversionPattern<util::LoadOp>::OpConversionPattern;
    LogicalResult matchAndRewrite(util::LoadOp op, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       Value elementPtr = adaptor.getRef();
-      auto elemType = typeConverter->convertType(op.getRef().getType().getElementType());
+      mlir::Type elemType = llvmTypeForOpaqueI8RefCell(op.getRef().getType().getElementType(), getContext());
+      if (!elemType)
+         elemType = typeConverter->convertType(op.getRef().getType().getElementType());
       if (adaptor.getIdx()) {
          elementPtr = rewriter.create<LLVM::GEPOp>(op->getLoc(), elementPtr.getType(), elemType, elementPtr, adaptor.getIdx());
       }

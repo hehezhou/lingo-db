@@ -16,7 +16,6 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include <cassert>
 #include <cstdlib>
@@ -32,6 +31,14 @@ static subop::Member makeOrGetPredMember(mlir::MLIRContext* ctx) {
    auto& mm = d->getMemberManager();
    // Stable name. If it already exists, type must match.
    return mm.createMemberDirect("filter_pred$0", mlir::IntegerType::get(ctx, 1));
+}
+
+/// `subop.materialize` may write into `!subop.buffer<...>` or `!subop.thread_local<!subop.buffer<...>>`.
+static subop::BufferType getInnerBufferTypeForMaterializeState(mlir::Type stateTy) {
+   if (auto b = mlir::dyn_cast<subop::BufferType>(stateTy)) return b;
+   if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(stateTy))
+      return mlir::dyn_cast<subop::BufferType>(tl.getWrapped());
+   return nullptr;
 }
 
 static subop::StateMembersAttr appendMember(mlir::MLIRContext* ctx, subop::StateMembersAttr members, subop::Member m) {
@@ -52,70 +59,512 @@ static bool valueMembersContainMemberNamed(mlir::MLIRContext* ctx, subop::StateM
    return false;
 }
 
-static mlir::Type substituteJoinBufferTypes(mlir::Type t,
-                                            const llvm::DenseMap<mlir::Type, mlir::Type>& bufOldToNew) {
-   auto* ctx = t.getContext();
-   if (auto it = bufOldToNew.find(t); it != bufOldToNew.end()) return it->second;
-   if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(t)) {
-      mlir::Type inner = substituteJoinBufferTypes(tl.getWrapped(), bufOldToNew);
-      if (inner != tl.getWrapped()) return subop::ThreadLocalType::get(ctx, mlir::cast<subop::State>(inner));
+static mlir::Value mapStateThroughExecutionStepOperands(mlir::Value v, mlir::Operation* user);
+static void collectJoinBufferReachabilitySeeds(mlir::Value canonicalMergedBuffer, const ModuleReuseInfo& reuse,
+                                               llvm::SmallVectorImpl<mlir::Value>& seeds);
+static mlir::Type extendHashMapTypeWithPred(mlir::Type t, subop::Member predMember);
+static subop::HashIndexedViewType extendHashIndexedViewWithPredMemberIfMissing(mlir::MLIRContext* ctx,
+                                                                              subop::HashIndexedViewType hiv,
+                                                                              subop::Member predMember);
+static void propagateSubOpColumnAttrsFromSsaStateLayout(mlir::ModuleOp module,
+                                                         const llvm::DenseSet<void*>* closureFilter);
+
+static bool opaqueClosureContains(const llvm::DenseSet<void*>& closure, mlir::Value v) {
+   return v && closure.contains(v.getAsOpaquePointer());
+}
+
+/// Link `execution_step` operands, body block arguments, and `execution_step_return` operands
+/// with step results whenever either side is already in \p closure (fixpoint over the join
+/// buffer → HIV SSA region).
+static void expandClosureThroughExecutionStepPorts(mlir::ModuleOp module, llvm::DenseSet<void*>& closure) {
+   for (unsigned round = 0; round < 32; ++round) {
+      size_t before = closure.size();
+      module.walk([&](subop::ExecutionStepOp step) {
+         mlir::Block& body = step.getSubOps().front();
+         for (unsigned i = 0; i < step.getNumOperands() && i < body.getNumArguments(); ++i) {
+            mlir::Value opnd = step.getOperand(i);
+            mlir::Value barg = body.getArgument(i);
+            if (opaqueClosureContains(closure, opnd)) closure.insert(barg.getAsOpaquePointer());
+            if (opaqueClosureContains(closure, barg)) closure.insert(opnd.getAsOpaquePointer());
+         }
+      });
+      module.walk([&](subop::ExecutionStepReturnOp ret) {
+         auto step = mlir::dyn_cast<subop::ExecutionStepOp>(ret->getParentOp());
+         if (!step) return;
+         for (unsigned i = 0; i < ret.getNumOperands() && i < step.getNumResults(); ++i) {
+            mlir::Value rv = ret.getOperand(i);
+            mlir::Value sr = step.getResult(i);
+            if (opaqueClosureContains(closure, rv)) closure.insert(sr.getAsOpaquePointer());
+            if (opaqueClosureContains(closure, sr)) closure.insert(rv.getAsOpaquePointer());
+         }
+      });
+      if (closure.size() == before) break;
    }
-   return t;
 }
 
-static void syncCreateHashIndexedViewTypesFromBuffers(mlir::ModuleOp module) {
+static bool executionStepTouchesClosure(subop::ExecutionStepOp step, const llvm::DenseSet<void*>& closure) {
+   for (mlir::Value v : step.getOperands()) {
+      if (opaqueClosureContains(closure, v)) return true;
+   }
+   for (mlir::OpResult r : step.getResults()) {
+      if (opaqueClosureContains(closure, r)) return true;
+   }
+   for (mlir::BlockArgument a : step.getSubOps().front().getArguments()) {
+      if (opaqueClosureContains(closure, a)) return true;
+   }
+   return false;
+}
+
+static bool opOperandsOrNestedBlockArgsTouchClosure(mlir::Operation* op, const llvm::DenseSet<void*>& closure) {
+   for (mlir::Value v : op->getOperands()) {
+      if (opaqueClosureContains(closure, v)) return true;
+   }
+   for (mlir::Region& reg : op->getRegions()) {
+      for (mlir::Block& b : reg) {
+         for (mlir::BlockArgument a : b.getArguments()) {
+            if (opaqueClosureContains(closure, a)) return true;
+         }
+      }
+   }
+   return false;
+}
+
+/// Keep `execution_step` result types and body entry types aligned with `execution_step_return`
+/// and step operands. When \p closureFilter is non-null, only touch steps that reach the join
+/// buffer / HIV closure (derived from `computeJoinBufferHivSsaClosure`).
+static void synchronizeExecutionStepPortTypes(mlir::ModuleOp module, const llvm::DenseSet<void*>* closureFilter) {
+   for (unsigned iter = 0; iter < 8; ++iter) {
+      bool changed = false;
+      module.walk([&](subop::ExecutionStepReturnOp ret) {
+         auto* parent = ret->getParentOp();
+         auto step = mlir::dyn_cast<subop::ExecutionStepOp>(parent);
+         if (!step || step.getNumResults() != ret.getNumOperands()) return;
+         if (closureFilter && !executionStepTouchesClosure(step, *closureFilter)) return;
+         for (unsigned i = 0; i < step.getNumResults(); ++i) {
+            mlir::Type t = ret.getOperand(i).getType();
+            if (t != step.getResult(i).getType()) {
+               step.getResult(i).setType(t);
+               changed = true;
+            }
+         }
+      });
+      module.walk([&](subop::ExecutionStepOp step) {
+         if (closureFilter && !executionStepTouchesClosure(step, *closureFilter)) return;
+         mlir::Block& body = step.getSubOps().front();
+         for (unsigned i = 0; i < step.getNumOperands() && i < body.getNumArguments(); ++i) {
+            mlir::Type wt = step.getOperand(i).getType();
+            if (body.getArgument(i).getType() != wt) {
+               body.getArgument(i).setType(wt);
+               changed = true;
+            }
+         }
+      });
+      if (!changed) break;
+   }
+}
+
+static void syncCreateHashIndexedViewResultType(subop::CreateHashIndexedView chiv) {
+   auto* ctx = chiv.getContext();
+   mlir::Value src = chiv.getSource();
+   auto bufTy = mlir::dyn_cast<subop::BufferType>(src.getType());
+   if (!bufTy) return;
+   if (!valueMembersContainMemberNamed(ctx, bufTy.getMembers(), "filter_pred$0")) return;
+   subop::Member linkM = chiv.getLinkMember().getMember();
+   subop::Member hashM = chiv.getHashMember().getMember();
+   llvm::SmallVector<subop::Member> vals;
+   for (subop::Member m : bufTy.getMembers().getMembers()) {
+      if (m == linkM || m == hashM) continue;
+      vals.push_back(m);
+   }
+   auto oldHiv = mlir::cast<subop::HashIndexedViewType>(chiv.getType());
+   auto keyMs = subop::StateMembersAttr::get(ctx, llvm::SmallVector<subop::Member>{hashM});
+   auto valMs = subop::StateMembersAttr::get(ctx, vals);
+   auto newHiv = subop::HashIndexedViewType::get(ctx, keyMs, valMs, oldHiv.getCompareHashForLookup());
+   chiv.getResult().setType(newHiv);
+}
+
+/// `applyGlobalHashMapPredLayout` updates SSA `HashMapType` values but not every nested
+/// `hash_map_entry_ref<...>` / `lookup_entry_ref<...>` carried by tuple column attrs. `reduce` /
+/// `gather` / `scatter` / `lookup` still read the old map layout from those attrs while the runtime
+/// buffer matches the extended map — lowering then loads the wrong struct field (e.g. i8 vs ptr)
+/// and leaves an unreconcilable `builtin.unrealized_conversion_cast` before LLVM translation.
+static subop::HashMapType getHashMapTypeForStateValue(mlir::Value v) {
+   if (auto hm = mlir::dyn_cast<subop::HashMapType>(v.getType())) return hm;
+   if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(v.getType()))
+      return mlir::dyn_cast<subop::HashMapType>(tl.getWrapped());
+   return {};
+}
+
+/// Join pipelines are keyed by `HashMapType::key_members` + lock flag. After extending a specific
+/// join map with `filter_pred$0`, every `lookup_entry_ref` / `hash_map_entry_ref` in the same
+/// `execution_step` body that targets the **same join key layout** must use the **same** canonical
+/// `HashMapType` object — otherwise `reduce`/`gather` lowering builds mismatched `EntryStorageHelper`
+/// layouts vs the actual merged hash state and LLVM ends up with `i8` vs `!llvm.ptr` bridges.
+static bool hashMapJoinKeyMatches(subop::HashMapType a, subop::HashMapType b) {
+   return a.getKeyMembers() == b.getKeyMembers() && a.getWithLock() == b.getWithLock();
+}
+
+static bool alignJoinHashMapColumnRefToCanonical(tuples::ColumnRefAttr& r, subop::HashMapType canonicalHm) {
+   auto* ctx = canonicalHm.getContext();
+   bool changed = false;
+   if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(r.getColumn().type)) {
+      if (auto hm = mlir::dyn_cast<subop::HashMapType>(ler.getState())) {
+         if (hashMapJoinKeyMatches(hm, canonicalHm)) {
+            r.getColumn().type = subop::LookupEntryRefType::get(ctx, canonicalHm);
+            changed = true;
+         }
+      }
+   }
+   if (auto hmer = mlir::dyn_cast<subop::HashMapEntryRefType>(r.getColumn().type)) {
+      if (hashMapJoinKeyMatches(hmer.getHashMap(), canonicalHm)) {
+         r.getColumn().type = subop::HashMapEntryRefType::get(ctx, canonicalHm);
+         changed = true;
+      }
+   }
+   return changed;
+}
+
+static bool alignJoinHashMapColumnDefToCanonical(tuples::ColumnDefAttr& def, subop::HashMapType canonicalHm) {
+   auto* ctx = canonicalHm.getContext();
+   bool changed = false;
+   if (auto hmer = mlir::dyn_cast<subop::HashMapEntryRefType>(def.getColumn().type)) {
+      if (hashMapJoinKeyMatches(hmer.getHashMap(), canonicalHm)) {
+         def.getColumn().type = subop::HashMapEntryRefType::get(ctx, canonicalHm);
+         changed = true;
+      }
+   }
+   if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(def.getColumn().type)) {
+      if (auto hm = mlir::dyn_cast<subop::HashMapType>(ler.getState())) {
+         if (hashMapJoinKeyMatches(hm, canonicalHm)) {
+            def.getColumn().type = subop::LookupEntryRefType::get(ctx, canonicalHm);
+            changed = true;
+         }
+      }
+   }
+   return changed;
+}
+
+/// Align tuple column attrs in one hash-build `execution_step` to the extended canonical map type.
+static void alignJoinHashMapStepColumnAttrs(ExecutionStepOp step, subop::HashMapType canonicalHm) {
+   auto* ctx = canonicalHm.getContext();
+   step.walk([&](mlir::Operation* op) {
+      if (op->getParentOfType<ExecutionStepOp>() != step) return;
+
+      if (auto ro = mlir::dyn_cast<subop::ReduceOp>(op)) {
+         auto r = ro.getRef();
+         if (alignJoinHashMapColumnRefToCanonical(r, canonicalHm)) ro.setRefAttr(r);
+         return;
+      }
+      if (auto lk = mlir::dyn_cast<subop::LookupOp>(op)) {
+         subop::HashMapType hm = getHashMapTypeForStateValue(lk.getState());
+         if (hm && hashMapJoinKeyMatches(hm, canonicalHm)) {
+            auto r = lk.getRef();
+            if (alignJoinHashMapColumnDefToCanonical(r, canonicalHm)) lk.setRefAttr(r);
+         }
+         return;
+      }
+      if (auto loi = mlir::dyn_cast<subop::LookupOrInsertOp>(op)) {
+         subop::HashMapType hm = getHashMapTypeForStateValue(loi.getState());
+         if (hm && hashMapJoinKeyMatches(hm, canonicalHm)) {
+            auto r = loi.getRef();
+            if (alignJoinHashMapColumnDefToCanonical(r, canonicalHm)) loi.setRefAttr(r);
+         }
+         return;
+      }
+      if (auto sr = mlir::dyn_cast<subop::ScanRefsOp>(op)) {
+         subop::HashMapType hm = getHashMapTypeForStateValue(sr.getState());
+         if (hm && hashMapJoinKeyMatches(hm, canonicalHm)) {
+            auto r = sr.getRef();
+            if (alignJoinHashMapColumnDefToCanonical(r, canonicalHm)) sr.setRefAttr(r);
+         }
+         return;
+      }
+      if (auto go = mlir::dyn_cast<subop::GatherOp>(op)) {
+         auto r = go.getRef();
+         bool changed = alignJoinHashMapColumnRefToCanonical(r, canonicalHm);
+         auto m = go.getMapping();
+         llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> out;
+         for (auto [mem, def] : m.getMapping()) {
+            tuples::ColumnDefAttr d = def;
+            if (alignJoinHashMapColumnDefToCanonical(d, canonicalHm)) changed = true;
+            out.push_back({mem, d});
+         }
+         if (changed) {
+            go.setRefAttr(r);
+            go.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, out));
+         }
+         return;
+      }
+      if (auto sc = mlir::dyn_cast<subop::ScanOp>(op)) {
+         auto m = sc.getMapping();
+         llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> out;
+         bool changed = false;
+         for (auto [mem, def] : m.getMapping()) {
+            tuples::ColumnDefAttr d = def;
+            if (alignJoinHashMapColumnDefToCanonical(d, canonicalHm)) changed = true;
+            out.push_back({mem, d});
+         }
+         if (changed) sc.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, out));
+         return;
+      }
+      if (auto so = mlir::dyn_cast<subop::ScatterOp>(op)) {
+         auto r = so.getRef();
+         bool changed = alignJoinHashMapColumnRefToCanonical(r, canonicalHm);
+         auto m = so.getMapping();
+         llvm::SmallVector<std::pair<subop::Member, tuples::ColumnRefAttr>> out;
+         for (auto [mem, cref] : m.getMapping()) {
+            tuples::ColumnRefAttr c = cref;
+            if (alignJoinHashMapColumnRefToCanonical(c, canonicalHm)) changed = true;
+            out.push_back({mem, c});
+         }
+         if (changed) {
+            so.setRefAttr(r);
+            so.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, out));
+         }
+         return;
+      }
+      if (auto lo = mlir::dyn_cast<subop::LockOp>(op)) {
+         auto r = lo.getRef();
+         if (alignJoinHashMapColumnRefToCanonical(r, canonicalHm)) lo.setRefAttr(r);
+         return;
+      }
+      if (auto mo = mlir::dyn_cast<subop::MapOp>(op)) {
+         auto cols = mo.getInputColsAttr();
+         llvm::SmallVector<mlir::Attribute> newCols;
+         bool changed = false;
+         for (mlir::Attribute a : cols) {
+            if (auto cref = mlir::dyn_cast<tuples::ColumnRefAttr>(a)) {
+               tuples::ColumnRefAttr r = cref;
+               if (alignJoinHashMapColumnRefToCanonical(r, canonicalHm)) {
+                  changed = true;
+                  newCols.push_back(r);
+                  continue;
+               }
+            }
+            newCols.push_back(a);
+         }
+         if (changed) mo.setInputColsAttr(mlir::ArrayAttr::get(ctx, newCols));
+         return;
+      }
+      if (auto fo = mlir::dyn_cast<subop::FilterOp>(op)) {
+         auto conds = fo.getConditionsAttr();
+         llvm::SmallVector<mlir::Attribute> out;
+         bool changed = false;
+         for (mlir::Attribute a : conds) {
+            if (auto cref = mlir::dyn_cast<tuples::ColumnRefAttr>(a)) {
+               tuples::ColumnRefAttr r = cref;
+               if (alignJoinHashMapColumnRefToCanonical(r, canonicalHm)) {
+                  changed = true;
+                  out.push_back(r);
+                  continue;
+               }
+            }
+            out.push_back(a);
+         }
+         if (changed) fo.setConditionsAttr(mlir::ArrayAttr::get(ctx, out));
+         return;
+      }
+      if (auto mat = mlir::dyn_cast<subop::MaterializeOp>(op)) {
+         auto m = mat.getMapping();
+         llvm::SmallVector<std::pair<subop::Member, tuples::ColumnRefAttr>> out;
+         bool changed = false;
+         for (auto [mem, cref] : m.getMapping()) {
+            tuples::ColumnRefAttr c = cref;
+            if (alignJoinHashMapColumnRefToCanonical(c, canonicalHm)) changed = true;
+            out.push_back({mem, c});
+         }
+         if (changed) mat.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, out));
+         return;
+      }
+      if (auto ins = mlir::dyn_cast<subop::InsertOp>(op)) {
+         auto m = ins.getMapping();
+         llvm::SmallVector<std::pair<subop::Member, tuples::ColumnRefAttr>> out;
+         bool changed = false;
+         for (auto [mem, cref] : m.getMapping()) {
+            tuples::ColumnRefAttr c = cref;
+            if (alignJoinHashMapColumnRefToCanonical(c, canonicalHm)) changed = true;
+            out.push_back({mem, c});
+         }
+         if (changed) ins.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, out));
+         return;
+      }
+      if (auto uo = mlir::dyn_cast<subop::UnwrapOptionalRefOp>(op)) {
+         auto pref = uo.getOptionalRef();
+         bool c1 = alignJoinHashMapColumnRefToCanonical(pref, canonicalHm);
+         auto r = uo.getRef();
+         bool c2 = alignJoinHashMapColumnDefToCanonical(r, canonicalHm);
+         if (c1) uo.setOptionalRefAttr(pref);
+         if (c2) uo.setRefAttr(r);
+         return;
+      }
+      if (auto gb = mlir::dyn_cast<subop::GetBeginReferenceOp>(op)) {
+         auto r = gb.getRef();
+         if (alignJoinHashMapColumnDefToCanonical(r, canonicalHm)) gb.setRefAttr(r);
+         return;
+      }
+      if (auto ge = mlir::dyn_cast<subop::GetEndReferenceOp>(op)) {
+         auto r = ge.getRef();
+         if (alignJoinHashMapColumnDefToCanonical(r, canonicalHm)) ge.setRefAttr(r);
+         return;
+      }
+      if (auto nm = mlir::dyn_cast<subop::NestedMapOp>(op)) {
+         auto params = nm.getParametersAttr();
+         llvm::SmallVector<mlir::Attribute> newParams;
+         bool changed = false;
+         for (mlir::Attribute a : params) {
+            if (auto cref = mlir::dyn_cast<tuples::ColumnRefAttr>(a)) {
+               tuples::ColumnRefAttr r = cref;
+               if (alignJoinHashMapColumnRefToCanonical(r, canonicalHm)) {
+                  changed = true;
+                  newParams.push_back(r);
+                  continue;
+               }
+            }
+            newParams.push_back(a);
+         }
+         if (changed) nm.setParametersAttr(mlir::ArrayAttr::get(ctx, newParams));
+      }
+   });
+}
+
+static bool isJoinPredCarrierType(mlir::Type t) {
+   if (mlir::isa<subop::BufferType>(t)) return true;
+   if (mlir::isa<subop::HashIndexedViewType>(t)) return true;
+   if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(t))
+      return mlir::isa<subop::BufferType>(tl.getWrapped());
+   return false;
+}
+
+/// SSA closure for one or more reuse join buffers and their derived `hash_indexed_view` values:
+/// forward uses (incl. `merge`, `execution_step` region entry), backward across step boundaries and
+/// `merge` results, and limited "any state-like result of an op that uses v".
+static void computeJoinBufferHivSsaClosure(llvm::ArrayRef<mlir::Value> canonicalBuffers,
+                                           const ModuleReuseInfo& reuse,
+                                           llvm::DenseSet<void*>& outClosure,
+                                           llvm::SmallVector<mlir::Value, 64>& outList) {
+   auto push = [&](mlir::Value x) {
+      if (!x || !isJoinPredCarrierType(x.getType())) return;
+      void* k = x.getAsOpaquePointer();
+      if (!outClosure.insert(k).second) return;
+      outList.push_back(x);
+   };
+
+   for (mlir::Value root : canonicalBuffers) {
+      llvm::SmallVector<mlir::Value, 8> seeds;
+      collectJoinBufferReachabilitySeeds(root, reuse, seeds);
+      for (mlir::Value s : seeds) push(s);
+   }
+
+   for (size_t qi = 0; qi < outList.size(); ++qi) {
+      mlir::Value v = outList[qi];
+
+      if (auto* def = v.getDefiningOp()) {
+         if (auto merge = mlir::dyn_cast<subop::MergeOp>(def)) {
+            push(merge.getThreadLocal());
+         }
+      }
+
+      if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+         mlir::Block* owner = ba.getOwner();
+         if (owner) {
+            if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(owner->getParentOp())) {
+               if (&step.getSubOps().front() == owner) {
+                  unsigned idx = ba.getArgNumber();
+                  if (idx < step.getNumOperands()) push(step.getOperand(idx));
+               }
+            }
+         }
+      }
+
+      if (auto* def = v.getDefiningOp()) {
+         if (auto ret = mlir::dyn_cast<subop::ExecutionStepReturnOp>(def)) {
+            if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(ret->getParentOp())) {
+               for (unsigned i = 0; i < ret.getNumOperands(); ++i) {
+                  if (ret.getOperand(i) == v && i < step.getNumResults()) push(step.getResult(i));
+               }
+            }
+         }
+      }
+
+      for (mlir::OpOperand& use : v.getUses()) {
+         mlir::Operation* op = use.getOwner();
+         if (mlir::isa<subop::BufferType>(v.getType())) {
+            if (auto chiv = mlir::dyn_cast<subop::CreateHashIndexedView>(op)) {
+               if (chiv.getSource() == v) push(chiv.getResult());
+            }
+         }
+         if (auto merge = mlir::dyn_cast<subop::MergeOp>(op)) {
+            if (merge.getThreadLocal() == v) push(merge.getResult());
+         }
+         if (mlir::Value inner = mapStateThroughExecutionStepOperands(v, op)) push(inner);
+
+         bool usesV = false;
+         for (mlir::Value ov : op->getOperands()) {
+            if (ov == v) {
+               usesV = true;
+               break;
+            }
+         }
+         if (usesV) {
+            for (mlir::OpResult res : op->getResults()) {
+               if (isJoinPredCarrierType(res.getType())) push(res);
+            }
+         }
+      }
+   }
+}
+
+static void applyJoinBufferHivPredToSsaClosure(mlir::ModuleOp module, llvm::ArrayRef<mlir::Value> canonicalBuffers,
+                                               const ModuleReuseInfo& reuse) {
+   if (canonicalBuffers.empty()) return;
+
+   llvm::DenseSet<void*> closure;
+   llvm::SmallVector<mlir::Value, 64> values;
+   computeJoinBufferHivSsaClosure(canonicalBuffers, reuse, closure, values);
+
    auto* ctx = module.getContext();
+   subop::Member predMember = makeOrGetPredMember(ctx);
+
+   for (mlir::Value v : values) {
+      if (auto buf = mlir::dyn_cast<subop::BufferType>(v.getType())) {
+         if (valueMembersContainMemberNamed(ctx, buf.getMembers(), "filter_pred$0")) continue;
+         auto nt = subop::BufferType::get(ctx, appendMember(ctx, buf.getMembers(), predMember));
+         v.setType(nt);
+      } else if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(v.getType())) {
+         auto inner = mlir::dyn_cast<subop::BufferType>(tl.getWrapped());
+         if (!inner || valueMembersContainMemberNamed(ctx, inner.getMembers(), "filter_pred$0")) continue;
+         auto innerNew = subop::BufferType::get(ctx, appendMember(ctx, inner.getMembers(), predMember));
+         v.setType(subop::ThreadLocalType::get(ctx, mlir::cast<subop::State>(innerNew)));
+      }
+   }
+
    module.walk([&](subop::CreateHashIndexedView chiv) {
-      auto bufTy = mlir::dyn_cast<subop::BufferType>(chiv.getSource().getType());
-      if (!bufTy) return;
-      if (!valueMembersContainMemberNamed(ctx, bufTy.getMembers(), "filter_pred$0")) return;
-      subop::Member linkM = chiv.getLinkMember().getMember();
-      subop::Member hashM = chiv.getHashMember().getMember();
-      llvm::SmallVector<subop::Member> vals;
-      for (subop::Member m : bufTy.getMembers().getMembers()) {
-         if (m == linkM || m == hashM) continue;
-         vals.push_back(m);
-      }
-      auto oldHiv = mlir::cast<subop::HashIndexedViewType>(chiv.getType());
-      auto keyMs = subop::StateMembersAttr::get(ctx, llvm::SmallVector<subop::Member>{hashM});
-      auto valMs = subop::StateMembersAttr::get(ctx, vals);
-      auto newHiv = subop::HashIndexedViewType::get(ctx, keyMs, valMs, oldHiv.getCompareHashForLookup());
-      chiv.getResult().setType(newHiv);
+      if (!closure.contains(chiv.getSource().getAsOpaquePointer())) return;
+      syncCreateHashIndexedViewResultType(chiv);
    });
+
+   expandClosureThroughExecutionStepPorts(module, closure);
+   synchronizeExecutionStepPortTypes(module, &closure);
+   propagateSubOpColumnAttrsFromSsaStateLayout(module, &closure);
 }
 
-static void patchLookupRefsForHashIndexedViewStates(mlir::ModuleOp module) {
+static void applyGlobalHashMapPredLayout(mlir::ModuleOp module) {
    auto* ctx = module.getContext();
-   module.walk([&](subop::LookupOp lookup) {
-      auto stTy = lookup.getState().getType();
-      if (!mlir::isa<subop::HashIndexedViewType>(stTy)) return;
-      auto hiv = mlir::cast<subop::HashIndexedViewType>(stTy);
-      auto refDef = lookup.getRef();
-      refDef.getColumn().type = subop::LookupEntryRefType::get(ctx, hiv);
-      lookup.setRefAttr(refDef);
-   });
-}
-
-/// `create_hash_indexed_view` updates its result type; align `execution_step` SSA result types.
-static void syncExecutionStepResultTypesFromReturns(mlir::ModuleOp module) {
-   module.walk([&](subop::ExecutionStepReturnOp ret) {
-      auto* parent = ret->getParentOp();
-      auto step = mlir::dyn_cast<subop::ExecutionStepOp>(parent);
-      if (!step || step.getNumResults() != ret.getNumOperands()) return;
-      for (unsigned i = 0; i < step.getNumResults(); ++i) {
-         mlir::Type t = ret.getOperand(i).getType();
-         if (t != step.getResult(i).getType()) step.getResult(i).setType(t);
+   subop::Member predMember = makeOrGetPredMember(ctx);
+   module.walk([&](mlir::Operation* op) {
+      for (mlir::OpResult r : op->getResults()) {
+         mlir::Type t = r.getType();
+         mlir::Type nt = extendHashMapTypeWithPred(t, predMember);
+         if (nt != t) r.setType(nt);
       }
-   });
-}
-
-static void syncExecutionStepBlockArgTypesFromOperands(mlir::ModuleOp module) {
-   module.walk([&](subop::ExecutionStepOp step) {
-      mlir::Block& body = step.getSubOps().front();
-      for (unsigned i = 0; i < step.getNumOperands(); ++i) {
-         if (i >= body.getNumArguments()) break;
-         mlir::Type wt = step.getOperand(i).getType();
-         if (body.getArgument(i).getType() != wt) body.getArgument(i).setType(wt);
+      for (mlir::Region& reg : op->getRegions()) {
+         for (mlir::Block& b : reg) {
+            for (mlir::BlockArgument a : b.getArguments()) {
+               mlir::Type t = a.getType();
+               mlir::Type nt = extendHashMapTypeWithPred(t, predMember);
+               if (nt != t) a.setType(nt);
+            }
+         }
       }
    });
 }
@@ -138,50 +587,481 @@ static mlir::Type extendHashMapTypeWithPred(mlir::Type t, subop::Member predMemb
    return t;
 }
 
-static constexpr llvm::StringLiteral kHashmapLookupInitPredExtendedAttr = "lingo.hashmap_lookup_init_pred_extended";
-static constexpr llvm::StringLiteral kHashmapMergeCombinePredExtendedAttr = "lingo.hashmap_merge_combine_pred_extended";
+/// Align `lookup_entry_ref<!subop.hash_indexed_view<...>>` with join-buffer `filter_pred$0` layout
+/// (same append order as `syncCreateHashIndexedViewResultType` when the pred column is last).
+static subop::HashIndexedViewType extendHashIndexedViewWithPredMemberIfMissing(mlir::MLIRContext* ctx,
+                                                                               subop::HashIndexedViewType hiv,
+                                                                               subop::Member predMember) {
+   if (valueMembersContainMemberNamed(ctx, hiv.getValueMembers(), "filter_pred$0")) return hiv;
+   auto newVals = appendMember(ctx, hiv.getValueMembers(), predMember);
+   return subop::HashIndexedViewType::get(ctx, hiv.getKeyMembers(), newVals, hiv.getCompareHashForLookup());
+}
 
-/// Extend join `hashmap` types globally, and extend matching `buffer` / `thread_local<buffer>` only for
-/// states targeted for cross-query reuse (`extendJoinBufferStates`), then align `hash_indexed_view` with buffers.
-static void rewriteHashmapTypesInModule(mlir::ModuleOp module,
-                                        llvm::ArrayRef<mlir::Value> extendJoinBufferStates = {}) {
+/// HIV gains `filter_pred$0` on join-buffer reuse; nested `!subop.list<!subop.lookup_entry_ref<...>>`
+/// (e.g. `nested_execution_group` block args) can keep the **old** HIV inside the value type while column
+/// attrs were patched — lowering then disagrees with the widened buffer / HIV and leaves unrealized casts.
+///
+/// Pure recursive rewrite on a `mlir::Type` only. SSA updates go through `refreshHivListCarrierValueTypes`,
+/// which applies this per `OpResult` / `BlockArgument` (entire module, or only values in the HIV closure).
+static mlir::Type deepReplaceHivLookupEntryRefWithPredLayout(mlir::MLIRContext* ctx, mlir::Type t,
+                                                            subop::Member predMember) {
+   if (!t) return t;
+   if (auto list = mlir::dyn_cast<subop::ListType>(t)) {
+      mlir::Type nt = deepReplaceHivLookupEntryRefWithPredLayout(ctx, list.getT(), predMember);
+      if (nt != list.getT()) return subop::ListType::get(ctx, mlir::cast<subop::StateEntryReference>(nt));
+      return t;
+   }
+   if (auto opt = mlir::dyn_cast<subop::OptionalType>(t)) {
+      mlir::Type nt = deepReplaceHivLookupEntryRefWithPredLayout(ctx, opt.getT(), predMember);
+      if (nt != opt.getT()) return subop::OptionalType::get(ctx, mlir::cast<subop::StateEntryReference>(nt));
+      return t;
+   }
+   if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(t)) {
+      if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState())) {
+         auto nhiv = extendHashIndexedViewWithPredMemberIfMissing(ctx, hiv, predMember);
+         if (nhiv != hiv) return subop::LookupEntryRefType::get(ctx, nhiv);
+      }
+      return t;
+   }
+   return t;
+}
+
+/// Apply `deepReplaceHivLookupEntryRefWithPredLayout` to each SSA value's declared type. When
+/// \p closureFilter is set, only **values whose opaque pointer is in the closure** are updated
+/// (no `opOperandsOrNestedBlockArgsTouchClosure` gate — operands are other values' results/args).
+///
+/// Important: never call `Value::setType` inside `module.walk` — mutating types while traversing
+/// the IR graph can leave `Type` storages in a bad state and crash the next `dyn_cast` on a
+/// sibling value. Collect updates first, then apply after the walk completes; repeat until a
+/// full pass makes no changes (fixpoint). With consistent IR, `deepReplaceHivLookupEntryRefWithPredLayout`
+/// is idempotent at fixpoint; a non-terminating loop would indicate a bug elsewhere, not an
+/// intentional "type update cycle".
+static void refreshHivListCarrierValueTypes(mlir::ModuleOp module, const llvm::DenseSet<void*>* closureFilter) {
    auto* ctx = module.getContext();
    subop::Member predMember = makeOrGetPredMember(ctx);
-
-   llvm::DenseMap<mlir::Type, mlir::Type> bufOldToNew;
-   for (mlir::Value v : extendJoinBufferStates) {
-      auto bt = mlir::dyn_cast<subop::BufferType>(v.getType());
-      if (!bt) continue;
-      if (valueMembersContainMemberNamed(ctx, bt.getMembers(), "filter_pred$0")) continue;
-      bufOldToNew[bt] = subop::BufferType::get(ctx, appendMember(ctx, bt.getMembers(), predMember));
-   }
-
-   module.walk([&](mlir::Operation* op) {
-      for (mlir::OpResult r : op->getResults()) {
-         mlir::Type t = r.getType();
-         mlir::Type nt = extendHashMapTypeWithPred(t, predMember);
-         if (!bufOldToNew.empty()) nt = substituteJoinBufferTypes(nt, bufOldToNew);
-         if (nt != t) r.setType(nt);
+   for (;;) {
+      llvm::SmallVector<std::pair<mlir::Value, mlir::Type>> updates;
+      updates.reserve(128);
+      module.walk([&](mlir::Operation* op) {
+         for (mlir::OpResult r : op->getResults()) {
+            if (closureFilter && !opaqueClosureContains(*closureFilter, r)) continue;
+            mlir::Type cur = r.getType();
+            if (!cur) continue;
+            mlir::Type nt = deepReplaceHivLookupEntryRefWithPredLayout(ctx, cur, predMember);
+            if (nt != cur) updates.push_back({r, nt});
+         }
+         for (mlir::Region& reg : op->getRegions()) {
+            for (mlir::Block& b : reg) {
+               for (mlir::BlockArgument a : b.getArguments()) {
+                  if (closureFilter && !opaqueClosureContains(*closureFilter, a)) continue;
+                  mlir::Type cur = a.getType();
+                  if (!cur) continue;
+                  mlir::Type nt = deepReplaceHivLookupEntryRefWithPredLayout(ctx, cur, predMember);
+                  if (nt != cur) updates.push_back({a, nt});
+               }
+            }
+         }
+      });
+      if (updates.empty()) break;
+      for (auto [v, nt] : updates) {
+         v.setType(nt);
       }
-      for (mlir::Region& reg : op->getRegions()) {
-         for (mlir::Block& b : reg) {
-            for (mlir::BlockArgument a : b.getArguments()) {
-               mlir::Type t = a.getType();
-               mlir::Type nt = extendHashMapTypeWithPred(t, predMember);
-               if (!bufOldToNew.empty()) nt = substituteJoinBufferTypes(nt, bufOldToNew);
-               if (nt != t) a.setType(nt);
+   }
+}
+
+/// After `applyGlobalHashMapPredLayout` / join-buffer HIV extensions, tuple column attrs and nested
+/// list/optional carrier types may still embed pre-extension `hash_map_entry_ref` / `lookup_entry_ref`.
+/// When \p closureFilter is null, fix the whole module. Otherwise column-attr walks still use
+/// `opOperandsOrNestedBlockArgsTouchClosure`, while `refreshHivListCarrierValueTypes` only rewrites
+/// **types of SSA values present in the closure** (after `expandClosureThroughExecutionStepPorts`).
+static void propagateSubOpColumnAttrsFromSsaStateLayout(mlir::ModuleOp module,
+                                                        const llvm::DenseSet<void*>* closureFilter) {
+   auto* ctx = module.getContext();
+   subop::Member predMember = makeOrGetPredMember(ctx);
+   auto shouldUpdateOp = [&](mlir::Operation* op) {
+      return !closureFilter || opOperandsOrNestedBlockArgsTouchClosure(op, *closureFilter);
+   };
+   auto syncHashMapEntryRef = [&](tuples::ColumnRefAttr cref) -> bool {
+      bool changed = false;
+      if (auto hmer = mlir::dyn_cast<subop::HashMapEntryRefType>(cref.getColumn().type)) {
+         mlir::Type nhm = extendHashMapTypeWithPred(hmer.getHashMap(), predMember);
+         if (nhm != hmer.getHashMap()) {
+            cref.getColumn().type = subop::HashMapEntryRefType::get(ctx, mlir::cast<subop::HashMapType>(nhm));
+            changed = true;
+         }
+      }
+      if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(cref.getColumn().type)) {
+         if (auto hm = mlir::dyn_cast<subop::HashMapType>(ler.getState())) {
+            mlir::Type nhm = extendHashMapTypeWithPred(hm, predMember);
+            hm = mlir::dyn_cast<subop::HashMapType>(nhm);
+            if (hm) {
+               auto expected = subop::LookupEntryRefType::get(ctx, hm);
+               if (cref.getColumn().type != expected) {
+                  cref.getColumn().type = expected;
+                  changed = true;
+               }
+            }
+         } else if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState())) {
+            auto nhiv = extendHashIndexedViewWithPredMemberIfMissing(ctx, hiv, predMember);
+            if (nhiv != hiv) {
+               cref.getColumn().type = subop::LookupEntryRefType::get(ctx, nhiv);
+               changed = true;
             }
          }
       }
+      return changed;
+   };
+   auto syncHashMapEntryRefInColumnDef = [&](tuples::ColumnDefAttr def) -> bool {
+      bool changed = false;
+      if (auto hmer = mlir::dyn_cast<subop::HashMapEntryRefType>(def.getColumn().type)) {
+         mlir::Type nhm = extendHashMapTypeWithPred(hmer.getHashMap(), predMember);
+         if (nhm != hmer.getHashMap()) {
+            def.getColumn().type = subop::HashMapEntryRefType::get(ctx, mlir::cast<subop::HashMapType>(nhm));
+            changed = true;
+         }
+      }
+      if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(def.getColumn().type)) {
+         if (auto hm = mlir::dyn_cast<subop::HashMapType>(ler.getState())) {
+            mlir::Type nhm = extendHashMapTypeWithPred(hm, predMember);
+            hm = mlir::dyn_cast<subop::HashMapType>(nhm);
+            if (hm) {
+               auto expected = subop::LookupEntryRefType::get(ctx, hm);
+               if (def.getColumn().type != expected) {
+                  def.getColumn().type = expected;
+                  changed = true;
+               }
+            }
+         } else if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState())) {
+            auto nhiv = extendHashIndexedViewWithPredMemberIfMissing(ctx, hiv, predMember);
+            if (nhiv != hiv) {
+               def.getColumn().type = subop::LookupEntryRefType::get(ctx, nhiv);
+               changed = true;
+            }
+         }
+      }
+      return changed;
+   };
+   module.walk([&](subop::ReduceOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      bool changed = false;
+      auto r = op.getRef();
+      if (syncHashMapEntryRef(r)) {
+         op.setRefAttr(r);
+         changed = true;
+      }
+      // `ReduceOpLowering` compares each stream column type to these attrs; stale
+      // `hash_map_entry_ref` / `lookup_entry_ref` after pred layout forces unrealized casts.
+      llvm::SmallVector<mlir::Attribute> newCols;
+      newCols.reserve(op.getColumns().size());
+      for (mlir::Attribute a : op.getColumns()) {
+         if (auto cref = mlir::dyn_cast<tuples::ColumnRefAttr>(a)) {
+            tuples::ColumnRefAttr cr = cref;
+            if (syncHashMapEntryRef(cr)) {
+               changed = true;
+               newCols.push_back(cr);
+               continue;
+            }
+         }
+         newCols.push_back(a);
+      }
+      if (changed) op.setColumnsAttr(mlir::ArrayAttr::get(ctx, newCols));
+   });
+   module.walk([&](subop::ScatterOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto r = op.getRef();
+      bool changed = syncHashMapEntryRef(r);
+      llvm::SmallVector<std::pair<subop::Member, tuples::ColumnRefAttr>> out;
+      for (auto [mem, cref] : op.getMapping().getMapping()) {
+         tuples::ColumnRefAttr c = cref;
+         if (syncHashMapEntryRef(c)) changed = true;
+         out.push_back({mem, c});
+      }
+      if (!changed) return;
+      op.setRefAttr(r);
+      op.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, out));
+   });
+   module.walk([&](subop::GatherOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto r = op.getRef();
+      bool changed = syncHashMapEntryRef(r);
+      auto m = op.getMapping();
+      llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> out;
+      for (auto [mem, def] : m.getMapping()) {
+         tuples::ColumnDefAttr d = def;
+         if (syncHashMapEntryRefInColumnDef(d)) changed = true;
+         out.push_back({mem, d});
+      }
+      if (changed) {
+         op.setRefAttr(r);
+         op.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, out));
+      }
+   });
+   module.walk([&](subop::ScanOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto m = op.getMapping();
+      llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> out;
+      bool changed = false;
+      for (auto [mem, def] : m.getMapping()) {
+         tuples::ColumnDefAttr d = def;
+         if (syncHashMapEntryRefInColumnDef(d)) changed = true;
+         out.push_back({mem, d});
+      }
+      if (changed) op.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, out));
+   });
+   module.walk([&](subop::NestedMapOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto params = op.getParametersAttr();
+      llvm::SmallVector<mlir::Attribute> newParams;
+      bool changed = false;
+      for (mlir::Attribute a : params) {
+         if (auto cref = mlir::dyn_cast<tuples::ColumnRefAttr>(a)) {
+            tuples::ColumnRefAttr r = cref;
+            if (syncHashMapEntryRef(r)) {
+               changed = true;
+               newParams.push_back(r);
+               continue;
+            }
+         }
+         newParams.push_back(a);
+      }
+      if (changed) op.setParametersAttr(mlir::ArrayAttr::get(ctx, newParams));
+   });
+   module.walk([&](subop::MapOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto cols = op.getInputColsAttr();
+      llvm::SmallVector<mlir::Attribute> newCols;
+      bool changed = false;
+      for (mlir::Attribute a : cols) {
+         if (auto cref = mlir::dyn_cast<tuples::ColumnRefAttr>(a)) {
+            tuples::ColumnRefAttr r = cref;
+            if (syncHashMapEntryRef(r)) {
+               changed = true;
+               newCols.push_back(r);
+               continue;
+            }
+         }
+         newCols.push_back(a);
+      }
+      if (changed) op.setInputColsAttr(mlir::ArrayAttr::get(ctx, newCols));
+   });
+   module.walk([&](subop::FilterOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto conds = op.getConditionsAttr();
+      llvm::SmallVector<mlir::Attribute> out;
+      bool changed = false;
+      for (mlir::Attribute a : conds) {
+         if (auto cref = mlir::dyn_cast<tuples::ColumnRefAttr>(a)) {
+            tuples::ColumnRefAttr r = cref;
+            if (syncHashMapEntryRef(r)) {
+               changed = true;
+               out.push_back(r);
+               continue;
+            }
+         }
+         out.push_back(a);
+      }
+      if (changed) op.setConditionsAttr(mlir::ArrayAttr::get(ctx, out));
+   });
+   module.walk([&](subop::LockOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto r = op.getRef();
+      if (!syncHashMapEntryRef(r)) return;
+      op.setRefAttr(r);
+   });
+   module.walk([&](subop::LookupOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto r = op.getRef();
+      if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(op.getState().getType())) {
+         auto expected = subop::LookupEntryRefType::get(ctx, hiv);
+         if (r.getColumn().type == expected) return;
+         r.getColumn().type = expected;
+         op.setRefAttr(r);
+         return;
+      }
+      subop::HashMapType hm = getHashMapTypeForStateValue(op.getState());
+      if (!hm) return;
+      mlir::Type nhm = extendHashMapTypeWithPred(hm, predMember);
+      hm = mlir::dyn_cast<subop::HashMapType>(nhm);
+      if (!hm) return;
+      auto expected = subop::LookupEntryRefType::get(ctx, hm);
+      if (r.getColumn().type == expected) return;
+      r.getColumn().type = expected;
+      op.setRefAttr(r);
+   });
+   module.walk([&](subop::LookupOrInsertOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      subop::HashMapType hm = getHashMapTypeForStateValue(op.getState());
+      if (!hm) return;
+      mlir::Type nhm = extendHashMapTypeWithPred(hm, predMember);
+      hm = mlir::dyn_cast<subop::HashMapType>(nhm);
+      if (!hm) return;
+      auto expected = subop::LookupEntryRefType::get(ctx, hm);
+      auto r = op.getRef();
+      if (r.getColumn().type == expected) return;
+      r.getColumn().type = expected;
+      op.setRefAttr(r);
+   });
+   module.walk([&](subop::ScanRefsOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      subop::HashMapType hm = getHashMapTypeForStateValue(op.getState());
+      if (!hm) return;
+      mlir::Type nhm = extendHashMapTypeWithPred(hm, predMember);
+      hm = mlir::dyn_cast<subop::HashMapType>(nhm);
+      if (!hm) return;
+      auto expected = subop::HashMapEntryRefType::get(ctx, hm);
+      auto r = op.getRef();
+      if (r.getColumn().type == expected) return;
+      r.getColumn().type = expected;
+      op.setRefAttr(r);
+   });
+   module.walk([&](subop::MaterializeOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto m = op.getMapping();
+      llvm::SmallVector<std::pair<subop::Member, tuples::ColumnRefAttr>> out;
+      bool changed = false;
+      for (auto [mem, cref] : m.getMapping()) {
+         tuples::ColumnRefAttr r = cref;
+         if (syncHashMapEntryRef(r)) changed = true;
+         out.push_back({mem, r});
+      }
+      if (changed) op.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, out));
+   });
+   module.walk([&](subop::InsertOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto m = op.getMapping();
+      llvm::SmallVector<std::pair<subop::Member, tuples::ColumnRefAttr>> out;
+      bool changed = false;
+      for (auto [mem, cref] : m.getMapping()) {
+         tuples::ColumnRefAttr r = cref;
+         if (syncHashMapEntryRef(r)) changed = true;
+         out.push_back({mem, r});
+      }
+      if (changed) op.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, out));
+   });
+   module.walk([&](subop::UnwrapOptionalRefOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto pref = op.getOptionalRef();
+      bool c1 = syncHashMapEntryRef(pref);
+      auto r = op.getRef();
+      bool c2 = syncHashMapEntryRefInColumnDef(r);
+      if (auto optTy = mlir::dyn_cast<subop::OptionalType>(op.getOptionalRef().getColumn().type)) {
+         mlir::Type inner = optTy.getT();
+         if (r.getColumn().type != inner) {
+            r.getColumn().type = inner;
+            c2 = true;
+         }
+      }
+      if (c1) op.setOptionalRefAttr(pref);
+      if (c2) op.setRefAttr(r);
+   });
+   module.walk([&](subop::GetBeginReferenceOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto r = op.getRef();
+      if (!syncHashMapEntryRefInColumnDef(r)) return;
+      op.setRefAttr(r);
+   });
+   module.walk([&](subop::GetEndReferenceOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto r = op.getRef();
+      if (!syncHashMapEntryRefInColumnDef(r)) return;
+      op.setRefAttr(r);
+   });
+   module.walk([&](subop::EntriesBetweenOp op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto lr = op.getLeftRef();
+      if (syncHashMapEntryRef(lr)) op.setLeftRefAttr(lr);
+      auto rr = op.getRightRef();
+      if (syncHashMapEntryRef(rr)) op.setRightRefAttr(rr);
+      auto between = op.getBetween();
+      if (syncHashMapEntryRefInColumnDef(between)) op.setBetweenAttr(between);
+   });
+   module.walk([&](subop::OffsetReferenceBy op) {
+      if (!shouldUpdateOp(op.getOperation())) return;
+      auto ref = op.getRef();
+      if (syncHashMapEntryRef(ref)) op.setRefAttr(ref);
+      auto idx = op.getIdx();
+      if (syncHashMapEntryRef(idx)) op.setIdxAttr(idx);
+      auto newRef = op.getNewRef();
+      if (syncHashMapEntryRefInColumnDef(newRef)) op.setNewRefAttr(newRef);
    });
 
-   if (!bufOldToNew.empty()) {
-      syncCreateHashIndexedViewTypesFromBuffers(module);
-      for (unsigned iter = 0; iter < 8; ++iter) {
-         syncExecutionStepResultTypesFromReturns(module);
-         syncExecutionStepBlockArgTypesFromOperands(module);
-      }
-      patchLookupRefsForHashIndexedViewStates(module);
+   refreshHivListCarrierValueTypes(module, closureFilter);
+   synchronizeExecutionStepPortTypes(module, closureFilter);
+
+   module.walk([&](subop::ScanListOp scan) {
+      if (!shouldUpdateOp(scan.getOperation())) return;
+      auto listTy = mlir::dyn_cast<subop::ListType>(scan.getList().getType());
+      if (!listTy) return;
+      mlir::Type inner = listTy.getT();
+      auto elem = scan.getElem();
+      if (elem.getColumn().type == inner) return;
+      auto elem2 = elem;
+      elem2.getColumn().type = inner;
+      scan.setElemAttr(elem2);
+   });
+   module.walk([&](subop::LookupOp lookup) {
+      if (!shouldUpdateOp(lookup.getOperation())) return;
+      auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(lookup.getState().getType());
+      if (!hiv) return;
+      auto expected = subop::LookupEntryRefType::get(ctx, hiv);
+      auto refDef = lookup.getRef();
+      if (refDef.getColumn().type == expected) return;
+      refDef.getColumn().type = expected;
+      lookup.setRefAttr(refDef);
+   });
+}
+
+/// Join-buffer reuse appends `filter_pred$0` to merged `!subop.buffer<...>` results. The `subop.merge`
+/// lowering assumes the incoming `thread_local` wraps the **same** buffer layout as the merge
+/// result; if only the merge result type was widened, the operand chain still names the old
+/// three-field buffer and LLVM translation hits stuck `builtin.unrealized_conversion_cast`.
+static void alignBufferMergeThreadLocalsWithExtendedMergeResult(mlir::ModuleOp module) {
+   auto* ctx = module.getContext();
+   for (unsigned round = 0; round < 1; ++round) {
+      module.walk([&](subop::MergeOp merge) {
+         auto resBuf = mlir::dyn_cast<subop::BufferType>(merge.getRes().getType());
+         if (!resBuf || !valueMembersContainMemberNamed(ctx, resBuf.getMembers(), "filter_pred$0")) return;
+         auto targetTl = subop::ThreadLocalType::get(ctx, mlir::cast<subop::State>(resBuf));
+
+         llvm::SmallDenseSet<void*> seen;
+         llvm::SmallVector<mlir::Value, 16> worklist;
+         worklist.push_back(merge.getThreadLocal());
+         while (!worklist.empty()) {
+            mlir::Value v = worklist.back();
+            worklist.pop_back();
+            void* k = v.getAsOpaquePointer();
+            if (!seen.insert(k).second) continue;
+            v.setType(targetTl);
+
+            if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+               mlir::Block* owner = ba.getOwner();
+               mlir::Operation* parentOp = owner->getParentOp();
+               if (!parentOp && owner->getParent()) parentOp = owner->getParent()->getParentOp();
+               if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(parentOp)) {
+                  unsigned idx = ba.getArgNumber();
+                  if (idx < step.getNumOperands()) worklist.push_back(step.getOperand(idx));
+               }
+            }
+         }
+      });
+   }
+}
+
+static constexpr llvm::StringLiteral kHashmapLookupInitPredExtendedAttr = "lingo.hashmap_lookup_init_pred_extended";
+static constexpr llvm::StringLiteral kHashmapMergeCombinePredExtendedAttr = "lingo.hashmap_merge_combine_pred_extended";
+
+/// Extend `hashmap` join state globally; extend `buffer` / `hash_indexed_view` only on the SSA closure of
+/// matched reuse buffers (requires \p reuseForJoinBuffers from `collectModuleReuseInfo` **before** mutation).
+static void rewriteHashmapTypesInModule(mlir::ModuleOp module,
+                                        llvm::ArrayRef<mlir::Value> extendJoinBufferStates,
+                                        const ModuleReuseInfo* reuseForJoinBuffers) {
+   applyGlobalHashMapPredLayout(module);
+
+   auto* ctx = module.getContext();
+
+   if (!extendJoinBufferStates.empty()) {
+      assert(reuseForJoinBuffers && "rewriteHashmapTypesInModule: reuse info required for join buffer+HIV");
+      applyJoinBufferHivPredToSsaClosure(module, extendJoinBufferStates, *reuseForJoinBuffers);
    }
 
    module.walk([&](subop::ScanRefsOp scan) {
@@ -220,16 +1100,37 @@ static void rewriteHashmapTypesInModule(mlir::ModuleOp module,
       if (!mlir::isa<subop::HashMapType>(mergeOp.getResult().getType())) return;
       if (mergeOp->hasAttr(kHashmapMergeCombinePredExtendedAttr)) return;
       if (mergeOp.getCombineFn().empty()) return;
-      mlir::Block& b = mergeOp.getCombineFn().front();
-      auto ret = mlir::cast<tuples::ReturnOp>(b.getTerminator());
-      auto loc = mergeOp.getLoc();
-      b.addArgument(mlir::IntegerType::get(ctx, 1), loc);
-      b.addArgument(mlir::IntegerType::get(ctx, 1), loc);
-      mlir::Value oldPred = b.getArgument(b.getNumArguments() - 2);
-      mlir::Value newPred = b.getArgument(b.getNumArguments() - 1);
+      auto hmTy = mlir::cast<subop::HashMapType>(mergeOp.getResult().getType());
+      auto* d = ctx->getLoadedDialect<subop::SubOperatorDialect>();
+      assert(d && "SubOperatorDialect must be loaded");
+      auto& mm = d->getMemberManager();
+      auto mems = hmTy.getValueMembers().getMembers();
+      if (mems.empty()) return;
+      if (mm.getName(mems.back()) != "filter_pred$0") return;
 
+      // `MergeThreadLocalHashMap` passes combine args as concat(left value map, right value map) in
+      // **member order**, so with `filter_pred$0` last the layout is
+      //   [L_non_pred..., L_pred, R_non_pred..., R_pred].
+      // Historically we appended two i1 at the end (`[L..., R..., L_pred, R_pred]`), which mismatched
+      // lowering and produced unreconcilable casts. Insert the predicate slots in the middle instead.
+      const unsigned k = mems.size();
+      const unsigned nonPredPerSide = k - 1;
+      mlir::Block& b = mergeOp.getCombineFn().front();
+      const unsigned nArg = b.getNumArguments();
+      // Already includes both sides' `filter_pred$0` slots (parser built full 2*k combine args).
+      if (nArg == 2 * k) return;
+      if (nArg != 2 * nonPredPerSide) return;
+
+      mlir::Type i1 = mlir::IntegerType::get(ctx, 1);
+      auto loc = mergeOp.getLoc();
+      b.insertArgument(nonPredPerSide, i1, loc);
+      b.insertArgument(2 * nonPredPerSide + 1, i1, loc);
+
+      auto ret = mlir::cast<tuples::ReturnOp>(b.getTerminator());
       mlir::OpBuilder bb(ret);
-      mlir::Value mergedPred = bb.create<mlir::arith::AndIOp>(loc, oldPred, newPred);
+      mlir::Value leftPred = b.getArgument(nonPredPerSide);
+      mlir::Value rightPred = b.getArgument(2 * nonPredPerSide + 1);
+      mlir::Value mergedPred = bb.create<mlir::arith::AndIOp>(loc, leftPred, rightPred);
 
       llvm::SmallVector<mlir::Value, 32> outs(ret.getOperands().begin(), ret.getOperands().end());
       outs.push_back(mergedPred);
@@ -237,6 +1138,9 @@ static void rewriteHashmapTypesInModule(mlir::ModuleOp module,
       ret.erase();
       mergeOp->setAttr(kHashmapMergeCombinePredExtendedAttr, mlir::UnitAttr::get(ctx));
    });
+
+   propagateSubOpColumnAttrsFromSsaStateLayout(module, nullptr);
+   alignBufferMergeThreadLocalsWithExtendedMergeResult(module);
 }
 
 // Convert runtime filter descriptions into MLIR subop.map + subop.filter.
@@ -606,14 +1510,23 @@ static void insertWriteSidePredIntoHashMapConstructionStep(ExecutionStepOp step,
    }
    assert(bigReduce && "write_pred: expected reduce into hashmap");
 
-   // Find the pred member in the hashmap value tuple.
+   // Canonical extended join hashmap for this step: align **every** column attr in the flat step
+   // body that refers to the same join key layout, so lowering never sees stale `hash_map_entry_ref`
+   // / `lookup_entry_ref` vs SSA buffer types.
+   subop::HashMapType hmTySync = mlir::cast<subop::HashMapType>(extendHashMapTypeWithPred(
+      mlir::cast<subop::HashMapType>(
+         mlir::cast<subop::LookupEntryRefType>(bigReduce.getRef().getColumn().type).getState()),
+      makeOrGetPredMember(step.getContext())));
+   alignJoinHashMapStepColumnAttrs(step, hmTySync);
+
    subop::Member predMember;
    {
-      auto refTy = mlir::cast<subop::LookupEntryRefType>(bigReduce.getRef().getColumn().type);
-      auto hmTy = mlir::cast<subop::HashMapType>(refTy.getState());
       auto& mm = bigReduce->getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-      for (auto m : hmTy.getValueMembers().getMembers()) {
-         if (mm.getName(m) == "filter_pred$0") { predMember = m; break; }
+      for (auto m : hmTySync.getValueMembers().getMembers()) {
+         if (mm.getName(m) == "filter_pred$0") {
+            predMember = m;
+            break;
+         }
       }
       assert(predMember && "write_pred: could not find filter_pred$0 member in hashmap type");
    }
@@ -785,9 +1698,12 @@ static void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
       return firstGather->isBeforeInBlock(ou.getOwner());
    });
 
+   // Materialize may target either `!subop.buffer<...>` or `!subop.thread_local<!subop.buffer<...>>`
+   // (parallel / align passes sometimes thread_local-wrap the state SSA). The layout with
+   // `filter_pred$0` lives on the inner buffer type in both cases.
    subop::MaterializeOp matOp;
    step.getOperation()->walk([&](subop::MaterializeOp m) {
-      auto bufTy = mlir::dyn_cast<subop::BufferType>(m.getState().getType());
+      subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(m.getState().getType());
       if (!bufTy) return mlir::WalkResult::advance();
       if (!valueMembersContainMemberNamed(step.getContext(), bufTy.getMembers(), "filter_pred$0"))
          return mlir::WalkResult::advance();
@@ -798,7 +1714,8 @@ static void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
 
    subop::Member predMember;
    {
-      auto bufTy = mlir::cast<subop::BufferType>(matOp.getState().getType());
+      subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(matOp.getState().getType());
+      assert(bufTy && "write_pred_buf: materialize state must be buffer or thread_local<buffer>");
       for (auto m : bufTy.getMembers().getMembers()) {
          if (mm.getName(m) == "filter_pred$0") {
             predMember = m;
@@ -813,6 +1730,76 @@ static void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
    for (auto& pr : matOp.getMapping().getMapping()) pairs.push_back(pr);
    pairs.push_back({predMember, predColRef});
    matOp.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(step.getContext(), pairs));
+}
+
+/// `rewriteHashmapTypesInModule` can extend join buffers with `filter_pred$0` on the type before any
+/// writer fills that member (e.g. no decoded table filters for that buffer, or predicate lowering did
+/// not attach to this `materialize`). Uninitialized bits make downstream `filter(all_true ...)` drop
+/// all rows. When the buffer layout includes `filter_pred$0` but the `materialize` mapping does not,
+/// append a constant-true predicate column and map it into `filter_pred$0`.
+static void ensureJoinBufferFilterPredMaterializeMappings(mlir::ModuleOp module) {
+   auto* ctx = module.getContext();
+   auto* subDialect = ctx->getLoadedDialect<subop::SubOperatorDialect>();
+   auto* tupleDialect = ctx->getLoadedDialect<tuples::TupleStreamDialect>();
+   if (!subDialect || !tupleDialect) return;
+   auto& mm = subDialect->getMemberManager();
+   auto& cm = tupleDialect->getColumnManager();
+
+   llvm::SmallVector<subop::MaterializeOp, 16> todo;
+   module.walk([&](subop::MaterializeOp m) {
+      subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(m.getState().getType());
+      if (!bufTy) return mlir::WalkResult::advance();
+      subop::Member predM;
+      for (auto mem : bufTy.getMembers().getMembers()) {
+         if (mm.getName(mem) == "filter_pred$0") {
+            predM = mem;
+            break;
+         }
+      }
+      if (!predM) return mlir::WalkResult::advance();
+      for (auto& pr : m.getMapping().getMapping()) {
+         if (pr.first == predM) return mlir::WalkResult::advance();
+      }
+      todo.push_back(m);
+      return mlir::WalkResult::advance();
+   });
+
+   for (subop::MaterializeOp m : todo) {
+      mlir::OpBuilder pb(m);
+      mlir::Location loc = m.getLoc();
+      std::string sc = cm.getUniqueScope("jp_default_pred");
+      tuples::ColumnDefAttr def = cm.createDef(sc, "t");
+      def.getColumn().type = mlir::IntegerType::get(ctx, 1);
+      tuples::ColumnRefAttr predRef = cm.createRef(&def.getColumn());
+
+      subop::MapCreationHelper helper(ctx);
+      helper.buildBlock(pb, [&](mlir::OpBuilder& rb) {
+         mlir::Value t = rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+         rb.create<tuples::ReturnOp>(loc, mlir::ValueRange{t});
+      });
+
+      mlir::Value stream = m.getStream();
+      pb.setInsertionPoint(m);
+      auto mapOp = pb.create<subop::MapOp>(loc, tuples::TupleStreamType::get(ctx), stream,
+                                           pb.getArrayAttr({def}), helper.getColRefs());
+      mapOp.getFn().push_back(helper.getMapBlock());
+      m->setOperand(0, mapOp.getResult());
+
+      subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(m.getState().getType());
+      assert(bufTy);
+      subop::Member predM;
+      for (auto mem : bufTy.getMembers().getMembers()) {
+         if (mm.getName(mem) == "filter_pred$0") {
+            predM = mem;
+            break;
+         }
+      }
+      assert(predM);
+      llvm::SmallVector<subop::RefMappingPairT> pairs;
+      for (auto pr : m.getMapping().getMapping()) pairs.push_back(pr);
+      pairs.push_back({predM, predRef});
+      m.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, pairs));
+   }
 }
 
 // For scan_refs over join `hashmap`: filter by stored predicate member `filter_pred$0`.
@@ -1198,22 +2185,148 @@ collectCreateAndWriteStepsForStates(ExecutionGroupOp donor, const ModuleReuseInf
    return out;
 }
 
-static int executionStepDonorIndex(ExecutionGroupOp donor, ExecutionStepOp target) {
-   int i = 0;
-   for (mlir::Operation& op : donor.getSubOps().front()) {
-      if (auto es = mlir::dyn_cast<ExecutionStepOp>(&op)) {
-         if (es == target) return i;
-         ++i;
+/// Peel region entry `block_arg` chains to the nearest enclosing op operands (`execution_step` /
+/// `nested_execution_group`) so liveness can follow state flow across nested regions.
+static mlir::Value peelBlockArgsToEnclosingOperands(mlir::Value v) {
+   for (;;) {
+      auto ba = mlir::dyn_cast<mlir::BlockArgument>(v);
+      if (!ba) break;
+      mlir::Block* owner = ba.getOwner();
+      mlir::Operation* parent = owner->getParentOp();
+      if (!parent) break;
+
+      if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(parent)) {
+         if (&step.getSubOps().front() == owner && ba.getArgNumber() < step.getNumOperands()) {
+            v = step.getOperand(ba.getArgNumber());
+            continue;
+         }
       }
+      if (auto neg = mlir::dyn_cast<subop::NestedExecutionGroupOp>(parent)) {
+         if (&neg.getSubOps().front() == owner && ba.getArgNumber() < neg.getNumOperands()) {
+            v = neg.getOperand(ba.getArgNumber());
+            continue;
+         }
+      }
+      break;
    }
-   return -1;
+   return v;
 }
 
-static const ModuleReuseInfo::StepRW* lookupStepRw(const ModuleReuseInfo& reuse, ExecutionStepOp step) {
-   for (const auto& e : reuse.steps) {
-      if (e.step == step) return &e;
+/// Any SSA referenced inside cloned `execution_step` regions must be defined by ops that are also
+/// cloned into the synthetic module. `expandNeededStatesFromTargets` only walks SubOp pipeline
+/// state values (not external `!subop.table` streams), so clone seeds can otherwise miss the
+/// top-level donor steps that host `get_external` / table producers while still using their results
+/// in nested maps — leaving operands pointing at SSA in the donor module (undefined behavior at
+/// runtime). This closure repeatedly pulls in top-level `execution_step` producers for every
+/// reached operand.
+static llvm::SmallVector<ExecutionStepOp, 32>
+augmentStepsWithOperandProducerClosure(ExecutionGroupOp donor,
+                                       llvm::ArrayRef<ExecutionStepOp> seedSteps) {
+   llvm::DenseSet<mlir::Operation*> seen;
+   llvm::SmallVector<ExecutionStepOp, 32> worklist;
+   worklist.reserve(seedSteps.size());
+   for (ExecutionStepOp s : seedSteps) {
+      if (seen.insert(s.getOperation()).second) {
+         worklist.push_back(s);
+      }
    }
-   return nullptr;
+   for (size_t i = 0; i < worklist.size(); ++i) {
+      ExecutionStepOp s = worklist[i];
+      s.walk([&](mlir::Operation* op) {
+         for (mlir::Value v : op->getOperands()) {
+            mlir::Value peeled = peelBlockArgsToEnclosingOperands(v);
+            mlir::Operation* def = peeled.getDefiningOp();
+            if (!def) continue;
+            ExecutionStepOp innerSt;
+            if (auto es = mlir::dyn_cast<ExecutionStepOp>(def)) {
+               innerSt = es;
+            } else {
+               innerSt = def->getParentOfType<ExecutionStepOp>();
+            }
+            if (!innerSt) continue;
+            ExecutionStepOp top = liftToTopLevelStepInDonor(donor, innerSt);
+            if (seen.insert(top.getOperation()).second) {
+               worklist.push_back(top);
+            }
+         }
+      });
+   }
+   llvm::sort(worklist, [](ExecutionStepOp a, ExecutionStepOp b) {
+      return a->isBeforeInBlock(b);
+   });
+   return worklist;
+}
+
+/// Backward pipeline-state closure from `execution_group_return` seeds using only
+/// `ModuleReuseInfo` (writer steps, create-only steps, and `StepRW` reads / step operands).
+/// Does not inspect post-rewrite SSA use edges.
+static llvm::DenseSet<void*> closureLiveStatesFromReuseReturnSeeds(
+   llvm::ArrayRef<mlir::Value> returnPipelineSeeds, const ModuleReuseInfo& reuse,
+   const llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*>& rwByStepOp) {
+   llvm::DenseSet<void*> live;
+   llvm::SmallVector<mlir::Value, 64> queue;
+
+   auto enqueue = [&](mlir::Value v) {
+      v = peelBlockArgsToEnclosingOperands(v);
+      if (!isPipelineStateValue(v)) return;
+      mlir::Value c = canonicalizeStateValueForReuse(v);
+      void* k = c.getAsOpaquePointer();
+      if (!live.insert(k).second) return;
+      queue.push_back(c);
+   };
+
+   for (mlir::Value s : returnPipelineSeeds) enqueue(s);
+
+   auto walkProducerStep = [&](ExecutionStepOp step) {
+      if (const ModuleReuseInfo::StepRW* rw = rwByStepOp.lookup(step.getOperation())) {
+         for (mlir::Value r : rw->reads) enqueue(r);
+      }
+      for (mlir::Value opnd : step.getOperands()) enqueue(opnd);
+   };
+
+   for (size_t qi = 0; qi < queue.size(); ++qi) {
+      mlir::Value v = queue[qi];
+      if (auto itW = findReuseMap(reuse.writerStepsByState, v); itW != reuse.writerStepsByState.end()) {
+         for (ExecutionStepOp w : itW->second) walkProducerStep(w);
+      }
+      if (auto itC = findReuseMap(reuse.createOnlyStepForState, v); itC != reuse.createOnlyStepForState.end()) {
+         walkProducerStep(itC->second);
+      }
+   }
+   return live;
+}
+
+/// Every pipeline state written by \p step (results + `StepRW::writes`) is in \p obsoleteCanonPtrs.
+static bool stepWritesOnlyStatesInObsoleteSet(
+   ExecutionStepOp step, const llvm::DenseSet<void*>& obsoleteCanonPtrs,
+   const llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*>& rwByStepOp) {
+   bool sawPipelineWrite = false;
+   bool allInObsolete = true;
+   auto check = [&](mlir::Value w) {
+      w = peelBlockArgsToEnclosingOperands(w);
+      if (!isPipelineStateValue(w)) return;
+      sawPipelineWrite = true;
+      mlir::Value c = canonicalizeStateValueForReuse(w);
+      if (!obsoleteCanonPtrs.contains(c.getAsOpaquePointer())) allInObsolete = false;
+   };
+
+   for (mlir::OpResult r : step.getResults()) check(r);
+   if (const ModuleReuseInfo::StepRW* rw = rwByStepOp.lookup(step.getOperation())) {
+      for (mlir::Value w : rw->writes) check(w);
+   }
+
+   return sawPipelineWrite && allInObsolete;
+}
+
+/// Never erase `execution_step`s that host `cache_get` (inserted at the start of the group): their
+/// result SSA may fingerprint like obsolete construction outputs, but removing them corrupts IR.
+static bool executionStepContainsCacheGet(ExecutionStepOp step) {
+   bool found = false;
+   step.walk([&](subop::CacheGetOp) {
+      found = true;
+      return mlir::WalkResult::interrupt();
+   });
+   return found;
 }
 
 mlir::IRMapping cloneExecutionStepsToQuery0(ExecutionGroupOp dstGroup,
@@ -1240,8 +2353,9 @@ void insertCachePutsForTargets(mlir::ModuleOp producerModule, llvm::ArrayRef<Cac
    }
    llvm::SmallVector<mlir::Value, 8> extendJoinBuffers =
       collectJoinBuffersFeedingHashIndexedView(bufferCandidates, reusePreRewrite);
-   rewriteHashmapTypesInModule(producerModule, extendJoinBuffers);
-   auto reuse = collectModuleReuseInfo(producerModule);
+   rewriteHashmapTypesInModule(producerModule, extendJoinBuffers,
+                               extendJoinBuffers.empty() ? nullptr : &reusePreRewrite);
+   const ModuleReuseInfo& reuse = reusePreRewrite;
 
    llvm::DenseSet<uint64_t> seenKeys;
    for (auto& t : targets) {
@@ -1298,6 +2412,22 @@ void insertCachePutsForTargets(mlir::ModuleOp producerModule, llvm::ArrayRef<Cac
       builder.create<CachePutOp>(loc, builder.getI64IntegerAttr(static_cast<int64_t>(t.cacheKey)), block.getArgument(0));
       builder.create<ExecutionStepReturnOp>(loc, mlir::ValueRange{});
    }
+   propagateSubOpColumnAttrsFromSsaStateLayout(producerModule, nullptr);
+   alignBufferMergeThreadLocalsWithExtendedMergeResult(producerModule);
+   // `alignBufferMergeThreadLocalsWithExtendedMergeResult` can widen `execution_step` SSA results
+   // (join-buffer `filter_pred$0`) without updating the body's `execution_step_return` operands from
+   // `subop.create` / `subop.create_thread_local`. Push result types back onto return operands, then
+   // re-sync step ports so lowering sees a consistent layout.
+   producerModule.walk([&](subop::ExecutionStepReturnOp ret) {
+      auto step = mlir::dyn_cast<subop::ExecutionStepOp>(ret->getParentOp());
+      if (!step || step.getNumResults() != ret.getNumOperands()) return;
+      for (unsigned i = 0; i < ret.getNumOperands(); ++i) {
+         mlir::Value out = ret.getOperand(i);
+         mlir::Type want = step.getResult(i).getType();
+         if (out.getType() != want) out.setType(want);
+      }
+   });
+   synchronizeExecutionStepPortTypes(producerModule, nullptr);
 }
 
 void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule,
@@ -1311,8 +2441,9 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule,
    }
    llvm::SmallVector<mlir::Value, 8> extendJoinBuffers =
       collectJoinBuffersFeedingHashIndexedView(bufferCandidates, reusePreRewrite);
-   rewriteHashmapTypesInModule(consumerModule, extendJoinBuffers);
-   auto reuse = collectModuleReuseInfo(consumerModule);
+   rewriteHashmapTypesInModule(consumerModule, extendJoinBuffers,
+                               extendJoinBuffers.empty() ? nullptr : &reusePreRewrite);
+   const ModuleReuseInfo& reuse = reusePreRewrite;
 
    auto findEnclosingExecutionGroup = [&](mlir::Value v) -> ExecutionGroupOp {
       if (auto* defOp = v.getDefiningOp()) {
@@ -1338,18 +2469,18 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule,
    };
 
    llvm::DenseMap<uint64_t, mlir::Value> keyToCached;
-   llvm::DenseSet<mlir::Operation*> uniqOpsToErase;
-   llvm::SmallVector<mlir::Operation*, 128> opsToErase;
    llvm::DenseSet<mlir::Operation*> joinBufPredProbeInjectedGroups;
+
+   llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*> rwByStepOp;
+   for (const auto& e : reuse.steps) {
+      auto st = const_cast<subop::ExecutionStepOp&>(e.step);
+      rwByStepOp[st.getOperation()] = &e;
+   }
 
    // Precompute decoded table filters per target state **before** we start rewriting (cache_get insertion
    // and replaceAllUsesWith can otherwise hide the original get_external-derived table values).
    llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>> decodedFiltersByTarget;
    {
-      llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*> rwByStepOp;
-      for (const auto& e : reuse.steps) {
-         rwByStepOp[const_cast<ExecutionStepOp&>(e.step).getOperation()] = &e;
-      }
       for (auto& t : targets) {
          if (!t.state) continue;
          mlir::Value state = t.state;
@@ -1419,6 +2550,30 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule,
       }
    }
 
+   // Erase plan from initial `ModuleReuseInfo` only: backward closure from `execution_group_return`
+   // pipeline seeds vs. forward prerequisite closure of `cache_get` targets; obsolete = R \ L.
+   ExecutionGroupOp egForErasePlan = getSingleExecutionGroup(consumerModule);
+   mlir::Block& egBodyForPlan = egForErasePlan.getSubOps().front();
+   auto retForPlan = mlir::dyn_cast<subop::ExecutionGroupReturnOp>(egBodyForPlan.getTerminator());
+   assert(retForPlan && "expected execution_group_return terminator");
+   llvm::SmallVector<mlir::Value, 8> returnPipelineSeedsForErase;
+   for (mlir::Value o : retForPlan.getOperands()) {
+      mlir::Value p = peelBlockArgsToEnclosingOperands(o);
+      if (!isPipelineStateValue(p)) continue;
+      returnPipelineSeedsForErase.push_back(o);
+   }
+
+   llvm::DenseSet<void*> liveFromReturnReuseOnly =
+      closureLiveStatesFromReuseReturnSeeds(returnPipelineSeedsForErase, reuse, rwByStepOp);
+
+   llvm::DenseSet<mlir::Value> replacedClosureValues = expandNeededStatesFromTargets(targets, reuse);
+   llvm::DenseSet<void*> obsoleteStateCanonPtrs;
+   for (mlir::Value rv : replacedClosureValues) {
+      mlir::Value c = canonicalizeStateValueForReuse(rv);
+      if (!liveFromReturnReuseOnly.contains(c.getAsOpaquePointer()))
+         obsoleteStateCanonPtrs.insert(c.getAsOpaquePointer());
+   }
+
    auto rewriteOne = [&](mlir::Value state, uint64_t cacheKey) {
       assert(!mlir::isa<ThreadLocalType>(state.getType()) &&
              "rewrite must never target thread_local-wrapped states");
@@ -1427,8 +2582,8 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule,
       statesToDelete.push_back(state);
       if (auto itTL = findReuseMap(reuse.mergedFromThreadLocal, state);
           itTL != reuse.mergedFromThreadLocal.end()) {
-         // If the match is on a merge result, we still must delete the thread_local side steps,
-         // but we must never cache that thread_local value.
+         // Match is on merge result; paired thread_local is part of the same construction closure for
+         // erase analysis (never cache the thread_local value itself).
          statesToDelete.push_back(itTL->second);
       }
 
@@ -1662,7 +2817,11 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule,
          }
       }
 
-      if (isJoinBuf && !decodedFilters.empty()) {
+      // Join-buffer `filter_pred$0` can be present on the HIV layout even when there are no
+      // external-table filters to decode (`decodedFilters` empty). Synthetic producers always run
+      // `insertHashIndexedViewGatherPredFilters` in that case; consumers must match or probe-side
+      // gathers leave predicate bits uninitialized and downstream `filter(all_true ...)` drops all rows.
+      if (isJoinBuf) {
          if (joinBufPredProbeInjectedGroups.insert(group.getOperation()).second) {
             subop::Member predMember = makeOrGetPredMember(state.getContext());
             for (mlir::Operation& op : group.getSubOps().front()) {
@@ -1672,18 +2831,6 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule,
             }
          }
       }
-
-      // Delete create steps too (create_only steps are part of construction but may not be marked as writes).
-      for (auto st : statesToDelete) {
-         if (auto defStep = mlir::dyn_cast_or_null<ExecutionStepOp>(st.getDefiningOp())) {
-            auto* op = defStep.getOperation();
-            if (uniqOpsToErase.insert(op).second) opsToErase.push_back(op);
-         }
-      }
-      for (auto s : writerSteps) {
-         auto* op = s.getOperation();
-         if (uniqOpsToErase.insert(op).second) opsToErase.push_back(op);
-      }
    };
 
    for (auto& t : targets) {
@@ -1691,32 +2838,38 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule,
       rewriteOne(t.state, t.cacheKey);
    }
 
-   // Actually erase the now-dead construction / writer steps.
-   // Only erase `execution_step` ops that are direct children of the module's top-level
-   // `execution_group`. Walk the group block in reverse: pipeline steps that appear later in the
-   // block are erased first, so producers (earlier construction) still exist while their users are
-   // removed (TPCH Q2 has long SSA chains across many steps).
-   if (!opsToErase.empty()) {
+   // Erase top-level steps that (per initial `reuse`) only write pipeline states in `obsoleteStateCanonPtrs`
+   // (construction for matched states that the return-driven closure does not need). Collect candidates
+   // first, erase in reverse block order, and never erase steps that host `cache_get` (see
+   // `executionStepContainsCacheGet`) or still have live SSA results.
+   if (!returnPipelineSeedsForErase.empty() && !obsoleteStateCanonPtrs.empty()) {
       ExecutionGroupOp eg = getSingleExecutionGroup(consumerModule);
       mlir::Operation* egOp = eg.getOperation();
       mlir::Block& egBody = eg.getSubOps().front();
-      llvm::DenseSet<mlir::Operation*> eraseSet;
-      for (mlir::Operation* o : opsToErase) {
-         if (!mlir::isa<ExecutionStepOp>(o)) continue;
-         if (o->getParentRegion()->getParentOp() != egOp) continue;
-         if (o->getBlock() != &egBody) continue;
-         eraseSet.insert(o);
+      llvm::SmallVector<ExecutionStepOp, 32> stepsToErase;
+      for (mlir::Operation& op : egBody.without_terminator()) {
+         auto step = mlir::dyn_cast<ExecutionStepOp>(&op);
+         if (!step) continue;
+         if (step->getParentRegion()->getParentOp() != egOp || step->getBlock() != &egBody) continue;
+         if (executionStepContainsCacheGet(step)) continue;
+         if (!stepWritesOnlyStatesInObsoleteSet(step, obsoleteStateCanonPtrs, rwByStepOp)) continue;
+         stepsToErase.push_back(step);
       }
-      // Erasing construction steps after `cache_get` is still being hardened for join-shaped
-      // pipelines (TPCH Q2). Until then, set `LINGODB_REUSE_ERASE=1` to enable erasure.
-      if (std::getenv("LINGODB_REUSE_ERASE")) {
-         for (mlir::Operation& op : llvm::make_early_inc_range(llvm::reverse(egBody.without_terminator()))) {
-            if (auto es = mlir::dyn_cast<ExecutionStepOp>(&op)) {
-               if (eraseSet.contains(es.getOperation())) es.erase();
+      for (ExecutionStepOp s : llvm::reverse(stepsToErase)) {
+         bool resultsUnused = true;
+         for (mlir::OpResult r : s.getResults()) {
+            if (!r.use_empty()) {
+               resultsUnused = false;
+               break;
             }
          }
+         if (!resultsUnused) continue;
+         s.erase();
       }
    }
+
+   propagateSubOpColumnAttrsFromSsaStateLayout(consumerModule, nullptr);
+   alignBufferMergeThreadLocalsWithExtendedMergeResult(consumerModule);
 }
 
 } // namespace
@@ -1777,7 +2930,9 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    // predecessors for remaining operand edges (merge, hash views, …).
    auto reuse0 = collectModuleReuseInfo(query0);
    llvm::DenseSet<mlir::Value> neededStates = expandNeededStatesFromTargets(targets0, reuse0);
-   auto stepsToClone = collectCreateAndWriteStepsForStates(donorGroup, reuse0, neededStates);
+   llvm::SmallVector<ExecutionStepOp, 32> stepsToClone =
+      collectCreateAndWriteStepsForStates(donorGroup, reuse0, neededStates);
+   stepsToClone = augmentStepsWithOperandProducerClosure(donorGroup, stepsToClone);
 
    // Join-buffer descr filters: mutate the **donor** query0 before cloning so cloned synthetic steps
    // already materialize `filter_pred$0` (synthetic modules may not register the same writer-step index
@@ -1790,7 +2945,7 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       llvm::SmallVector<mlir::Value, 8> extendBufStates =
          collectJoinBuffersFeedingHashIndexedView(bufferCandidates, reuse0);
       if (!extendBufStates.empty()) {
-         rewriteHashmapTypesInModule(query0, extendBufStates);
+         rewriteHashmapTypesInModule(query0, extendBufStates, &reuse0);
          llvm::DenseSet<mlir::Operation*> stepSet;
          for (ExecutionStepOp s : stepsToClone) stepSet.insert(s.getOperation());
          for (auto& t : targets0) {
@@ -1848,9 +3003,47 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    // Producer: cache_puts.
    insertCachePutsForTargets(*res.query0, targetsQ0);
 
+   // Materialize `filter_pred$0` before nested HIV gathers read it (see `ensureJoinBufferFilterPredMaterializeMappings`).
+   ensureJoinBufferFilterPredMaterializeMappings(*res.query0);
+
+   // Synthetic never runs `injectCacheGets...`; mirror the join-buffer `insertHashIndexedViewGatherPredFilters`
+   // pass so nested probes load `filter_pred$0` like consumers do.
+   {
+      bool hasJoinBufWithPred = false;
+      for (const auto& t : targetsQ0) {
+         if (!t.state) continue;
+         if (!mlir::isa<subop::BufferType>(t.state.getType())) continue;
+         auto buf = mlir::cast<subop::BufferType>(t.state.getType());
+         if (valueMembersContainMemberNamed(res.query0->getContext(), buf.getMembers(), "filter_pred$0")) {
+            hasJoinBufWithPred = true;
+            break;
+         }
+      }
+      if (hasJoinBufWithPred) {
+         subop::Member predMember = makeOrGetPredMember(res.query0->getContext());
+         ExecutionGroupOp eg = getSingleExecutionGroup(*res.query0);
+         for (mlir::Operation& op : eg.getSubOps().front()) {
+            if (auto step = mlir::dyn_cast<ExecutionStepOp>(&op))
+               insertHashIndexedViewGatherPredFilters(step, predMember);
+         }
+      }
+   }
+
    // Consumers: cache_get + delete construction steps.
    injectCacheGetsAndDeleteConstructionSteps(query0, targets0);
    injectCacheGetsAndDeleteConstructionSteps(query1, targets1);
+
+   // Cloning / buffer pred injection can leave tuple attrs pointing at pre-extension entry refs;
+   // run the same reconciliation as the producer path so SubOp→LLVM lowering does not emit casts.
+   propagateSubOpColumnAttrsFromSsaStateLayout(query0, nullptr);
+   propagateSubOpColumnAttrsFromSsaStateLayout(query1, nullptr);
+   propagateSubOpColumnAttrsFromSsaStateLayout(*res.query0, nullptr);
+   alignBufferMergeThreadLocalsWithExtendedMergeResult(query0);
+   alignBufferMergeThreadLocalsWithExtendedMergeResult(query1);
+   alignBufferMergeThreadLocalsWithExtendedMergeResult(*res.query0);
+
+   ensureJoinBufferFilterPredMaterializeMappings(query0);
+   ensureJoinBufferFilterPredMaterializeMappings(query1);
 
    return res;
 }
