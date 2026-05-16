@@ -1100,11 +1100,22 @@ materializeRuntimeFiltersAsPredicateColumn(mlir::OpBuilder& b,
 }
 
 void collectJoinBufferStatesFromTargets(llvm::ArrayRef<CacheTarget> targets,
-                                        llvm::SmallVector<mlir::Value, 8>& out) {
+                                        llvm::SmallVector<mlir::Value, 8>& out,
+                                        const ModuleReuseInfo* reuse) {
+   llvm::DenseSet<void*> seen;
    for (auto& t : targets) {
-      if (t.state && mlir::isa<subop::BufferType>(t.state.getType())) {
-         out.push_back(t.state);
+      if (!t.state) continue;
+      mlir::Value buf;
+      if (mlir::isa<subop::BufferType>(t.state.getType())) {
+         buf = t.state;
+      } else if (reuse) {
+         if (auto itG = findReuseMap(reuse->hashIndexedViewFromMergedBuffer, t.state);
+             itG != reuse->hashIndexedViewFromMergedBuffer.end()) {
+            buf = itG->second;
+         }
       }
+      if (!buf) continue;
+      if (seen.insert(buf.getAsOpaquePointer()).second) out.push_back(buf);
    }
 }
 
@@ -1824,9 +1835,14 @@ decodeFiltersByCacheTargets(llvm::ArrayRef<CacheTarget> targets, const ModuleReu
    llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>> decodedFiltersByTarget;
    for (auto& t : targets) {
       if (!t.state) continue;
+      mlir::Value filterSeed = t.state;
+      if (auto itG = findReuseMap(reuse.hashIndexedViewFromMergedBuffer, t.state);
+          itG != reuse.hashIndexedViewFromMergedBuffer.end()) {
+         filterSeed = itG->second;
+      }
       llvm::SmallVector<runtime::FilterDescription, 8> decoded =
-         decodeFiltersForStateFromWriterSteps(t.state, reuse, &rwByStepOp);
-      if (auto itTL = findReuseMap(reuse.mergedFromThreadLocal, t.state);
+         decodeFiltersForStateFromWriterSteps(filterSeed, reuse, &rwByStepOp);
+      if (auto itTL = findReuseMap(reuse.mergedFromThreadLocal, filterSeed);
           itTL != reuse.mergedFromThreadLocal.end()) {
          auto fromTl = decodeFiltersForStateFromWriterSteps(itTL->second, reuse, &rwByStepOp);
          decoded.append(fromTl.begin(), fromTl.end());

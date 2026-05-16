@@ -372,11 +372,15 @@ llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRW(subop::ExecutionStepOp s
          }
          continue;
       }
-      // `create_hash_indexed_view`: only reads source buffer; generic loop would mark buffer written.
+      // `create_hash_indexed_view`: reads source buffer; produces a new hash_indexed_view state.
       if (auto hiv = mlir::dyn_cast<subop::CreateHashIndexedView>(&op)) {
          mlir::Value src = hiv.getSource();
          if (isStateType(src.getType()) || isThreadLocalOfStateType(src.getType())) {
             res[canonicalizeStateValueDeep(src)].read = true;
+         }
+         mlir::Value out = hiv.getResult();
+         if (isStateType(out.getType()) || isThreadLocalOfStateType(out.getType())) {
+            res[canonicalizeStateValueDeep(out)].write = true;
          }
          continue;
       }
@@ -455,10 +459,11 @@ llvm::SmallVector<int, 8> getConstructionStepIndicesForState(
    mlir::Value state,
    const llvm::DenseMap<mlir::Value, int>& createdAtByState,
    const llvm::DenseMap<mlir::Value, llvm::SmallSet<int, 16>>& writesByState,
-   const llvm::DenseMap<mlir::Value, mlir::Value>& mergedFromThreadLocal) {
+   const llvm::DenseMap<mlir::Value, mlir::Value>& mergedFromThreadLocal,
+   const llvm::DenseMap<mlir::Value, mlir::Value>* hashIndexedViewFromMergedBuffer) {
    llvm::SmallVector<int, 8> steps;
 
-   // Normal state: createdAt (+ first real write).
+   // Normal state: createdAt (+ all write steps).
    addConstructionStepsForSingleState(state, createdAtByState, writesByState, steps);
 
    // Merge-produced global state: include thread_local side construction steps as well,
@@ -466,6 +471,17 @@ llvm::SmallVector<int, 8> getConstructionStepIndicesForState(
    if (auto it = mergedFromThreadLocal.find(state); it != mergedFromThreadLocal.end()) {
       mlir::Value tl = it->second;
       addConstructionStepsForSingleState(tl, createdAtByState, writesByState, steps);
+   }
+
+   // TL buffer -> merged global buffer -> hash_indexed_view: profile/match on HIV, include buffer+TL steps.
+   if (hashIndexedViewFromMergedBuffer) {
+      if (auto itG = hashIndexedViewFromMergedBuffer->find(state); itG != hashIndexedViewFromMergedBuffer->end()) {
+         mlir::Value globalBuf = itG->second;
+         addConstructionStepsForSingleState(globalBuf, createdAtByState, writesByState, steps);
+         if (auto itTL = mergedFromThreadLocal.find(globalBuf); itTL != mergedFromThreadLocal.end()) {
+            addConstructionStepsForSingleState(itTL->second, createdAtByState, writesByState, steps);
+         }
+      }
    }
 
    llvm::sort(steps);
@@ -1052,6 +1068,19 @@ static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp 
       if (cx != cy) return cx < cy;
       return x.getAsOpaquePointer() < y.getAsOpaquePointer();
    });
+
+   // Global buffer -> create_hash_indexed_view (at most one HIV per buffer). Optional TL merge on buffer.
+   moduleOp.walk([&](subop::CreateHashIndexedView chiv) {
+      mlir::Value globalBuf = canonicalizeStateValueDeep(chiv.getSource());
+      mlir::Value hiv = canonicalizeStateValueDeep(chiv.getResult());
+      if (!mlir::isa<subop::BufferType>(globalBuf.getType())) return;
+      if (!mlir::isa<subop::HashIndexedViewType>(hiv.getType())) return;
+      assert(!a.reuse.mergedBufferToHashIndexedView.contains(globalBuf) &&
+             "each join buffer must feed at most one hash_indexed_view in a serial chain");
+      a.reuse.hashIndexedViewFromMergedBuffer[hiv] = globalBuf;
+      a.reuse.mergedBufferToHashIndexedView[globalBuf] = hiv;
+   });
+
    return a;
 }
 
@@ -1068,6 +1097,9 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
    llvm::DenseSet<mlir::Value> threadLocalMergePartners;
    for (auto& kv : a.mergedFromThreadLocal) threadLocalMergePartners.insert(kv.second);
 
+   llvm::DenseSet<mlir::Value> bufferJoinChainBufferPartners;
+   for (auto& kv : a.reuse.mergedBufferToHashIndexedView) bufferJoinChainBufferPartners.insert(kv.first);
+
    llvm::SmallVector<StateMatchProfile, 128> profiles;
 
    for (auto s : a.statesSorted) {
@@ -1079,8 +1111,11 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
       }
 
       if (threadLocalMergePartners.contains(s)) continue;
+      // Join chain is represented by the HIV; the merged global buffer is not a separate reuse target.
+      if (bufferJoinChainBufferPartners.contains(s)) continue;
 
-      auto stepIdxs = getConstructionStepIndicesForState(s, a.createdAtByState, a.writesByState, a.mergedFromThreadLocal);
+      auto stepIdxs = getConstructionStepIndicesForState(s, a.createdAtByState, a.writesByState, a.mergedFromThreadLocal,
+                                                         &a.reuse.hashIndexedViewFromMergedBuffer);
       auto prereqStepIdxs = sortedUniqueStepIndices(stepIdxs);
 
       llvm::SmallVector<uint64_t, 16> stepHashes;
@@ -1123,8 +1158,9 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
 
             llvm::SmallVector<std::string, 8> local;
             auto itC = a.createdAtByState.find(st);
-            assert(itC != a.createdAtByState.end());
-            auto stHashSteps = getConstructionStepIndicesForState(st, a.createdAtByState, a.writesByState, a.mergedFromThreadLocal);
+            if (itC == a.createdAtByState.end()) return false;
+            auto stHashSteps = getConstructionStepIndicesForState(st, a.createdAtByState, a.writesByState, a.mergedFromThreadLocal,
+                                                                &a.reuse.hashIndexedViewFromMergedBuffer);
             auto stRwSteps = sortedUniqueStepIndices(stHashSteps);
             llvm::SmallVector<mlir::Value, 8> stPrereqs =
                getPrereqStatesForConstructionSteps(stRwSteps, st, a.rwByStep);
@@ -1171,12 +1207,31 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
                   if (!collectDeps(p, local)) return false;
                   continue;
                }
+               // `hash_indexed_view` from a merged join buffer is the same construction unit as that buffer.
+               if (auto itHiv = a.reuse.hashIndexedViewFromMergedBuffer.find(p);
+                   itHiv != a.reuse.hashIndexedViewFromMergedBuffer.end()) {
+                  mlir::Value mergedBuf = itHiv->second;
+                  // When profiling the merged buffer itself, HIV is downstream — do not recurse back.
+                  if (mergedBuf == st) continue;
+                  if (visiting.contains(mergedBuf)) continue;
+                  if (!collectDeps(mergedBuf, local)) return false;
+                  continue;
+               }
                // Cross-query reuse may only *match* on states whose construction deps are external tables
                // (descr / type token) and/or `result_table` fingerprints. Any other `!subop.*` state edge
                // (heap/buffer/hashmap/hash_indexed_view, …) is pipeline-internal and disqualifies reuse.
                if (isThreadLocalOfStateType(p.getType())) {
                   if (!collectDeps(p, local)) return false;
                   continue;
+               }
+               // Profiling `hash_indexed_view`: merged global buffer (+ TL) are the same reuse unit.
+               if (auto itChain = a.reuse.hashIndexedViewFromMergedBuffer.find(st);
+                   itChain != a.reuse.hashIndexedViewFromMergedBuffer.end()) {
+                  if (p == itChain->second) continue;
+                  if (auto itTL = a.mergedFromThreadLocal.find(itChain->second);
+                      itTL != a.mergedFromThreadLocal.end() && p == itTL->second) {
+                     continue;
+                  }
                }
                if (mlir::isa<subop::State>(p.getType())) return false;
                llvm_unreachable("collectDeps: unexpected prereq value type");
@@ -1222,7 +1277,8 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
       // special handling; this experimental project prefers to skip them.)
       bool hasWriter = a.reuse.writerStepsByState.contains(s);
       bool isMergeResult = a.mergedFromThreadLocal.contains(s);
-      bool hasWriterOrIsMergeResult = hasWriter || isMergeResult;
+      bool isJoinBufferHashViewRoot = a.reuse.hashIndexedViewFromMergedBuffer.contains(s);
+      bool hasWriterOrIsMergeResult = hasWriter || isMergeResult || isJoinBufferHashViewRoot;
 
       StateMatchProfile prof;
       prof.queryId = queryId;
@@ -1401,7 +1457,7 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
    for (auto s : states) {
       if (threadLocalMergePartners.contains(s)) continue;
 
-      auto stepIdxs = getConstructionStepIndicesForState(s, createdAtByState, writesByState, mergedFromThreadLocal);
+      auto stepIdxs = getConstructionStepIndicesForState(s, createdAtByState, writesByState, mergedFromThreadLocal, nullptr);
       auto prereqStepIdxs = sortedUniqueStepIndices(stepIdxs);
       os << "\n// -- state ";
       s.printAsOperand(os, flags);
@@ -1744,6 +1800,55 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       }
    }
    return out;
+}
+
+mlir::Value bufferJoinChainRootForReuse(mlir::Value v, const ModuleReuseInfo& reuse) {
+   v = canonicalizeStateValueForReuse(v);
+   if (auto it = reuse.mergedBufferToHashIndexedView.find(v); it != reuse.mergedBufferToHashIndexedView.end()) {
+      return it->second;
+   }
+   return v;
+}
+
+mlir::Value resolveCacheTargetStateForReuse(mlir::Value v, const ModuleReuseInfo& reuse) {
+   return bufferJoinChainRootForReuse(v, reuse);
+}
+
+bool isBufferJoinChainNonRootPartner(mlir::Value v, const ModuleReuseInfo& reuse) {
+   v = canonicalizeStateValueForReuse(v);
+   if (reuse.mergedBufferToHashIndexedView.contains(v)) return true;
+   if (auto itG = reuse.hashIndexedViewFromMergedBuffer.find(v); itG != reuse.hashIndexedViewFromMergedBuffer.end()) {
+      if (auto itTL = reuse.mergedFromThreadLocal.find(itG->second); itTL != reuse.mergedFromThreadLocal.end()) {
+         if (itTL->second == v) return true;
+      }
+   }
+   return false;
+}
+
+void forEachBufferJoinChainPartner(mlir::Value chainRootBuffer, const ModuleReuseInfo& reuse,
+                                   llvm::function_ref<void(mlir::Value)> fn) {
+   mlir::Value root = bufferJoinChainRootForReuse(chainRootBuffer, reuse);
+   if (!mlir::isa<subop::BufferType>(root.getType())) return;
+   if (mlir::isa<subop::HashIndexedViewType>(root.getType())) {
+      fn(root);
+      if (auto itG = reuse.hashIndexedViewFromMergedBuffer.find(root); itG != reuse.hashIndexedViewFromMergedBuffer.end()) {
+         fn(itG->second);
+         if (auto itTL = reuse.mergedFromThreadLocal.find(itG->second); itTL != reuse.mergedFromThreadLocal.end()) {
+            fn(itTL->second);
+         }
+      }
+      return;
+   }
+   if (!mlir::isa<subop::BufferType>(root.getType())) return;
+   if (auto itH = reuse.mergedBufferToHashIndexedView.find(root); itH != reuse.mergedBufferToHashIndexedView.end()) {
+      fn(itH->second);
+      fn(root);
+      if (auto itTL = reuse.mergedFromThreadLocal.find(root); itTL != reuse.mergedFromThreadLocal.end()) {
+         fn(itTL->second);
+      }
+      return;
+   }
+   fn(root);
 }
 
 } // namespace lingodb::compiler::dialect::subop

@@ -5,6 +5,7 @@
 #include "lingodb/runtime/ExternalDataSourceProperty.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include <llvm/Support/raw_ostream.h>
 
 #include <cstdint>
@@ -51,6 +52,12 @@ struct ModuleReuseInfo {
    // Merge pairing: global_state -> thread_local_state (both canonicalized to step inputs/results).
    llvm::DenseMap<mlir::Value, mlir::Value> mergedFromThreadLocal;
 
+   /// Join build chain: `thread_local` buffer -> merged global `!subop.buffer` -> `create_hash_indexed_view`.
+   /// Maps hash_indexed_view SSA -> merged global buffer (cache/match representative stays the buffer).
+   llvm::DenseMap<mlir::Value, mlir::Value> hashIndexedViewFromMergedBuffer;
+   /// Inverse of the above (merged global buffer -> its paired hash_indexed_view), when present.
+   llvm::DenseMap<mlir::Value, mlir::Value> mergedBufferToHashIndexedView;
+
    // Convenience: state -> steps that write it (subset of steps[]).
    llvm::DenseMap<mlir::Value, llvm::SmallVector<subop::ExecutionStepOp, 8>> writerStepsByState;
 
@@ -65,6 +72,20 @@ struct ModuleReuseInfo {
 };
 
 ModuleReuseInfo collectModuleReuseInfo(mlir::ModuleOp moduleOp);
+
+/// Canonical cache/match target for a join buffer chain: the `hash_indexed_view` when a serial
+/// `buffer -> create_hash_indexed_view` link exists; otherwise `canonicalizeStateValueForReuse(v)`.
+mlir::Value bufferJoinChainRootForReuse(mlir::Value v, const ModuleReuseInfo& reuse);
+
+/// Map a matched state SSA to the value that should receive `cache_put` / `cache_get` (HIV root).
+mlir::Value resolveCacheTargetStateForReuse(mlir::Value v, const ModuleReuseInfo& reuse);
+
+/// True for thread_local merge partners and hash_indexed_view partners of a buffer join chain.
+bool isBufferJoinChainNonRootPartner(mlir::Value v, const ModuleReuseInfo& reuse);
+
+/// Invoke \p fn for merged global buffer, its thread_local (if any), and hash_indexed_view (if any).
+void forEachBufferJoinChainPartner(mlir::Value chainRootBuffer, const ModuleReuseInfo& reuse,
+                                   llvm::function_ref<void(mlir::Value)> fn);
 
 llvm::SmallVector<CrossQueryStateMatchPair, 64>
 collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> queries);

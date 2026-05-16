@@ -26,7 +26,8 @@ void rewriteHashmapTypesInModule(mlir::ModuleOp module, llvm::ArrayRef<mlir::Val
                                  const ModuleReuseInfo* reuseForJoinBuffers);
 
 void collectJoinBufferStatesFromTargets(llvm::ArrayRef<CacheTarget> targets,
-                                        llvm::SmallVector<mlir::Value, 8>& out);
+                                        llvm::SmallVector<mlir::Value, 8>& out,
+                                        const ModuleReuseInfo* reuse = nullptr);
 
 llvm::SmallVector<runtime::FilterDescription, 8> decodeFiltersForStateFromWriterSteps(
    mlir::Value state, const ModuleReuseInfo& reuse,

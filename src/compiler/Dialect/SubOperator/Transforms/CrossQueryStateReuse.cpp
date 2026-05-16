@@ -49,22 +49,53 @@ static ExecutionStepOp liftToTopLevelStepInDonor(ExecutionGroupOp donor, Executi
 /// - each top-level `execution_step` listed in `writerStepsByState` (all writes / updates), and
 /// - the top-level `execution_step` that **defines** the state SSA result, if any (create path).
 /// - the create-only `execution_step` registered in `ModuleReuseInfo::createOnlyStepForState`, if any.
+/// - the top-level `execution_step` that returns the state SSA (e.g. `subop.merge` with no RW write edge).
+static ExecutionStepOp findTopLevelStepReturningState(ExecutionGroupOp donor, mlir::Value state) {
+   ExecutionStepOp found;
+   donor.walk([&](ExecutionStepOp step) {
+      if (step->getParentOp() != donor.getOperation()) return mlir::WalkResult::advance();
+      auto canon = [&](mlir::Value v) { return v ? canonicalizeStateValueForReuse(v) : mlir::Value{}; };
+      for (mlir::Value r : step.getResults()) {
+         if (canon(r) == state) {
+            found = step;
+            return mlir::WalkResult::interrupt();
+         }
+      }
+      auto& body = step.getSubOps().front();
+      if (auto ret = mlir::dyn_cast<subop::ExecutionStepReturnOp>(body.getTerminator())) {
+         for (mlir::Value o : ret.getOperands()) {
+            if (canon(o) == state) {
+               found = step;
+               return mlir::WalkResult::interrupt();
+            }
+         }
+      }
+      return mlir::WalkResult::advance();
+   });
+   return found;
+}
+
 static llvm::SmallVector<ExecutionStepOp, 32>
 collectCreateAndWriteStepsForStates(ExecutionGroupOp donor, const ModuleReuseInfo& reuse,
                                     const llvm::DenseSet<mlir::Value>& neededStates) {
    llvm::DenseSet<mlir::Operation*> seen;
    llvm::SmallVector<ExecutionStepOp, 32> out;
    for (mlir::Value s : neededStates) {
-      assert(canonicalizeStateValueForReuse(s) == s);
-      if (auto itC = reuse.createOnlyStepForState.find(s); itC != reuse.createOnlyStepForState.end()) {
+      mlir::Value key = bufferJoinChainRootForReuse(s, reuse);
+      assert(canonicalizeStateValueForReuse(key) == key);
+      if (auto itC = reuse.createOnlyStepForState.find(key); itC != reuse.createOnlyStepForState.end()) {
          ExecutionStepOp top = liftToTopLevelStepInDonor(donor, itC->second);
          if (seen.insert(top.getOperation()).second) out.push_back(top);
       }
-      auto itW = findReuseMap(reuse.writerStepsByState, s);
-      if (itW == reuse.writerStepsByState.end()) continue;
-      for (ExecutionStepOp w : itW->second) {
-         ExecutionStepOp top = liftToTopLevelStepInDonor(donor, w);
-         if (seen.insert(top.getOperation()).second) out.push_back(top);
+      auto itW = findReuseMap(reuse.writerStepsByState, key);
+      if (itW != reuse.writerStepsByState.end()) {
+         for (ExecutionStepOp w : itW->second) {
+            ExecutionStepOp top = liftToTopLevelStepInDonor(donor, w);
+            if (seen.insert(top.getOperation()).second) out.push_back(top);
+         }
+      }
+      if (auto def = findTopLevelStepReturningState(donor, key)) {
+         if (seen.insert(def.getOperation()).second) out.push_back(def);
       }
    }
    llvm::sort(out, [](ExecutionStepOp a, ExecutionStepOp b) { return a->isBeforeInBlock(b); });
@@ -163,6 +194,210 @@ mlir::IRMapping cloneExecutionStepsToQuery0(ExecutionGroupOp dstGroup,
    return mapping;
 }
 
+/// Join-buffer / HIV layout extension and post-layout merge alignment (producer or consumer).
+void maybeExtendJoinBufferHashmapLayoutForFilterPred(mlir::ModuleOp module, llvm::ArrayRef<CacheTarget> targets,
+                                                     const ModuleReuseInfo& reuse) {
+   llvm::SmallVector<mlir::Value, 8> bufferCandidates;
+   collectJoinBufferStatesFromTargets(targets, bufferCandidates, &reuse);
+   llvm::SmallVector<mlir::Value, 8> extendJoinBuffers =
+      collectJoinBuffersFeedingHashIndexedView(bufferCandidates, reuse);
+   rewriteHashmapTypesInModule(module, extendJoinBuffers, extendJoinBuffers.empty() ? nullptr : &reuse);
+}
+
+void maybeFinalizeModuleAfterJoinBufferFilterPredLayout(mlir::ModuleOp module) {
+   propagateSubOpColumnAttrsFromSsaStateLayout(module, nullptr);
+   alignBufferMergeThreadLocalsWithExtendedMergeResult(module);
+   // `alignBufferMergeThreadLocalsWithExtendedMergeResult` can widen `execution_step` SSA results
+   // (join-buffer `filter_pred$0`) without updating the body's `execution_step_return` operands from
+   // `subop.create` / `subop.create_thread_local`. Push result types back onto return operands, then
+   // re-sync step ports so lowering sees a consistent layout.
+   module.walk([&](subop::ExecutionStepReturnOp ret) {
+      auto step = mlir::dyn_cast<subop::ExecutionStepOp>(ret->getParentOp());
+      if (!step || step.getNumResults() != ret.getNumOperands()) return;
+      for (unsigned i = 0; i < ret.getNumOperands(); ++i) {
+         mlir::Value out = ret.getOperand(i);
+         mlir::Type want = step.getResult(i).getType();
+         if (out.getType() != want) out.setType(want);
+      }
+   });
+   synchronizeExecutionStepPortTypes(module, nullptr);
+}
+
+llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>>
+maybeDecodeFiltersByCacheTargets(llvm::ArrayRef<CacheTarget> targets, const ModuleReuseInfo& reuse) {
+   using FilterMap = llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>>;
+   if (!kEnableReuseStateFilterPredReapply) return FilterMap();
+   return decodeFiltersByCacheTargets(targets, reuse);
+}
+
+void maybeApplyWriteSideFilterPredOnProducerHashmap(
+   mlir::Value st, const ModuleReuseInfo& reuse,
+   const llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*>& rwByStepOp) {
+   if (!kEnableReuseStateFilterPredReapply) return;
+   if (!mlir::isa<subop::HashMapType>(st.getType())) return;
+
+   auto itTL = reuse.mergedFromThreadLocal.find(st);
+   assert(itTL != reuse.mergedFromThreadLocal.end() && "hashmap merge result must have paired thread_local");
+   mlir::Value tl = itTL->second;
+
+   auto decoded = decodeFiltersForStateFromWriterSteps(tl, reuse, &rwByStepOp);
+   if (decoded.empty()) return;
+
+   auto itW = reuse.writerStepsByState.find(tl);
+   assert(itW != reuse.writerStepsByState.end());
+   ExecutionStepOp construction;
+   for (auto ws : itW->second) {
+      mlir::Block& body = ws.getSubOps().front();
+      bool hasLoi = false, hasRed = false;
+      for (auto& op : body.without_terminator()) {
+         if (mlir::isa<subop::LookupOrInsertOp>(&op)) hasLoi = true;
+         if (mlir::isa<subop::ReduceOp>(&op)) hasRed = true;
+      }
+      if (hasLoi && hasRed) {
+         construction = ws;
+         break;
+      }
+   }
+   assert(construction && "write_pred: could not find construction step for join hashmap");
+   insertWriteSidePredIntoHashMapConstructionStep(construction, decoded);
+}
+
+void maybePatchJoinBufferWritersWithFilterPred(
+   llvm::ArrayRef<CacheTarget> targets,
+   const llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>>& decodedFiltersByTarget,
+   const ModuleReuseInfo& reuse) {
+   if (!kEnableReuseStateFilterPredReapply) return;
+   for (auto& t : targets) {
+      if (!t.state) continue;
+      if (!mlir::isa<subop::BufferType>(t.state.getType())) continue;
+      auto itF = decodedFiltersByTarget.find(t.state);
+      if (itF == decodedFiltersByTarget.end() || itF->second.empty()) continue;
+      auto itTL = findReuseMap(reuse.mergedFromThreadLocal, t.state);
+      if (itTL == reuse.mergedFromThreadLocal.end()) continue;
+      auto itW = findReuseMap(reuse.writerStepsByState, itTL->second);
+      if (itW == reuse.writerStepsByState.end()) continue;
+      for (ExecutionStepOp ws : itW->second) {
+         bool hasBufMat = false;
+         ws.getOperation()->walk([&](subop::MaterializeOp m) {
+            if (mlir::isa<subop::BufferType>(m.getState().getType())) hasBufMat = true;
+         });
+         if (!hasBufMat) continue;
+         insertWriteSidePredIntoBufferConstructionStep(ws, itF->second);
+      }
+   }
+}
+
+/// After `state` is replaced by `cached` from `cache_get`, re-apply decoded construction filters.
+void applyFilterPredReapplyAfterCacheGetReplacement(
+   mlir::Value state, mlir::Value cached, llvm::ArrayRef<runtime::FilterDescription> decodedFilters,
+   ExecutionGroupOp group, subop::Member predMember,
+   llvm::DenseSet<mlir::Operation*>& joinBufPredProbeInjectedGroups) {
+   if (!kEnableReuseStateFilterPredReapply) return;
+
+   const bool isAggHt = mlir::isa<subop::PreAggrHtType>(state.getType());
+   const bool isJoinHm = mlir::isa<subop::HashMapType>(state.getType());
+   const bool isJoinBuf = mlir::isa<subop::BufferType>(state.getType());
+   const bool isJoinHiv = mlir::isa<subop::HashIndexedViewType>(state.getType());
+
+   if (!decodedFilters.empty() && !isAggHt && !isJoinHm && !isJoinBuf) {
+      materializeRuntimeFiltersAtCacheGetUses(cached, decodedFilters);
+   }
+
+   if (isJoinHm && !decodedFilters.empty()) {
+      for (auto& u : cached.getUses()) {
+         auto step = mlir::dyn_cast<subop::ExecutionStepOp>(u.getOwner());
+         if (!step) continue;
+         insertScanRefsPredFilter(step, predMember);
+      }
+   }
+
+   // Join-buffer `filter_pred$0` can be present on the HIV layout even when there are no
+   // external-table filters to decode (`decodedFilters` empty). Synthetic producers always run
+   // `insertHashIndexedViewGatherPredFilters` in that case; consumers must match or probe-side
+   // gathers leave predicate bits uninitialized and downstream `filter(all_true ...)` drops all rows.
+   if (isJoinBuf || isJoinHiv) {
+      if (joinBufPredProbeInjectedGroups.insert(group.getOperation()).second) {
+         for (mlir::Operation& op : group.getSubOps().front()) {
+            if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(&op)) {
+               insertHashIndexedViewGatherPredFilters(step, predMember);
+            }
+         }
+      }
+   }
+}
+
+struct DonorJoinBufferFilterPredPrep {
+   bool layoutApplied = false;
+   bool writePredApplied = false;
+   llvm::SmallVector<mlir::Value, 8> extendBufStates;
+};
+
+/// Mutate donor query0 before cloning so synthetic steps carry write-side `filter_pred$0`.
+DonorJoinBufferFilterPredPrep maybePrepareDonorJoinBufferFilterPredBeforeClone(
+   mlir::ModuleOp query0, llvm::ArrayRef<CacheTarget> targets0, const ModuleReuseInfo& reuse0,
+   llvm::ArrayRef<ExecutionStepOp> stepsToClone,
+   const llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>>& decodedFiltersForQ0) {
+   DonorJoinBufferFilterPredPrep prep;
+   if (!kEnableReuseStateFilterPredReapply) return prep;
+
+   llvm::SmallVector<mlir::Value, 8> bufferCandidates;
+   collectJoinBufferStatesFromTargets(targets0, bufferCandidates, &reuse0);
+   prep.extendBufStates = collectJoinBuffersFeedingHashIndexedView(bufferCandidates, reuse0);
+   if (prep.extendBufStates.empty()) return prep;
+
+   rewriteHashmapTypesInModule(query0, prep.extendBufStates, &reuse0);
+   prep.layoutApplied = true;
+
+   llvm::DenseSet<mlir::Operation*> stepSet;
+   for (ExecutionStepOp s : stepsToClone) stepSet.insert(s.getOperation());
+   for (auto& t : targets0) {
+      mlir::Value bufState;
+      if (mlir::isa<subop::BufferType>(t.state.getType())) {
+         bufState = t.state;
+      } else if (auto itG = reuse0.hashIndexedViewFromMergedBuffer.find(t.state);
+                 itG != reuse0.hashIndexedViewFromMergedBuffer.end()) {
+         bufState = itG->second;
+      } else {
+         continue;
+      }
+      auto itF = decodedFiltersForQ0.find(t.state);
+      if (itF == decodedFiltersForQ0.end() || itF->second.empty()) continue;
+      auto itTL = reuse0.mergedFromThreadLocal.find(bufState);
+      if (itTL == reuse0.mergedFromThreadLocal.end()) continue;
+      auto itW = reuse0.writerStepsByState.find(itTL->second);
+      if (itW == reuse0.writerStepsByState.end()) continue;
+      for (ExecutionStepOp ws : itW->second) {
+         if (!stepSet.contains(ws.getOperation())) continue;
+         bool hasBufMat = false;
+         ws.getOperation()->walk([&](subop::MaterializeOp m) {
+            if (mlir::isa<subop::BufferType>(m.getState().getType())) hasBufMat = true;
+         });
+         if (!hasBufMat) continue;
+         insertWriteSidePredIntoBufferConstructionStep(ws, itF->second);
+      }
+   }
+   prep.writePredApplied = true;
+   return prep;
+}
+
+void maybeApplySyntheticProducerFilterPredGatherSteps(mlir::ModuleOp synthetic,
+                                                      llvm::ArrayRef<mlir::Value> extendBufStates) {
+   if (!kEnableReuseStateFilterPredReapply || extendBufStates.empty()) return;
+   ensureJoinBufferFilterPredMaterializeMappings(synthetic);
+   subop::Member predMember = makeOrGetPredMember(synthetic.getContext());
+   ExecutionGroupOp eg = getSingleExecutionGroup(synthetic);
+   for (mlir::Operation& op : eg.getSubOps().front()) {
+      if (auto step = mlir::dyn_cast<ExecutionStepOp>(&op)) {
+         insertHashIndexedViewGatherPredFilters(step, predMember);
+      }
+   }
+}
+
+void maybeEnsureJoinBufferFilterPredMaterializeMappings(mlir::ModuleOp module) {
+   if (!kEnableReuseStateFilterPredReapply) return;
+   ensureJoinBufferFilterPredMaterializeMappings(module);
+}
+
 } // namespace
 
 void insertCachePutsForTargets(mlir::ModuleOp producerModule, llvm::ArrayRef<CacheTarget> targets,
@@ -176,11 +411,9 @@ void insertCachePutsForTargets(mlir::ModuleOp producerModule, llvm::ArrayRef<Cac
    }
    const ModuleReuseInfo& reuse = *reuseBeforeMutation;
 
-   llvm::SmallVector<mlir::Value, 8> bufferCandidates;
-   collectJoinBufferStatesFromTargets(targets, bufferCandidates);
-   llvm::SmallVector<mlir::Value, 8> extendJoinBuffers =
-      collectJoinBuffersFeedingHashIndexedView(bufferCandidates, reuse);
-   rewriteHashmapTypesInModule(producerModule, extendJoinBuffers, extendJoinBuffers.empty() ? nullptr : &reuse);
+   if (kEnableReuseStateFilterPredReapply) {
+      maybeExtendJoinBufferHashmapLayoutForFilterPred(producerModule, targets, reuse);
+   }
 
    auto rwByStepOp = buildRwByStepOpMap(reuse);
    llvm::DenseSet<uint64_t> seenKeys;
@@ -201,30 +434,7 @@ void insertCachePutsForTargets(mlir::ModuleOp producerModule, llvm::ArrayRef<Cac
       }
       if (!insertAfter) continue;
 
-      // Write-side: join `hashmap` — materialize table descr filters right after scan, store bool in `filter_pred$0`.
-      if (mlir::isa<subop::HashMapType>(st.getType())) {
-         auto itTL = reuse.mergedFromThreadLocal.find(st);
-         assert(itTL != reuse.mergedFromThreadLocal.end() && "hashmap merge result must have paired thread_local");
-         mlir::Value tl = itTL->second;
-
-         auto decoded = decodeFiltersForStateFromWriterSteps(tl, reuse, &rwByStepOp);
-         if (!decoded.empty()) {
-            auto itW = reuse.writerStepsByState.find(tl);
-            assert(itW != reuse.writerStepsByState.end());
-            ExecutionStepOp construction;
-            for (auto ws : itW->second) {
-               mlir::Block& body = ws.getSubOps().front();
-               bool hasLoi = false, hasRed = false;
-               for (auto& op : body.without_terminator()) {
-                  if (mlir::isa<subop::LookupOrInsertOp>(&op)) hasLoi = true;
-                  if (mlir::isa<subop::ReduceOp>(&op)) hasRed = true;
-               }
-               if (hasLoi && hasRed) { construction = ws; break; }
-            }
-            assert(construction && "write_pred: could not find construction step for join hashmap");
-            insertWriteSidePredIntoHashMapConstructionStep(construction, decoded);
-         }
-      }
+      maybeApplyWriteSideFilterPredOnProducerHashmap(st, reuse, rwByStepOp);
 
       auto loc = insertAfter->getLoc();
       mlir::OpBuilder builder(st.getContext());
@@ -238,22 +448,9 @@ void insertCachePutsForTargets(mlir::ModuleOp producerModule, llvm::ArrayRef<Cac
       builder.create<CachePutOp>(loc, builder.getI64IntegerAttr(static_cast<int64_t>(t.cacheKey)), block.getArgument(0));
       builder.create<ExecutionStepReturnOp>(loc, mlir::ValueRange{});
    }
-   propagateSubOpColumnAttrsFromSsaStateLayout(producerModule, nullptr);
-   alignBufferMergeThreadLocalsWithExtendedMergeResult(producerModule);
-   // `alignBufferMergeThreadLocalsWithExtendedMergeResult` can widen `execution_step` SSA results
-   // (join-buffer `filter_pred$0`) without updating the body's `execution_step_return` operands from
-   // `subop.create` / `subop.create_thread_local`. Push result types back onto return operands, then
-   // re-sync step ports so lowering sees a consistent layout.
-   producerModule.walk([&](subop::ExecutionStepReturnOp ret) {
-      auto step = mlir::dyn_cast<subop::ExecutionStepOp>(ret->getParentOp());
-      if (!step || step.getNumResults() != ret.getNumOperands()) return;
-      for (unsigned i = 0; i < ret.getNumOperands(); ++i) {
-         mlir::Value out = ret.getOperand(i);
-         mlir::Type want = step.getResult(i).getType();
-         if (out.getType() != want) out.setType(want);
-      }
-   });
-   synchronizeExecutionStepPortTypes(producerModule, nullptr);
+   if (kEnableReuseStateFilterPredReapply) {
+      maybeFinalizeModuleAfterJoinBufferFilterPredLayout(producerModule);
+   }
 }
 
 void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, llvm::ArrayRef<CacheTarget> targets,
@@ -269,13 +466,8 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
    }
    const ModuleReuseInfo& reuse = *reuseBeforeMutation;
 
-   if (!joinBufferHashmapLayoutAlreadyApplied) {
-      llvm::SmallVector<mlir::Value, 8> bufferCandidates;
-      collectJoinBufferStatesFromTargets(targets, bufferCandidates);
-      llvm::SmallVector<mlir::Value, 8> extendJoinBuffers =
-         collectJoinBuffersFeedingHashIndexedView(bufferCandidates, reuse);
-      rewriteHashmapTypesInModule(consumerModule, extendJoinBuffers,
-                                  extendJoinBuffers.empty() ? nullptr : &reuse);
+   if (kEnableReuseStateFilterPredReapply && !joinBufferHashmapLayoutAlreadyApplied) {
+      maybeExtendJoinBufferHashmapLayoutForFilterPred(consumerModule, targets, reuse);
    }
 
    auto findEnclosingExecutionGroup = [&](mlir::Value v) -> ExecutionGroupOp {
@@ -306,30 +498,11 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
 
    auto rwByStepOp = buildRwByStepOpMap(reuse);
 
-   // Before cache_get / replaceAllUsesWith hide get_external table SSA.
    llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>> decodedFiltersByTarget =
-      decodeFiltersByCacheTargets(targets, reuse);
+      maybeDecodeFiltersByCacheTargets(targets, reuse);
 
-   // Patch thread_local buffer writers on this consumer when layout was extended here (not on donor).
-   if (!joinBufferWritePredAlreadyApplied) {
-      for (auto& t : targets) {
-         if (!t.state) continue;
-         if (!mlir::isa<subop::BufferType>(t.state.getType())) continue;
-         auto itF = decodedFiltersByTarget.find(t.state);
-         if (itF == decodedFiltersByTarget.end() || itF->second.empty()) continue;
-         auto itTL = findReuseMap(reuse.mergedFromThreadLocal, t.state);
-         if (itTL == reuse.mergedFromThreadLocal.end()) continue;
-         auto itW = findReuseMap(reuse.writerStepsByState, itTL->second);
-         if (itW == reuse.writerStepsByState.end()) continue;
-         for (ExecutionStepOp ws : itW->second) {
-            bool hasBufMat = false;
-            ws.getOperation()->walk([&](subop::MaterializeOp m) {
-               if (mlir::isa<subop::BufferType>(m.getState().getType())) hasBufMat = true;
-            });
-            if (!hasBufMat) continue;
-            insertWriteSidePredIntoBufferConstructionStep(ws, itF->second);
-         }
-      }
+   if (kEnableReuseStateFilterPredReapply && !joinBufferWritePredAlreadyApplied) {
+      maybePatchJoinBufferWritersWithFilterPred(targets, decodedFiltersByTarget, reuse);
    }
 
    // Erase plan from initial `ModuleReuseInfo` only: backward closure from `execution_group_return`
@@ -356,18 +529,26 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
          obsoleteStateCanonPtrs.insert(c.getAsOpaquePointer());
    }
 
-   subop::Member predMember = makeOrGetPredMember(consumerModule.getContext());
+   subop::Member predMember;
+   if (kEnableReuseStateFilterPredReapply) {
+      predMember = makeOrGetPredMember(consumerModule.getContext());
+   }
 
    auto rewriteOne = [&](mlir::Value state, uint64_t cacheKey) {
       assert(!mlir::isa<ThreadLocalType>(state.getType()) &&
              "rewrite must never target thread_local-wrapped states");
 
-      llvm::SmallVector<mlir::Value, 2> statesToDelete;
+      llvm::SmallVector<mlir::Value, 8> statesToDelete;
       statesToDelete.push_back(state);
-      if (auto itTL = findReuseMap(reuse.mergedFromThreadLocal, state);
-          itTL != reuse.mergedFromThreadLocal.end()) {
-         // Match is on merge result; paired thread_local is part of the same construction closure for
-         // erase analysis (never cache the thread_local value itself).
+      if (auto itG = findReuseMap(reuse.hashIndexedViewFromMergedBuffer, state);
+          itG != reuse.hashIndexedViewFromMergedBuffer.end()) {
+         statesToDelete.push_back(itG->second);
+         if (auto itTL = findReuseMap(reuse.mergedFromThreadLocal, itG->second);
+             itTL != reuse.mergedFromThreadLocal.end()) {
+            statesToDelete.push_back(itTL->second);
+         }
+      } else if (auto itTL = findReuseMap(reuse.mergedFromThreadLocal, state);
+                 itTL != reuse.mergedFromThreadLocal.end()) {
          statesToDelete.push_back(itTL->second);
       }
 
@@ -383,9 +564,6 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
       if (auto itF = decodedFiltersByTarget.find(state); itF != decodedFiltersByTarget.end()) {
          decodedFilters = itF->second;
       }
-      const bool isAggHt = mlir::isa<subop::PreAggrHtType>(state.getType());
-      const bool isJoinHm = mlir::isa<subop::HashMapType>(state.getType());
-      const bool isJoinBuf = mlir::isa<subop::BufferType>(state.getType());
 
       auto group = findEnclosingExecutionGroup(state);
       mlir::Value cached;
@@ -396,34 +574,10 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
          keyToCached[cacheKey] = cached;
       }
 
-      // Replace the state uses with cached value.
       state.replaceAllUsesWith(cached);
 
-      if (!decodedFilters.empty() && !isAggHt && !isJoinHm && !isJoinBuf) {
-         materializeRuntimeFiltersAtCacheGetUses(cached, decodedFilters);
-      }
-
-      if (isJoinHm && !decodedFilters.empty()) {
-         for (auto& u : cached.getUses()) {
-            auto step = mlir::dyn_cast<subop::ExecutionStepOp>(u.getOwner());
-            if (!step) continue;
-            insertScanRefsPredFilter(step, predMember);
-         }
-      }
-
-      // Join-buffer `filter_pred$0` can be present on the HIV layout even when there are no
-      // external-table filters to decode (`decodedFilters` empty). Synthetic producers always run
-      // `insertHashIndexedViewGatherPredFilters` in that case; consumers must match or probe-side
-      // gathers leave predicate bits uninitialized and downstream `filter(all_true ...)` drops all rows.
-      if (isJoinBuf) {
-         if (joinBufPredProbeInjectedGroups.insert(group.getOperation()).second) {
-            for (mlir::Operation& op : group.getSubOps().front()) {
-               if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(&op)) {
-                  insertHashIndexedViewGatherPredFilters(step, predMember);
-               }
-            }
-         }
-      }
+      applyFilterPredReapplyAfterCacheGetReplacement(state, cached, decodedFilters, group, predMember,
+                                                     joinBufPredProbeInjectedGroups);
    };
 
    for (auto& t : targets) {
@@ -462,7 +616,9 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
    }
 
    propagateSubOpColumnAttrsFromSsaStateLayout(consumerModule, nullptr);
-   alignBufferMergeThreadLocalsWithExtendedMergeResult(consumerModule);
+   if (kEnableReuseStateFilterPredReapply) {
+      alignBufferMergeThreadLocalsWithExtendedMergeResult(consumerModule);
+   }
 }
 
 ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
@@ -476,16 +632,21 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    targets0.reserve(matches.size());
    targets1.reserve(matches.size());
 
+   auto reuse0Early = collectModuleReuseInfo(query0);
+   auto reuse1Early = collectModuleReuseInfo(query1);
+
    for (auto& m : matches) {
       if (m.stateA) {
-         assert(!mlir::isa<ThreadLocalType>(m.stateA.getType()) &&
-                "match pairs must never target thread_local-wrapped states; match should use merge result");
-         targets0.push_back(CacheTarget{m.stateA, m.cacheKey});
+         mlir::Value ta = resolveCacheTargetStateForReuse(m.stateA, reuse0Early);
+         assert(!mlir::isa<ThreadLocalType>(ta.getType()) &&
+                "match pairs must never target thread_local-wrapped states");
+         targets0.push_back(CacheTarget{ta, m.cacheKey});
       }
       if (m.stateB) {
-         assert(!mlir::isa<ThreadLocalType>(m.stateB.getType()) &&
-                "match pairs must never target thread_local-wrapped states; match should use merge result");
-         targets1.push_back(CacheTarget{m.stateB, m.cacheKey});
+         mlir::Value tb = resolveCacheTargetStateForReuse(m.stateB, reuse1Early);
+         assert(!mlir::isa<ThreadLocalType>(tb.getType()) &&
+                "match pairs must never target thread_local-wrapped states");
+         targets1.push_back(CacheTarget{tb, m.cacheKey});
       }
    }
 
@@ -519,51 +680,16 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    // prerequisite states via reads on writer steps (`ModuleReuseInfo`), then take every state's
    // defining step, `createOnlyStepForState`, and all writer steps (`writerStepsByState`), then SSA
    // predecessors for remaining operand edges (merge, hash views, …).
-   auto reuse0 = collectModuleReuseInfo(query0);
-   auto reuse1 = collectModuleReuseInfo(query1);
-   bool query0JoinBufferLayoutApplied = false;
-   bool query0JoinBufferWritePredApplied = false;
-   llvm::SmallVector<mlir::Value, 8> extendBufStatesForQ0;
-
+   auto reuse0 = reuse0Early;
+   auto reuse1 = reuse1Early;
    llvm::DenseSet<mlir::Value> neededStates = expandNeededStatesFromTargets(targets0, reuse0);
    llvm::SmallVector<ExecutionStepOp, 32> stepsToClone =
       collectCreateAndWriteStepsForStates(donorGroup, reuse0, neededStates);
    stepsToClone = augmentStepsWithOperandProducerClosure(donorGroup, stepsToClone);
 
-   // Join-buffer descr filters: mutate the **donor** query0 before cloning so cloned synthetic steps
-   // already materialize `filter_pred$0` (synthetic modules may not register the same writer-step index
-   // keys as the donor for `insertCachePutsForTargets` to rediscover the construction step).
-   auto decodedFiltersForQ0 = decodeFiltersByCacheTargets(targets0, reuse0);
-   {
-      llvm::SmallVector<mlir::Value, 8> bufferCandidates;
-      collectJoinBufferStatesFromTargets(targets0, bufferCandidates);
-      extendBufStatesForQ0 = collectJoinBuffersFeedingHashIndexedView(bufferCandidates, reuse0);
-      if (!extendBufStatesForQ0.empty()) {
-         rewriteHashmapTypesInModule(query0, extendBufStatesForQ0, &reuse0);
-         query0JoinBufferLayoutApplied = true;
-         llvm::DenseSet<mlir::Operation*> stepSet;
-         for (ExecutionStepOp s : stepsToClone) stepSet.insert(s.getOperation());
-         for (auto& t : targets0) {
-            if (!mlir::isa<subop::BufferType>(t.state.getType())) continue;
-            auto itF = decodedFiltersForQ0.find(t.state);
-            if (itF == decodedFiltersForQ0.end() || itF->second.empty()) continue;
-            auto itTL = reuse0.mergedFromThreadLocal.find(t.state);
-            if (itTL == reuse0.mergedFromThreadLocal.end()) continue;
-            auto itW = reuse0.writerStepsByState.find(itTL->second);
-            if (itW == reuse0.writerStepsByState.end()) continue;
-            for (ExecutionStepOp ws : itW->second) {
-               if (!stepSet.contains(ws.getOperation())) continue;
-               bool hasBufMat = false;
-               ws.getOperation()->walk([&](subop::MaterializeOp m) {
-                  if (mlir::isa<subop::BufferType>(m.getState().getType())) hasBufMat = true;
-               });
-               if (!hasBufMat) continue;
-               insertWriteSidePredIntoBufferConstructionStep(ws, itF->second);
-            }
-         }
-         query0JoinBufferWritePredApplied = true;
-      }
-   }
+   auto decodedFiltersForQ0 = maybeDecodeFiltersByCacheTargets(targets0, reuse0);
+   DonorJoinBufferFilterPredPrep donorFilterPredPrep = maybePrepareDonorJoinBufferFilterPredBeforeClone(
+      query0, targets0, reuse0, stepsToClone, decodedFiltersForQ0);
 
    auto mapping = cloneExecutionStepsToQuery0(q0Group, stepsToClone);
 
@@ -597,23 +723,14 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       insertCachePutsForTargets(*res.query0, targetsQ0, &reuseSynthetic);
    }
 
-   ensureJoinBufferFilterPredMaterializeMappings(*res.query0);
-   if (!extendBufStatesForQ0.empty()) {
-      subop::Member predMember = makeOrGetPredMember(q0Ctx);
-      ExecutionGroupOp eg = getSingleExecutionGroup(*res.query0);
-      for (mlir::Operation& op : eg.getSubOps().front()) {
-         if (auto step = mlir::dyn_cast<ExecutionStepOp>(&op)) {
-            insertHashIndexedViewGatherPredFilters(step, predMember);
-         }
-      }
-   }
+   maybeApplySyntheticProducerFilterPredGatherSteps(*res.query0, donorFilterPredPrep.extendBufStates);
 
-   injectCacheGetsAndDeleteConstructionSteps(query0, targets0, &reuse0, query0JoinBufferLayoutApplied,
-                                           query0JoinBufferWritePredApplied);
+   injectCacheGetsAndDeleteConstructionSteps(query0, targets0, &reuse0, donorFilterPredPrep.layoutApplied,
+                                           donorFilterPredPrep.writePredApplied);
    injectCacheGetsAndDeleteConstructionSteps(query1, targets1, &reuse1);
 
-   ensureJoinBufferFilterPredMaterializeMappings(query0);
-   ensureJoinBufferFilterPredMaterializeMappings(query1);
+   maybeEnsureJoinBufferFilterPredMaterializeMappings(query0);
+   maybeEnsureJoinBufferFilterPredMaterializeMappings(query1);
    propagateSubOpColumnAttrsFromSsaStateLayout(query0, nullptr);
    propagateSubOpColumnAttrsFromSsaStateLayout(query1, nullptr);
    propagateSubOpColumnAttrsFromSsaStateLayout(*res.query0, nullptr);

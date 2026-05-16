@@ -277,9 +277,16 @@ llvm::DenseSet<mlir::Value> expandNeededStatesFromTargets(llvm::ArrayRef<CacheTa
    for (size_t qi = 0; qi < queue.size(); ++qi) {
       mlir::Value s = queue[qi];
 
-      if (auto itM = findReuseMap(reuse.mergedFromThreadLocal, s);
-          itM != reuse.mergedFromThreadLocal.end()) {
+      if (auto itM = findReuseMap(reuse.mergedFromThreadLocal, s); itM != reuse.mergedFromThreadLocal.end()) {
          enqueue(itM->second);
+      }
+      if (auto itH = findReuseMap(reuse.mergedBufferToHashIndexedView, s);
+          itH != reuse.mergedBufferToHashIndexedView.end()) {
+         enqueue(itH->second);
+      }
+      if (auto itG = findReuseMap(reuse.hashIndexedViewFromMergedBuffer, s);
+          itG != reuse.hashIndexedViewFromMergedBuffer.end()) {
+         enqueue(itG->second);
       }
 
       auto itW = findReuseMap(reuse.writerStepsByState, s);
