@@ -2,6 +2,7 @@
 #define LINGODB_COMPILER_DIALECT_SUBOPERATOR_TRANSFORMS_CROSSQUERYSTATEREUSE_H
 
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/StateExtraction.h"
+#include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseRewriteCommon.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -32,6 +33,19 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    mlir::ModuleOp query0,
    mlir::ModuleOp query1,
    llvm::ArrayRef<CrossQueryStateMatchPair> matches);
+
+/// \p reuseBeforeMutation must reflect the module **before** `rewriteHashmapTypesInModule` runs on
+/// \p producerModule (when null, it is collected here). Used to skip a redundant full-module scan.
+void insertCachePutsForTargets(mlir::ModuleOp producerModule, llvm::ArrayRef<CacheTarget> targets,
+                               const ModuleReuseInfo* reuseBeforeMutation = nullptr);
+
+/// \p reuseBeforeMutation same contract as for `insertCachePutsForTargets`. When
+/// \p joinBufferHashmapLayoutAlreadyApplied is true, join-buffer / HIV layout extension was already
+/// applied on \p consumerModule and is not run again.
+void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, llvm::ArrayRef<CacheTarget> targets,
+                                               const ModuleReuseInfo* reuseBeforeMutation = nullptr,
+                                               bool joinBufferHashmapLayoutAlreadyApplied = false,
+                                               bool joinBufferWritePredAlreadyApplied = false);
 
 } // namespace lingodb::compiler::dialect::subop
 

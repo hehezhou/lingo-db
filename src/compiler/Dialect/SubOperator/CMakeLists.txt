@@ -23,6 +23,9 @@ add_mlir_dialect_library(MLIRSubOperator
         Transforms/PrepareForLowering.cpp
         Transforms/CommonPipelineElimination.cpp
         Transforms/StateExtraction.cpp
+        Transforms/ReuseRewriteCommon.cpp
+        Transforms/ReuseStateClosure.cpp
+        Transforms/ReuseFilterPredInsert.cpp
         Transforms/CrossQueryStateReuse.cpp
         ADDITIONAL_HEADER_DIRS
         ../../../../include/lingodb/compiler/Dialect/SubOperator
