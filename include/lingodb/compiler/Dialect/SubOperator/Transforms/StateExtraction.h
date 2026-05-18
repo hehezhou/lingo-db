@@ -69,6 +69,10 @@ struct ModuleReuseInfo {
    /// Canonical external table state (`!subop.table`) -> decoded external datasource property
    /// (parsed from `subop.get_external` `descr` hex string).
    llvm::DenseMap<mlir::Value, lingodb::runtime::ExternalDatasourceProperty> externalDatasourceByTableState;
+
+   /// For `hash_indexed_view` join-build roots: sorted member/column fingerprint of stored payload
+   /// columns (full layout). Cross-query matching ignores this in `constructionHash` but keeps it here.
+   llvm::DenseMap<mlir::Value, std::string> joinBuildStoredValueMembersByState;
 };
 
 ModuleReuseInfo collectModuleReuseInfo(mlir::ModuleOp moduleOp);

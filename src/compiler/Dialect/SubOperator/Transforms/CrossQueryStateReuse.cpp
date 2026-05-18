@@ -2,6 +2,7 @@
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseRewriteCommon.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseStateClosure.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseFilterPredInsert.h"
+#include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseJoinSuperset.h"
 
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorOps.h"
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorOpsAttributes.h"
@@ -716,6 +717,8 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    if (targetsQ0.empty()) {
       return res;
    }
+
+   extendSyntheticJoinBuffersToColumnUnion(*res.query0, query0, query1, matches, targetsQ0, mapping);
 
    // Producer: cache_puts (cloned synthetic IR — needs its own reuse snapshot).
    {

@@ -603,6 +603,18 @@ static std::string sanitizeBaseName(llvm::StringRef name) {
    return base.substr(0, pos).str();
 }
 
+/// Like `sanitizeBaseName` for scopes/columns, but keeps compiler member slot suffixes (`member$0` vs `member$1`).
+static std::string sanitizeMemberSlotName(llvm::StringRef name) {
+   auto pos = name.rfind("_u_");
+   if (pos == llvm::StringRef::npos) return name.str();
+   llvm::StringRef tail = name.substr(pos + 3);
+   if (tail.empty()) return name.str();
+   for (char c : tail) {
+      if (c < '0' || c > '9') return name.str();
+   }
+   return name.substr(0, pos).str();
+}
+
 static std::string sanitizeScopeName(llvm::StringRef scope) {
    // ColumnManager may uniquify scopes as "<base>_u_<n>" across runs/contexts.
    auto pos = scope.rfind("_u_");
@@ -634,11 +646,126 @@ static uint64_t hashOpName(mlir::Operation& op) {
    return static_cast<uint64_t>(llvm::hash_value(op.getName().getStringRef()));
 }
 
+static std::string fingerprintSortedMemberPairs(subop::MemberManager& mm, llvm::ArrayRef<subop::Member> members);
+
+/// Join HIV cross-query matching: hash/link slots + first stored lookup key; payload columns tracked separately.
+struct JoinHivMatchDetails {
+   llvm::SmallSet<std::string, 8> indexMemberNamesSanitized;
+   llvm::SmallSet<uint64_t, 8> joinKeyColumnAttrHashes;
+   std::string storedValueMembersFingerprint;
+};
+
+static std::string tableNameDepToken(mlir::Value tableState,
+                                    const llvm::DenseMap<mlir::Value, lingodb::runtime::ExternalDatasourceProperty>&
+                                       externalDatasourceByTableState) {
+   if (auto it = externalDatasourceByTableState.find(tableState); it != externalDatasourceByTableState.end()) {
+      return std::string("table_name:") + it->second.tableName;
+   }
+   return {};
+}
+
+static subop::CreateHashIndexedView findCreateHashIndexedViewForState(
+   mlir::Value hiv, const llvm::DenseMap<mlir::Value, llvm::SmallVector<subop::ExecutionStepOp, 8>>& writerStepsByState) {
+   auto itW = writerStepsByState.find(hiv);
+   if (itW == writerStepsByState.end()) return {};
+   for (subop::ExecutionStepOp ws : itW->second) {
+      subop::CreateHashIndexedView found;
+      ws.walk([&](subop::CreateHashIndexedView op) { found = op; });
+      if (found) return found;
+   }
+   return {};
+}
+
+static std::optional<JoinHivMatchDetails> computeJoinHivMatchDetails(
+   mlir::Value hiv, subop::HashIndexedViewType hivTy, subop::MemberManager& mm,
+   lingodb::compiler::dialect::tuples::ColumnManager& columnManager,
+   const llvm::DenseMap<mlir::Value, llvm::SmallVector<subop::ExecutionStepOp, 8>>& writerStepsByState) {
+   subop::CreateHashIndexedView chiv = findCreateHashIndexedViewForState(hiv, writerStepsByState);
+   if (!chiv) return std::nullopt;
+
+   JoinHivMatchDetails details;
+   details.storedValueMembersFingerprint =
+      fingerprintSortedMemberPairs(mm, hivTy.getValueMembers().getMembers());
+
+   details.indexMemberNamesSanitized.insert(sanitizeMemberSlotName(mm.getName(chiv.getHashMember().getMember())));
+   details.indexMemberNamesSanitized.insert(sanitizeMemberSlotName(mm.getName(chiv.getLinkMember().getMember())));
+   auto valueMembers = hivTy.getValueMembers().getMembers();
+   subop::Member joinValueMember;
+   if (!valueMembers.empty()) {
+      joinValueMember = valueMembers.front();
+      details.indexMemberNamesSanitized.insert(sanitizeMemberSlotName(mm.getName(joinValueMember)));
+   }
+
+   auto recordJoinKeyColumnHash = [&](llvm::StringRef scope, llvm::StringRef name, mlir::Type colTy) {
+      std::string nameSan = sanitizeBaseName(name);
+      std::string scopeSan = sanitizeScopeName(scope);
+      uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(scopeSan)));
+      h = hashCombineU64(h, static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(nameSan))));
+      h = hashCombineU64(h, hashType(colTy));
+      details.joinKeyColumnAttrHashes.insert(h);
+   };
+
+   if (joinValueMember) {
+      auto joinValueSanitized = sanitizeMemberSlotName(mm.getName(joinValueMember));
+      auto itW = writerStepsByState.find(hiv);
+      if (itW != writerStepsByState.end()) {
+         for (subop::ExecutionStepOp ws : itW->second) {
+            ws.walk([&](subop::MaterializeOp mat) {
+               if (!mlir::isa<subop::BufferType>(mat.getState().getType())) return;
+               for (auto& [member, colRef] : mat.getMapping().getMapping()) {
+                  if (sanitizeMemberSlotName(mm.getName(member)) != joinValueSanitized) continue;
+                  auto [scope, name] = columnManager.getName(&colRef.getColumn());
+                  recordJoinKeyColumnHash(scope, name, colRef.getColumn().type);
+               }
+            });
+            ws.walk([&](subop::GatherOp gather) {
+               for (auto& [member, colDef] : gather.getMapping().getMapping()) {
+                  (void)member;
+                  auto [scope, name] = columnManager.getName(&colDef.getColumn());
+                  if (sanitizeBaseName(name) != sanitizeBaseName(mm.getName(joinValueMember))) continue;
+                  recordJoinKeyColumnHash(scope, name, colDef.getColumn().type);
+               }
+            });
+         }
+      }
+   }
+
+   return details;
+}
+
+static std::string normalizedHashIndexedViewTypeFingerprintForJoinMatch(subop::MemberManager& mm,
+                                                                        subop::HashIndexedViewType hivTy,
+                                                                        const JoinHivMatchDetails& details) {
+   llvm::SmallVector<subop::Member, 4> indexValueMembers;
+   for (auto m : hivTy.getValueMembers().getMembers()) {
+      if (details.indexMemberNamesSanitized.contains(sanitizeMemberSlotName(mm.getName(m)))) {
+         indexValueMembers.push_back(m);
+      }
+   }
+   return std::string("hash_indexed_view{key_members=") +
+          fingerprintSortedMemberPairs(mm, hivTy.getKeyMembers().getMembers()) +
+          ",index_value_members=" + fingerprintSortedMemberPairs(mm, indexValueMembers) +
+          ",compare=" + (hivTy.getCompareHashForLookup() ? "1" : "0") + "}";
+}
+
+static bool executionStepBuildsJoinBuffer(subop::ExecutionStepOp step) {
+   bool found = false;
+   step.walk([&](subop::MaterializeOp mat) {
+      if (mlir::isa<subop::BufferType>(mat.getState().getType())) found = true;
+   });
+   return found;
+}
+
 struct StepDagHasher {
    subop::ExecutionStepOp step;
    const llvm::DenseMap<mlir::Value, std::string>* tableDescrByTableState = nullptr;
    subop::MemberManager* memberManager = nullptr;
    lingodb::compiler::dialect::tuples::ColumnManager* columnManager = nullptr;
+   bool relaxJoinPayloadColumns = false;
+   const llvm::SmallSet<std::string, 8>* joinIndexMemberNamesSanitized = nullptr;
+   const llvm::SmallSet<uint64_t, 8>* joinKeyColumnAttrHashes = nullptr;
+   const llvm::DenseMap<mlir::Value, lingodb::runtime::ExternalDatasourceProperty>* externalDatasourceByTableState =
+      nullptr;
    llvm::DenseMap<mlir::Value, uint64_t> memo;
 
    bool isWithinStep(mlir::Operation* op) {
@@ -648,17 +775,55 @@ struct StepDagHasher {
       return false;
    }
 
+   uint64_t hashMlirType(mlir::Type t) const {
+      if (!t) return 0;
+      if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(t)) {
+         return hashMlirType(tl.getWrapped());
+      }
+      if (relaxJoinPayloadColumns && joinIndexMemberNamesSanitized && memberManager) {
+         if (auto buf = mlir::dyn_cast<subop::BufferType>(t)) {
+            llvm::SmallVector<subop::Member, 8> kept;
+            for (auto m : buf.getMembers().getMembers()) {
+               if (joinIndexMemberNamesSanitized->contains(sanitizeMemberSlotName(memberManager->getName(m)))) {
+                  kept.push_back(m);
+               }
+            }
+            std::string fp = std::string("buffer{members=") + fingerprintSortedMemberPairs(*memberManager, kept) + "}";
+            return static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(fp)));
+         }
+         if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(t)) {
+            llvm::SmallVector<subop::Member, 4> indexValueMembers;
+            for (auto m : hiv.getValueMembers().getMembers()) {
+               if (joinIndexMemberNamesSanitized->contains(sanitizeMemberSlotName(memberManager->getName(m)))) {
+                  indexValueMembers.push_back(m);
+               }
+            }
+            std::string fp = std::string("hash_indexed_view{key_members=") +
+                             fingerprintSortedMemberPairs(*memberManager, hiv.getKeyMembers().getMembers()) +
+                             ",index_value_members=" + fingerprintSortedMemberPairs(*memberManager, indexValueMembers) +
+                             ",compare=" + (hiv.getCompareHashForLookup() ? "1" : "0") + "}";
+            return static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(fp)));
+         }
+      }
+      return hashType(t);
+   }
+
    uint64_t hashExternalLeaf(mlir::Value v) {
+      if (relaxJoinPayloadColumns && externalDatasourceByTableState) {
+         if (auto it = externalDatasourceByTableState->find(v); it != externalDatasourceByTableState->end()) {
+            return static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(it->second.tableName)));
+         }
+      }
       // Treat external tables as stable leaves keyed by GetExternal descr + type.
       if (tableDescrByTableState) {
          if (auto it = tableDescrByTableState->find(v); it != tableDescrByTableState->end()) {
             uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(it->second)));
-            h = hashCombineU64(h, hashType(v.getType()));
+            h = hashCombineU64(h, hashMlirType(v.getType()));
             return h;
          }
       }
       // Fallback: type-only leaf.
-      return hashType(v.getType());
+      return hashMlirType(v.getType());
    }
 
    uint64_t hashRegion(mlir::Region& r) {
@@ -683,7 +848,7 @@ struct StepDagHasher {
          auto m = mr.getMember();
          auto name = sanitizeBaseName(memberManager->getName(m));
          uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(name)));
-         h = hashCombineU64(h, hashType(memberManager->getType(m)));
+         h = hashCombineU64(h, hashMlirType(memberManager->getType(m)));
          return h;
       }
       if (auto cr = mlir::dyn_cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(a)) {
@@ -693,7 +858,7 @@ struct StepDagHasher {
          scope = sanitizeScopeName(scope);
          uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(scope)));
          h = hashCombineU64(h, static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(name))));
-         h = hashCombineU64(h, hashType(cr.getColumn().type));
+         h = hashCombineU64(h, hashMlirType(cr.getColumn().type));
          return h;
       }
       if (auto cd = mlir::dyn_cast<lingodb::compiler::dialect::tuples::ColumnDefAttr>(a)) {
@@ -703,7 +868,7 @@ struct StepDagHasher {
          scope = sanitizeScopeName(scope);
          uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(scope)));
          h = hashCombineU64(h, static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(name))));
-         h = hashCombineU64(h, hashType(cd.getColumn().type));
+         h = hashCombineU64(h, hashMlirType(cd.getColumn().type));
          if (cd.getFromExisting()) h = hashCombineU64(h, hashAttrNormalized(cd.getFromExisting()));
          return h;
       }
@@ -741,6 +906,11 @@ struct StepDagHasher {
       assert(0);
    }
 
+   bool includeMemberForJoinIndexHash(llvm::StringRef memberNameSanitized) const {
+      if (!relaxJoinPayloadColumns || !joinIndexMemberNamesSanitized) return true;
+      return joinIndexMemberNamesSanitized->contains(memberNameSanitized.str());
+   }
+
    uint64_t hashAttrDictSorted(mlir::Operation& op) {
       llvm::SmallVector<mlir::NamedAttribute, 16> attrs(op.getAttrs().begin(), op.getAttrs().end());
       llvm::sort(attrs, [](auto a, auto b) { return a.getName().strref() < b.getName().strref(); });
@@ -752,11 +922,42 @@ struct StepDagHasher {
       return h;
    }
 
+   uint64_t hashGatherOpRelaxed(subop::GatherOp gather) {
+      uint64_t h = hashOpName(*gather.getOperation());
+      for (auto t : gather->getResultTypes()) h = hashCombineU64(h, hashMlirType(t));
+      for (auto v : gather->getOperands()) h = hashCombineU64(h, hashValue(v));
+      if (joinKeyColumnAttrHashes) {
+         for (auto& [member, colDef] : gather.getMapping().getMapping()) {
+            uint64_t colH = hashAttrNormalized(colDef);
+            if (!joinKeyColumnAttrHashes->contains(colH)) continue;
+            (void)member;
+            h = hashCombineU64(h, colH);
+         }
+      }
+      return h;
+   }
+
+   uint64_t hashMaterializeOpRelaxed(subop::MaterializeOp mat) {
+      uint64_t h = hashOpName(*mat.getOperation());
+      for (auto t : mat->getResultTypes()) h = hashCombineU64(h, hashMlirType(t));
+      for (auto v : mat->getOperands()) h = hashCombineU64(h, hashValue(v));
+      for (auto& [member, colRef] : mat.getMapping().getMapping()) {
+         if (!includeMemberForJoinIndexHash(sanitizeMemberSlotName(memberManager->getName(member)))) continue;
+         h = hashCombineU64(h, hashAttrNormalized(colRef));
+         h = hashCombineU64(h, hashAttrNormalized(subop::MemberAttr::get(mat->getContext(), member)));
+      }
+      return h;
+   }
+
    uint64_t hashOp(mlir::Operation& op) {
+      if (relaxJoinPayloadColumns) {
+         if (auto gather = mlir::dyn_cast<subop::GatherOp>(&op)) return hashGatherOpRelaxed(gather);
+         if (auto mat = mlir::dyn_cast<subop::MaterializeOp>(&op)) return hashMaterializeOpRelaxed(mat);
+      }
       uint64_t h = 0;
       h = hashCombineU64(h, hashOpName(op));
       h = hashCombineU64(h, hashAttrDictSorted(op));
-      for (auto t : op.getResultTypes()) h = hashCombineU64(h, hashType(t));
+      for (auto t : op.getResultTypes()) h = hashCombineU64(h, hashMlirType(t));
       // Operand order is semantic.
       for (auto v : op.getOperands()) h = hashCombineU64(h, hashValue(v));
       // Include nested regions (map/reduce/combine etc.)
@@ -947,6 +1148,8 @@ struct StateMatchProfile {
    llvm::SmallVector<uint64_t, 8> constructionStepHashes;
    uint64_t constructionHash = 0;
    std::string typeFingerprintStr;
+   /// Full HIV/buffer stored-value column layout (excluded from `constructionHash` / match type key).
+   std::string storedValueMembersFingerprint;
 };
 
 struct ModuleMatchAndReuseAnalysis {
@@ -1091,6 +1294,8 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
    auto* dialect = moduleOp.getContext()->getLoadedDialect<subop::SubOperatorDialect>();
    assert(dialect && "subop dialect must be loaded to fingerprint members");
    subop::MemberManager& memberManager = dialect->getMemberManager();
+   auto* tupDialect = moduleOp.getContext()->getLoadedDialect<lingodb::compiler::dialect::tuples::TupleStreamDialect>();
+   assert(tupDialect && "tuples dialect must be loaded");
 
    auto a = analyzeModuleForMatchAndReuse(moduleOp);
 
@@ -1118,6 +1323,16 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
                                                          &a.reuse.hashIndexedViewFromMergedBuffer);
       auto prereqStepIdxs = sortedUniqueStepIndices(stepIdxs);
 
+      const bool isJoinHivRoot = a.reuse.hashIndexedViewFromMergedBuffer.contains(s);
+      std::optional<JoinHivMatchDetails> joinHivDetails;
+      if (auto hivTy = mlir::dyn_cast<subop::HashIndexedViewType>(s.getType())) {
+         joinHivDetails =
+            computeJoinHivMatchDetails(s, hivTy, memberManager, tupDialect->getColumnManager(), a.reuse.writerStepsByState);
+         if (joinHivDetails) {
+            a.reuse.joinBuildStoredValueMembersByState[s] = joinHivDetails->storedValueMembersFingerprint;
+         }
+      }
+
       llvm::SmallVector<uint64_t, 16> stepHashes;
       stepHashes.reserve(stepIdxs.size());
       for (int si : stepIdxs) {
@@ -1127,9 +1342,13 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
          hasher.step = itS->second;
          hasher.tableDescrByTableState = &tableDescrByTableState;
          hasher.memberManager = &memberManager;
-         auto* tupDialect = moduleOp.getContext()->getLoadedDialect<lingodb::compiler::dialect::tuples::TupleStreamDialect>();
-         assert(tupDialect && "tuples dialect must be loaded");
          hasher.columnManager = &tupDialect->getColumnManager();
+         if (joinHivDetails) {
+            hasher.relaxJoinPayloadColumns = true;
+            hasher.joinIndexMemberNamesSanitized = &joinHivDetails->indexMemberNamesSanitized;
+            hasher.joinKeyColumnAttrHashes = &joinHivDetails->joinKeyColumnAttrHashes;
+            hasher.externalDatasourceByTableState = &a.reuse.externalDatasourceByTableState;
+         }
          stepHashes.push_back(hasher.hashStepReturnGraph());
       }
       llvm::sort(stepHashes);
@@ -1180,6 +1399,13 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
                   }
                }
                if (isTableStateValue(p)) {
+                  if (isJoinHivRoot) {
+                     std::string tableNameToken = tableNameDepToken(p, a.reuse.externalDatasourceByTableState);
+                     if (!tableNameToken.empty()) {
+                        local.push_back(std::move(tableNameToken));
+                        continue;
+                     }
+                  }
                   auto itD = tableDescrByTableState.find(p);
                   if (itD != tableDescrByTableState.end()) {
                      local.push_back(std::string("table:") + itD->second);
@@ -1290,7 +1516,13 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
       prof.depTokensSorted.assign(depTokens.begin(), depTokens.end());
       prof.constructionStepHashes.assign(stepHashes.begin(), stepHashes.end());
       prof.constructionHash = constructionHash;
-      prof.typeFingerprintStr = normalizedSubopStateTypeFingerprint(memberManager, s.getType());
+      if (joinHivDetails) {
+         prof.typeFingerprintStr = normalizedHashIndexedViewTypeFingerprintForJoinMatch(
+            memberManager, mlir::cast<subop::HashIndexedViewType>(s.getType()), *joinHivDetails);
+         prof.storedValueMembersFingerprint = joinHivDetails->storedValueMembersFingerprint;
+      } else {
+         prof.typeFingerprintStr = normalizedSubopStateTypeFingerprint(memberManager, s.getType());
+      }
       profiles.push_back(std::move(prof));
    }
 
@@ -1663,6 +1895,31 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
    os << "// States with any other prereq state are skipped.\n";
    os << "// Match key: sorted dep tokens + construction fingerprints + result type fingerprint.\n";
    os << "// Match key: sorted dep tokens + constructionHash + result type fingerprint.\n";
+
+   // Debug helper: print eligible join hash_indexed_view profiles per query (capped).
+   {
+      os << "\n// ==== debug: eligible hash_indexed_view (join build) profiles (capped) ====\n";
+      size_t cap = 20;
+      for (auto& m : models) {
+         size_t printedDbg = 0;
+         for (auto& p : m.profiles) {
+            if (!mlir::isa<subop::HashIndexedViewType>(p.value.getType())) continue;
+            std::string deps = joinSortedStrings(p.depTokensSorted);
+            os << "//   query[" << m.id << "] ";
+            mlir::OpPrintingFlags dbgFlags;
+            p.value.printAsOperand(os, dbgFlags);
+            os << " eligible=" << (p.eligible ? "true" : "false");
+            os << " h=" << p.constructionHash;
+            os << " type_fp=" << p.typeFingerprintStr;
+            if (!p.storedValueMembersFingerprint.empty()) {
+               os << " stored_cols=" << p.storedValueMembersFingerprint;
+            }
+            os << " deps=" << deps << "\n";
+            if (++printedDbg >= cap) break;
+         }
+         if (printedDbg == 0) os << "//   query[" << m.id << "] (none)\n";
+      }
+   }
 
    // Debug helper: print eligible optimistic_ht_fragment-like profiles per query (capped).
    {
