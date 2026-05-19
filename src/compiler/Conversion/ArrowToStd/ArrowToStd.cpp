@@ -406,7 +406,6 @@ void ArrowToStdLoweringPass::runOnOperation() {
    mlir::populateCallOpTypeConversionPattern(patterns, typeConverter);
    mlir::populateReturnOpTypeConversionPattern(patterns, typeConverter);
    util::populateUtilTypeConversionPatterns(typeConverter, patterns);
-   mlir::scf::populateSCFStructuralTypeConversions(typeConverter, patterns);
    patterns.insert<SimpleTypeConversionPattern<mlir::func::ConstantOp>>(typeConverter, &getContext());
    patterns.insert<SimpleTypeConversionPattern<mlir::arith::SelectOp>>(typeConverter, &getContext());
    patterns.insert<ArrayIsValidLowering>(typeConverter, &getContext());
@@ -419,6 +418,7 @@ void ArrowToStdLoweringPass::runOnOperation() {
    patterns.insert<BuilderAppendBoolLowering>(typeConverter, &getContext());
    patterns.insert<BuilderAppendVariableSizeBinaryLowering>(typeConverter, &getContext());
    patterns.insert<BuilderAppendIntervalDaytimeLowering>(typeConverter, &getContext());
+   mlir::scf::populateSCFStructuralTypeConversions(typeConverter, patterns);
    if (failed(applyFullConversion(module, target, std::move(patterns))))
       signalPassFailure();
 }

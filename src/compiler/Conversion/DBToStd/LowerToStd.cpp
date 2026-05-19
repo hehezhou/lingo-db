@@ -1462,7 +1462,6 @@ void DBToStdLoweringPass::runOnOperation() {
    mlir::populateCallOpTypeConversionPattern(patterns, typeConverter);
    mlir::populateReturnOpTypeConversionPattern(patterns, typeConverter);
    util::populateUtilTypeConversionPatterns(typeConverter, patterns);
-   mlir::scf::populateSCFStructuralTypeConversions(typeConverter, patterns);
    patterns.insert<SimpleTypeConversionPattern<mlir::func::ConstantOp>>(typeConverter, &getContext());
    patterns.insert<SimpleTypeConversionPattern<mlir::func::CallIndirectOp>>(typeConverter, &getContext());
    patterns.insert<SimpleTypeConversionPattern<mlir::arith::SelectOp>>(typeConverter, &getContext());
@@ -1524,6 +1523,8 @@ void DBToStdLoweringPass::runOnOperation() {
    patterns.insert<DictIterNextLowering>(typeConverter, ctxt);
    patterns.insert<DictIterGetKeyLowering>(typeConverter, ctxt);
    patterns.insert<DictIterGetValueLowering>(typeConverter, ctxt);
+
+   mlir::scf::populateSCFStructuralTypeConversions(typeConverter, patterns);
 
    if (failed(applyFullConversion(module, target, std::move(patterns))))
       signalPassFailure();

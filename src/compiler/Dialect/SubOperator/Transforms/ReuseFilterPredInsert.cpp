@@ -1,3 +1,4 @@
+#include "lingodb/compiler/Dialect/SubOperator/Transforms/CrossQueryStateReuse.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseRewriteCommon.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseFilterPredInsert.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseStateClosure.h"
@@ -480,6 +481,11 @@ static void refreshHivListCarrierValueTypes(mlir::ModuleOp module, const llvm::D
 /// **types of SSA values present in the closure** (after `expandClosureThroughExecutionStepPorts`).
 void propagateSubOpColumnAttrsFromSsaStateLayout(mlir::ModuleOp module,
                                                         const llvm::DenseSet<void*>* closureFilter) {
+   // `alignConsumerHashIndexedViewsWithSyntheticProducer` strips nested lookup/HIV carriers to the
+   // synthetic producer layout; this pass re-extends attrs and SSA with `filter_pred$0` via
+   // `refreshHivListCarrierValueTypes`. Skip entirely while filter-pred reuse is disabled.
+   if (!kEnableReuseStateFilterPredReapply) return;
+
    auto* ctx = module.getContext();
    subop::Member predMember = makeOrGetPredMember(ctx);
    auto shouldUpdateOp = [&](mlir::Operation* op) {

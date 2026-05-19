@@ -32,6 +32,8 @@
 #include "lingodb/compiler/Dialect/util/UtilOps.h"
 
 #include <llvm/ADT/StringRef.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
@@ -70,6 +72,16 @@ static bool envFlagEnabled(const char* envVar) {
 static double millisSince(std::chrono::high_resolution_clock::time_point start) {
    auto end = std::chrono::high_resolution_clock::now();
    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+}
+
+static void dumpModuleToFile(mlir::ModuleOp module, const llvm::Twine& path) {
+   std::error_code ec;
+   llvm::raw_fd_ostream os(path.str(), ec);
+   if (ec) {
+      llvm::errs() << kToolName << ": failed to write " << path << ": " << ec.message() << "\n";
+      return;
+   }
+   module.print(os);
 }
 
 const llvm::json::Array& getQueriesArray(const llvm::json::Object& obj) {
@@ -125,9 +137,22 @@ void runPasses(mlir::ModuleOp moduleOp, lingodb::catalog::Catalog* catalog) {
    }
 }
 
-static void executeFromSubOpLayer(mlir::ModuleOp subopModule,
-                                  lingodb::runtime::ExecutionContext* executionContext) {
+/// Lower from SubOp layer through tail PM. Returns false if lowerDB fails.
+static bool lowerFromSubOpLayer(mlir::ModuleOp subopModule, const char* snapshotDir = nullptr,
+                                llvm::StringRef snapshotLabel = {}) {
    using namespace lingodb::compiler::dialect;
+
+   auto snap = [&](llvm::StringRef stage, mlir::ModuleOp mod) {
+      if (!snapshotDir) return;
+      llvm::SmallString<256> filePath;
+      if (snapshotLabel.empty()) {
+         llvm::sys::path::append(filePath, snapshotDir, "snapshots", (stage + ".mlir").str());
+      } else {
+         llvm::sys::path::append(filePath, snapshotDir, "snapshots", snapshotLabel, (stage + ".mlir").str());
+      }
+      llvm::sys::fs::create_directories(llvm::sys::path::parent_path(filePath));
+      dumpModuleToFile(mod, filePath);
+   };
 
    // Default: keep `parallel` scan/map attrs from `runPasses` so JIT matches normal parallel lowering.
    // Opt-in sequential debugging via `LINGODB_SUBOP_FORCE_SEQUENTIAL=1` (sets module attr + strips `parallel`).
@@ -145,8 +170,9 @@ static void executeFromSubOpLayer(mlir::ModuleOp subopModule,
       lowerSubOpPm.addPass(subop::createLowerSubOpPass());
       lowerSubOpPm.addPass(lingodb::compiler::createCanonicalizerPass());
       lowerSubOpPm.addPass(mlir::createCSEPass());
-      assert(succeeded(lowerSubOpPm.run(subopModule)));
+      if (failed(lowerSubOpPm.run(subopModule))) return false;
    }
+   snap("before-lower-db", subopModule);
 
    // Lower DB imperative ops.
    {
@@ -216,10 +242,11 @@ static void executeFromSubOpLayer(mlir::ModuleOp subopModule,
       lowerDBPm.addPass(std::make_unique<FixUnrealizedScalarCasts>());
       db::createLowerDBPipeline(lowerDBPm);
       if (failed(lowerDBPm.run(subopModule))) {
-         subopModule.dump();
-         assert(0 && "lowerDBPm failed (dumped module above)");
+         snap("lower-db-failed", subopModule);
+         return false;
       }
    }
+   snap("after-lower-db", subopModule);
 
    // Lower Arrow ops to std.
    {
@@ -229,7 +256,7 @@ static void executeFromSubOpLayer(mlir::ModuleOp subopModule,
       lowerArrowPm.addPass(lingodb::compiler::createCanonicalizerPass());
       lowerArrowPm.addPass(mlir::createLoopInvariantCodeMotionPass());
       lowerArrowPm.addPass(mlir::createCSEPass());
-      assert(succeeded(lowerArrowPm.run(subopModule)));
+      if (failed(lowerArrowPm.run(subopModule))) return false;
    }
 
    // Cross-query reuse can leave a few `builtin.unrealized_conversion_cast` ops after dialect
@@ -240,7 +267,19 @@ static void executeFromSubOpLayer(mlir::ModuleOp subopModule,
       tailPm.addPass(mlir::createReconcileUnrealizedCastsPass());
       tailPm.addPass(lingodb::compiler::createCanonicalizerPass());
       tailPm.addPass(mlir::createCSEPass());
-      assert(succeeded(tailPm.run(subopModule)));
+      if (failed(tailPm.run(subopModule))) return false;
+   }
+   snap("after-tail-pm", subopModule);
+   return true;
+}
+
+static void executeFromSubOpLayer(mlir::ModuleOp subopModule,
+                                  lingodb::runtime::ExecutionContext* executionContext) {
+   using namespace lingodb::compiler::dialect;
+
+   if (!lowerFromSubOpLayer(subopModule)) {
+      subopModule.dump();
+      assert(0 && "lowerFromSubOpLayer failed (dumped module above)");
    }
 
    // Execute using default LLVM backend and print result.
@@ -412,6 +451,28 @@ int main(int argc, char** argv) {
    llvm::outs() << "\n// reuse_targets: query[0]=" << rewriteRes.numTargetsQuery0
                   << " query[1]=" << rewriteRes.numTargetsQuery1 << "\n";
    llvm::outs() << "\n// reuse_targets_q0_mapped: " << rewriteRes.numTargetsQuery0Mapped << "\n";
+
+   const char* dumpSubOpDir = std::getenv("LINGODB_DUMP_SUBOP_DIR");
+   const bool dumpLowering = envFlagEnabled("LINGODB_DUMP_LOWERING");
+   if (dumpLowering && dumpSubOpDir) {
+      auto dumpScenario = [&](mlir::ModuleOp mod, const llvm::Twine& outDir, llvm::StringRef scenarioName) {
+         const std::string dir = outDir.str();
+         llvm::sys::fs::create_directories(dir);
+         dumpModuleToFile(mod, dir + "/consumer-subop.mlir");
+         mlir::OwningOpRef<mlir::ModuleOp> clone = mlir::cast<mlir::ModuleOp>(mod->clone());
+         const bool ok = lowerFromSubOpLayer(*clone, dir.c_str(), /*snapshotLabel=*/{});
+         llvm::errs() << "[dump] " << scenarioName << " lowerDB " << (ok ? "OK" : "FAILED") << "\n";
+         return ok;
+      };
+
+      const std::string base(dumpSubOpDir);
+      dumpScenario(runs[0].module, base + "/rewrite-query0-test.sql", "rewrite-query0-test.sql");
+      dumpScenario(runs[1].module, base + "/rewrite-query1-test2.sql", "rewrite-query1-test2.sql");
+   } else if (dumpSubOpDir) {
+      llvm::sys::fs::create_directories(dumpSubOpDir);
+      dumpModuleToFile(runs[0].module, llvm::Twine(dumpSubOpDir) + "/rewrite-query0-test.sql/consumer-subop.mlir");
+      dumpModuleToFile(runs[1].module, llvm::Twine(dumpSubOpDir) + "/rewrite-query1-test2.sql/consumer-subop.mlir");
+   }
 
    // Optional heavy debug printing (can be huge / sometimes crashes when IR is malformed).
    // Enable via env var: LINGODB_REUSE_PRINT_REWRITTEN=1
