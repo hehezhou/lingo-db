@@ -718,7 +718,9 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       return res;
    }
 
-   extendSyntheticJoinBuffersToColumnUnion(*res.query0, query0, query1, matches, targetsQ0, mapping);
+   CachedJoinBufferLayoutsByKey producerLayoutsByKey;
+   extendSyntheticJoinBuffersToColumnUnion(*res.query0, query0, query1, matches, targetsQ0, mapping,
+                                           &producerLayoutsByKey);
 
    // Producer: cache_puts (cloned synthetic IR — needs its own reuse snapshot).
    {
@@ -737,6 +739,17 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    propagateSubOpColumnAttrsFromSsaStateLayout(query0, nullptr);
    propagateSubOpColumnAttrsFromSsaStateLayout(query1, nullptr);
    propagateSubOpColumnAttrsFromSsaStateLayout(*res.query0, nullptr);
+
+   for (auto& t : targets0) {
+      if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
+         alignConsumerModulesToCachedJoinLayout(query0, it->second, t.cacheKey);
+      }
+   }
+   for (auto& t : targets1) {
+      if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
+         alignConsumerModulesToCachedJoinLayout(query1, it->second, t.cacheKey);
+      }
+   }
 
    return res;
 }

@@ -53,6 +53,27 @@ class MemberManager {
       members[uniqueName] = member;
       return member.get();
    }
+   /// Like \c createMemberDirect but updates stored type when \p allowTypeUpdate and an existing
+   /// member name has a different type (used when aligning consumers to a shared cache layout).
+   Member getOrCreateMemberDirect(std::string name, mlir::Type type, bool allowTypeUpdate = false) {
+      if (auto it = members.find(name); it != members.end()) {
+         if (it->second->type == type) return it->second.get();
+         if (allowTypeUpdate) {
+            it->second->type = type;
+            return it->second.get();
+         }
+         assert(false && "Member type mismatch");
+         return nullptr;
+      }
+      auto member = std::make_shared<internal::MemberInternal>(name, type);
+      members[name] = member;
+      if (name.find("$") != std::string::npos) {
+         auto baseName = name.substr(0, name.find("$"));
+         size_t id = std::stoi(name.substr(name.find("$") + 1));
+         counts[baseName] = std::max(counts[baseName], id + 1);
+      }
+      return member.get();
+   }
    Member createMemberDirect(std::string name, mlir::Type type) {
       if (members.contains(name)) {
          assert(type == members[name]->type && "Member type mismatch");

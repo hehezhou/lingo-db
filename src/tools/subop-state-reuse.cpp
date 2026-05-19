@@ -466,12 +466,21 @@ int main(int argc, char** argv) {
       };
 
       const std::string base(dumpSubOpDir);
+      if (rewriteRes.query0 && rewriteRes.numTargetsQuery0Mapped > 0) {
+         dumpScenario(*rewriteRes.query0, base + "/rewrite-synthetic-query0", "rewrite-synthetic-query0");
+      }
       dumpScenario(runs[0].module, base + "/rewrite-query0-test.sql", "rewrite-query0-test.sql");
       dumpScenario(runs[1].module, base + "/rewrite-query1-test2.sql", "rewrite-query1-test2.sql");
    } else if (dumpSubOpDir) {
-      llvm::sys::fs::create_directories(dumpSubOpDir);
-      dumpModuleToFile(runs[0].module, llvm::Twine(dumpSubOpDir) + "/rewrite-query0-test.sql/consumer-subop.mlir");
-      dumpModuleToFile(runs[1].module, llvm::Twine(dumpSubOpDir) + "/rewrite-query1-test2.sql/consumer-subop.mlir");
+      const std::string base(dumpSubOpDir);
+      if (rewriteRes.query0 && rewriteRes.numTargetsQuery0Mapped > 0) {
+         llvm::sys::fs::create_directories(base + "/rewrite-synthetic-query0");
+         dumpModuleToFile(*rewriteRes.query0, base + "/rewrite-synthetic-query0/consumer-subop.mlir");
+      }
+      llvm::sys::fs::create_directories(base + "/rewrite-query0-test.sql");
+      llvm::sys::fs::create_directories(base + "/rewrite-query1-test2.sql");
+      dumpModuleToFile(runs[0].module, base + "/rewrite-query0-test.sql/consumer-subop.mlir");
+      dumpModuleToFile(runs[1].module, base + "/rewrite-query1-test2.sql/consumer-subop.mlir");
    }
 
    // Optional heavy debug printing (can be huge / sometimes crashes when IR is malformed).
