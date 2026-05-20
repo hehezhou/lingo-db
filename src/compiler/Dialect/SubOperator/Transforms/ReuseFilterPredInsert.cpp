@@ -10,6 +10,7 @@
 #include "lingodb/compiler/Dialect/TupleStream/TupleStreamDialect.h"
 #include "lingodb/compiler/Dialect/DB/IR/DBOps.h"
 #include "lingodb/runtime/ExternalDataSourceProperty.h"
+#include "lingodb/utility/Serialization.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/DenseSet.h"
@@ -953,8 +954,109 @@ void rewriteHashmapTypesInModule(mlir::ModuleOp module,
    alignBufferMergeThreadLocalsWithExtendedMergeResult(module);
 }
 
+static llvm::SmallVector<runtime::FilterDescription, 8>
+decodeExternalFiltersForTableState(mlir::Value tableState) {
+   for (int i = 0; i < 8; ++i) {
+      tableState = peelBlockArgsToEnclosingOperands(tableState);
+      if (auto ge = mlir::dyn_cast<subop::GetExternalOp>(tableState.getDefiningOp())) {
+         auto ds = lingodb::utility::deserializeFromHexString<runtime::ExternalDatasourceProperty>(ge.getDescr());
+         return llvm::SmallVector<runtime::FilterDescription, 8>(ds.filterDescriptions.begin(),
+                                                                 ds.filterDescriptions.end());
+      }
+      if (auto prevStep = mlir::dyn_cast<ExecutionStepOp>(tableState.getDefiningOp())) {
+         for (mlir::Operation& op : prevStep.getSubOps().front().without_terminator()) {
+            if (auto ge = mlir::dyn_cast<subop::GetExternalOp>(&op)) {
+               auto ds = lingodb::utility::deserializeFromHexString<runtime::ExternalDatasourceProperty>(ge.getDescr());
+               return llvm::SmallVector<runtime::FilterDescription, 8>(ds.filterDescriptions.begin(),
+                                                                       ds.filterDescriptions.end());
+            }
+         }
+      }
+   }
+   return {};
+}
+
+/// Decode pushdown filters from the external table descriptor on the `scan_refs` in this step.
+static llvm::SmallVector<runtime::FilterDescription, 8>
+decodeFiltersFromTableScanInExecutionStep(ExecutionStepOp step) {
+   mlir::Block& body = step.getSubOps().front();
+   subop::ScanRefsOp scanOp;
+   for (mlir::Operation& op : body.without_terminator()) {
+      auto s = mlir::dyn_cast<subop::ScanRefsOp>(&op);
+      if (!s) continue;
+      if (mlir::isa<subop::TableType>(s.getState().getType())) {
+         scanOp = s;
+         break;
+      }
+   }
+   if (!scanOp) return {};
+
+   mlir::Value tableState = scanOp.getState();
+   if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(tableState)) {
+      if (ba.getOwner() == &body) {
+         auto inputs = step.getInputs();
+         assert(static_cast<unsigned>(ba.getArgNumber()) < inputs.size());
+         tableState = inputs[ba.getArgNumber()];
+      }
+   }
+   return decodeExternalFiltersForTableState(tableState);
+}
+
+// Emit one filter predicate (i1). Types aligned with runtime Restrictions::create (table scan).
+static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Location loc,
+                                                   subop::MapCreationHelper& helper,
+                                                   tuples::ColumnRefAttr colRef,
+                                                   const runtime::FilterDescription& f) {
+   if (f.op == runtime::FilterOp::IN) {
+      assert(false && "runtime filter IR: FilterOp::IN not supported yet");
+   }
+   mlir::Value colV = helper.access(colRef, loc);
+   if (f.op == runtime::FilterOp::NOTNULL) {
+      return rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+   }
+   if (std::holds_alternative<int64_t>(f.value)) {
+      int64_t v = std::get<int64_t>(f.value);
+      auto itTy = mlir::dyn_cast<mlir::IntegerType>(colV.getType());
+      assert(itTy && "runtime filter IR: int64 literal requires integer column type");
+      mlir::Value c = rb.create<mlir::arith::ConstantIntOp>(loc, v, itTy.getWidth());
+      using P = mlir::arith::CmpIPredicate;
+      P p;
+      switch (f.op) {
+         case runtime::FilterOp::EQ: p = P::eq; break;
+         case runtime::FilterOp::NEQ: p = P::ne; break;
+         case runtime::FilterOp::LT: p = P::slt; break;
+         case runtime::FilterOp::LTE: p = P::sle; break;
+         case runtime::FilterOp::GT: p = P::sgt; break;
+         case runtime::FilterOp::GTE: p = P::sge; break;
+         default: assert(false && "runtime filter IR: unsupported filter op");
+      }
+      return rb.create<mlir::arith::CmpIOp>(loc, p, colV, c);
+   }
+   if (std::holds_alternative<std::string>(f.value)) {
+      auto s = std::get<std::string>(f.value);
+      assert((mlir::isa<lingodb::compiler::dialect::db::DateType>(colV.getType()) ||
+              mlir::isa<lingodb::compiler::dialect::db::CharType>(colV.getType())) &&
+             "runtime filter IR: string literal only supported for db.date/db.char");
+      auto rhs = rb.create<lingodb::compiler::dialect::db::ConstantOp>(loc, colV.getType(), rb.getStringAttr(s));
+      using P = lingodb::compiler::dialect::db::DBCmpPredicate;
+      P p;
+      switch (f.op) {
+         case runtime::FilterOp::EQ: p = P::eq; break;
+         case runtime::FilterOp::NEQ: p = P::neq; break;
+         case runtime::FilterOp::LT: p = P::lt; break;
+         case runtime::FilterOp::LTE: p = P::lte; break;
+         case runtime::FilterOp::GT: p = P::gt; break;
+         case runtime::FilterOp::GTE: p = P::gte; break;
+         default: assert(false && "runtime filter IR: unsupported filter op");
+      }
+      auto cmp = rb.create<lingodb::compiler::dialect::db::CmpOp>(loc, p, colV, rhs);
+      return rb.create<lingodb::compiler::dialect::db::DeriveTruth>(loc, cmp);
+   }
+   assert(false && "runtime filter IR: unsupported filter literal type (expected int64 or string)");
+   return {};
+}
+
 // Convert runtime filter descriptions into MLIR subop.map + subop.filter.
-// For now: only integer column + int64 constant comparisons. Everything else asserts.
 mlir::Value materializeRuntimeFiltersAsSubopFilter(mlir::OpBuilder& b,
                                                           mlir::Location loc,
                                                           mlir::Value stream,
@@ -977,30 +1079,7 @@ mlir::Value materializeRuntimeFiltersAsSubopFilter(mlir::OpBuilder& b,
       for (auto& f : filters) {
          auto it = colByName.find(f.columnName);
          assert(it != colByName.end() && "delay_filter: missing filter column in gathered columns");
-         mlir::Value colV = helper.access(it->second, loc);
-
-         mlir::Value pred;
-         if (f.op == runtime::FilterOp::NOTNULL) {
-            pred = rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
-         } else {
-            assert(std::holds_alternative<int64_t>(f.value) && "delay_filter: only int64 filter values supported");
-            int64_t v = std::get<int64_t>(f.value);
-            auto itTy = mlir::dyn_cast<mlir::IntegerType>(colV.getType());
-            assert(itTy && "delay_filter: only integer-typed columns supported");
-            mlir::Value c = rb.create<mlir::arith::ConstantIntOp>(loc, v, itTy.getWidth());
-            using P = mlir::arith::CmpIPredicate;
-            P p;
-            switch (f.op) {
-               case runtime::FilterOp::EQ: p = P::eq; break;
-               case runtime::FilterOp::NEQ: p = P::ne; break;
-               case runtime::FilterOp::LT: p = P::slt; break;
-               case runtime::FilterOp::LTE: p = P::sle; break;
-               case runtime::FilterOp::GT: p = P::sgt; break;
-               case runtime::FilterOp::GTE: p = P::sge; break;
-               default: assert(0 && "delay_filter: unsupported filter op");
-            }
-            pred = rb.create<mlir::arith::CmpIOp>(loc, p, colV, c);
-         }
+         mlir::Value pred = emitRuntimeFilterPredicateValue(rb, loc, helper, it->second, f);
          acc = acc ? rb.create<mlir::arith::AndIOp>(loc, acc, pred) : pred;
       }
       rb.create<tuples::ReturnOp>(loc, mlir::ValueRange{acc});
@@ -1042,55 +1121,7 @@ materializeRuntimeFiltersAsPredicateColumn(mlir::OpBuilder& b,
       for (auto& f : filters) {
          auto it = colByName.find(f.columnName);
          assert(it != colByName.end() && "delay_filter_pred: missing filter column in gathered columns");
-         mlir::Value colV = helper.access(it->second, loc);
-
-         mlir::Value pred;
-         if (f.op == runtime::FilterOp::NOTNULL) {
-            pred = rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
-         } else {
-            // Minimal support for TPCH Q1: date column compared to string literal.
-            if (std::holds_alternative<int64_t>(f.value)) {
-               int64_t v = std::get<int64_t>(f.value);
-               auto itTy = mlir::dyn_cast<mlir::IntegerType>(colV.getType());
-               assert(itTy && "delay_filter_pred: only integer-typed columns supported");
-               mlir::Value c = rb.create<mlir::arith::ConstantIntOp>(loc, v, itTy.getWidth());
-               using P = mlir::arith::CmpIPredicate;
-               P p;
-               switch (f.op) {
-                  case runtime::FilterOp::EQ: p = P::eq; break;
-                  case runtime::FilterOp::NEQ: p = P::ne; break;
-                  case runtime::FilterOp::LT: p = P::slt; break;
-                  case runtime::FilterOp::LTE: p = P::sle; break;
-                  case runtime::FilterOp::GT: p = P::sgt; break;
-                  case runtime::FilterOp::GTE: p = P::sge; break;
-                  default: assert(0 && "delay_filter_pred: unsupported filter op");
-               }
-               pred = rb.create<mlir::arith::CmpIOp>(loc, p, colV, c);
-            } else if (std::holds_alternative<std::string>(f.value)) {
-               auto s = std::get<std::string>(f.value);
-               assert((mlir::isa<lingodb::compiler::dialect::db::DateType>(colV.getType()) ||
-                       mlir::isa<lingodb::compiler::dialect::db::CharType>(colV.getType())) &&
-                      "delay_filter_pred: string literal filters only supported for db.date/db.char");
-               auto rhs = rb.create<lingodb::compiler::dialect::db::ConstantOp>(
-                  loc, colV.getType(), rb.getStringAttr(s));
-               using P = lingodb::compiler::dialect::db::DBCmpPredicate;
-               P p;
-               switch (f.op) {
-                  case runtime::FilterOp::EQ: p = P::eq; break;
-                  case runtime::FilterOp::NEQ: p = P::neq; break;
-                  case runtime::FilterOp::LT: p = P::lt; break;
-                  case runtime::FilterOp::LTE: p = P::lte; break;
-                  case runtime::FilterOp::GT: p = P::gt; break;
-                  case runtime::FilterOp::GTE: p = P::gte; break;
-                  default: assert(0 && "delay_filter_pred: unsupported filter op");
-               }
-               auto cmp = rb.create<lingodb::compiler::dialect::db::CmpOp>(loc, p, colV, rhs);
-               // cmp may be nullable depending on operands; `derive_truth` normalizes to i1.
-               pred = rb.create<lingodb::compiler::dialect::db::DeriveTruth>(loc, cmp);
-            } else {
-               assert(0 && "delay_filter_pred: unsupported filter literal type");
-            }
-         }
+         mlir::Value pred = emitRuntimeFilterPredicateValue(rb, loc, helper, it->second, f);
          acc = acc ? rb.create<mlir::arith::AndIOp>(loc, acc, pred) : pred;
       }
       rb.create<tuples::ReturnOp>(loc, mlir::ValueRange{acc});
@@ -1145,8 +1176,9 @@ llvm::SmallVector<runtime::FilterDescription, 8> decodeFiltersForStateFromWriter
          mlir::Value tableV = r;
          if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(r)) {
             if (ba.getOwner() == &ws.getSubOps().front()) {
-               assert(static_cast<unsigned>(ba.getArgNumber()) < ws.getNumOperands());
-               tableV = ws.getOperand(ba.getArgNumber());
+               auto inputs = ws.getInputs();
+               assert(static_cast<unsigned>(ba.getArgNumber()) < inputs.size());
+               tableV = inputs[ba.getArgNumber()];
             }
          }
          mlir::Value key = canonicalizeStateValueForReuse(tableV);
@@ -1518,21 +1550,6 @@ void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
       firstGather = g2;
    }
 
-   mlir::OpBuilder pb(firstGather);
-   pb.setInsertionPointAfter(firstGather);
-   auto [predStream, predDef] =
-      materializeRuntimeFiltersAsPredicateColumn(pb, firstGather.getLoc(), firstGather.getRes(), colByName, filters, "filter_pred");
-
-   mlir::Value oldS = firstGather.getRes();
-   oldS.replaceUsesWithIf(predStream, [&](mlir::OpOperand& ou) {
-      if (ou.getOwner() == predStream.getDefiningOp()) return false;
-      if (ou.getOwner()->getBlock() != &body) return false;
-      return firstGather->isBeforeInBlock(ou.getOwner());
-   });
-
-   // Materialize may target either `!subop.buffer<...>` or `!subop.thread_local<!subop.buffer<...>>`
-   // (parallel / align passes sometimes thread_local-wrap the state SSA). The layout with
-   // `filter_pred$0` lives on the inner buffer type in both cases.
    subop::MaterializeOp matOp;
    step.getOperation()->walk([&](subop::MaterializeOp m) {
       subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(m.getState().getType());
@@ -1543,6 +1560,20 @@ void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
       return mlir::WalkResult::interrupt();
    });
    assert(matOp && "write_pred_buf: expected materialize into join buffer with filter_pred$0");
+
+   mlir::Value feedForPred = matOp.getStream();
+   while (mlir::Operation* def = feedForPred.getDefiningOp()) {
+      auto mapOp = mlir::dyn_cast<subop::MapOp>(def);
+      if (!mapOp || mapOp.getComputedCols().size() != 1) break;
+      auto defAttr = mlir::cast<tuples::ColumnDefAttr>(mapOp.getComputedCols()[0]);
+      if (!mlir::isa<mlir::IntegerType>(defAttr.getColumn().type)) break;
+      feedForPred = mapOp.getStream();
+   }
+
+   mlir::OpBuilder pb(matOp);
+   pb.setInsertionPointAfter(feedForPred.getDefiningOp());
+   auto [predStream, predDef] = materializeRuntimeFiltersAsPredicateColumn(
+      pb, matOp.getLoc(), feedForPred, colByName, filters, "filter_pred");
 
    subop::Member predMember;
    {
@@ -1559,16 +1590,17 @@ void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
 
    tuples::ColumnRefAttr predColRef = cm.createRef(&predDef.getColumn());
    llvm::SmallVector<subop::RefMappingPairT> pairs;
-   for (auto& pr : matOp.getMapping().getMapping()) pairs.push_back(pr);
+   for (auto& pr : matOp.getMapping().getMapping()) {
+      if (pr.first != predMember) pairs.push_back(pr);
+   }
    pairs.push_back({predMember, predColRef});
    matOp.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(step.getContext(), pairs));
+   matOp->setOperand(0, predStream);
 }
 
-/// `rewriteHashmapTypesInModule` can extend join buffers with `filter_pred$0` on the type before any
-/// writer fills that member (e.g. no decoded table filters for that buffer, or predicate lowering did
-/// not attach to this `materialize`). Uninitialized bits make downstream `filter(all_true ...)` drop
-/// all rows. When the buffer layout includes `filter_pred$0` but the `materialize` mapping does not,
-/// append a constant-true predicate column and map it into `filter_pred$0`.
+/// `rewriteHashmapTypesInModule` can extend join buffers with `filter_pred$0` before the writer maps it.
+/// Recompute predicates from the table scan's external descriptor (same filters as table-scan runtime)
+/// and materialize them into `filter_pred$0`. Steps with no pushdown filters get constant-true.
 void ensureJoinBufferFilterPredMaterializeMappings(mlir::ModuleOp module) {
    auto* ctx = module.getContext();
    auto* subDialect = ctx->getLoadedDialect<subop::SubOperatorDialect>();
@@ -1576,11 +1608,18 @@ void ensureJoinBufferFilterPredMaterializeMappings(mlir::ModuleOp module) {
    if (!subDialect || !tupleDialect) return;
    auto& mm = subDialect->getMemberManager();
    auto& cm = tupleDialect->getColumnManager();
+   ModuleReuseInfo reuse = collectModuleReuseInfo(module);
 
-   llvm::SmallVector<subop::MaterializeOp, 16> todo;
-   module.walk([&](subop::MaterializeOp m) {
+   auto isPlaceholderPredColumn = [&](tuples::ColumnRefAttr ref) -> bool {
+      auto [scope, leaf] = cm.getName(&ref.getColumn());
+      (void)leaf;
+      llvm::StringRef sc(scope);
+      return sc.contains("jp_default_pred") || sc.contains("jp_no_table_filter");
+   };
+
+   auto materializeNeedsPredMapping = [&](subop::MaterializeOp m) -> bool {
       subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(m.getState().getType());
-      if (!bufTy) return mlir::WalkResult::advance();
+      if (!bufTy) return false;
       subop::Member predM;
       for (auto mem : bufTy.getMembers().getMembers()) {
          if (mm.getName(mem) == "filter_pred$0") {
@@ -1588,18 +1627,91 @@ void ensureJoinBufferFilterPredMaterializeMappings(mlir::ModuleOp module) {
             break;
          }
       }
-      if (!predM) return mlir::WalkResult::advance();
+      if (!predM) return false;
       for (auto& pr : m.getMapping().getMapping()) {
-         if (pr.first == predM) return mlir::WalkResult::advance();
+         if (pr.first != predM) continue;
+         if (isPlaceholderPredColumn(pr.second)) return true;
+         return false;
       }
-      todo.push_back(m);
+      return true;
+   };
+
+   auto stripPlaceholderPredFromMaterialize = [&](subop::MaterializeOp m, subop::Member predM) {
+      if (auto mapOp = mlir::dyn_cast<subop::MapOp>(m.getStream().getDefiningOp())) {
+         bool placeholder = false;
+         for (auto colAttr : mapOp.getComputedCols()) {
+            auto def = mlir::cast<tuples::ColumnDefAttr>(colAttr);
+            auto [scope, leaf] = cm.getName(&def.getColumn());
+            (void)leaf;
+            if (llvm::StringRef(scope).contains("jp_default_pred") ||
+                llvm::StringRef(scope).contains("jp_no_table_filter")) {
+               placeholder = true;
+               break;
+            }
+         }
+         if (placeholder) {
+            m->setOperand(0, mapOp.getStream());
+            mapOp.erase();
+         }
+      }
+      llvm::SmallVector<subop::RefMappingPairT> pairs;
+      for (auto pr : m.getMapping().getMapping()) {
+         if (pr.first != predM) pairs.push_back(pr);
+      }
+      m.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, pairs));
+   };
+
+   llvm::SmallVector<subop::MaterializeOp, 16> todo;
+   module.walk([&](subop::MaterializeOp m) {
+      if (materializeNeedsPredMapping(m)) todo.push_back(m);
       return mlir::WalkResult::advance();
    });
 
+   llvm::DenseSet<mlir::Operation*> stepsWithTableFilters;
    for (subop::MaterializeOp m : todo) {
+      auto step = m->getParentOfType<ExecutionStepOp>();
+      if (!step) continue;
+
+      llvm::SmallVector<runtime::FilterDescription, 8> filters =
+         decodeFiltersFromTableScanInExecutionStep(step);
+      if (filters.empty()) filters = decodeFiltersForStateFromWriterSteps(m.getState(), reuse);
+      if (filters.empty()) continue;
+
+      if (!stepsWithTableFilters.insert(step.getOperation()).second) {
+         // Upgrade placeholder pred maps from an earlier ensureJoinBuffer pass.
+         subop::Member predM;
+         if (subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(m.getState().getType())) {
+            for (auto mem : bufTy.getMembers().getMembers()) {
+               if (mm.getName(mem) == "filter_pred$0") {
+                  predM = mem;
+                  break;
+               }
+            }
+         }
+         if (predM) stripPlaceholderPredFromMaterialize(m, predM);
+         insertWriteSidePredIntoBufferConstructionStep(step, filters);
+         continue;
+      }
+
+      subop::Member predM;
+      if (subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(m.getState().getType())) {
+         for (auto mem : bufTy.getMembers().getMembers()) {
+            if (mm.getName(mem) == "filter_pred$0") {
+               predM = mem;
+               break;
+            }
+         }
+      }
+      if (predM) stripPlaceholderPredFromMaterialize(m, predM);
+      insertWriteSidePredIntoBufferConstructionStep(step, filters);
+   }
+
+   for (subop::MaterializeOp m : todo) {
+      if (!materializeNeedsPredMapping(m)) continue;
+
       mlir::OpBuilder pb(m);
       mlir::Location loc = m.getLoc();
-      std::string sc = cm.getUniqueScope("jp_default_pred");
+      std::string sc = cm.getUniqueScope("jp_no_table_filter");
       tuples::ColumnDefAttr def = cm.createDef(sc, "t");
       def.getColumn().type = mlir::IntegerType::get(ctx, 1);
       tuples::ColumnRefAttr predRef = cm.createRef(&def.getColumn());
@@ -1715,6 +1827,18 @@ void insertScanRefsPredFilter(ExecutionStepOp step, subop::Member predMember) {
    });
 }
 
+static bool gatherStreamAlreadyPredFiltered(subop::GatherOp gatherOp) {
+   for (mlir::OpOperand& use : gatherOp.getRes().getUses()) {
+      if (auto filterOp = mlir::dyn_cast<subop::FilterOp>(use.getOwner())) {
+         if (filterOp.getStream() == gatherOp.getRes() &&
+             filterOp.getFilterSemantic() == subop::FilterSemantic::all_true) {
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
 /// After `lookup` / `scan_list` on `!subop.hash_indexed_view<...>` with `filter_pred$0`, re-check the stored bool.
 void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member predMember) {
    auto* ctx = step.getContext();
@@ -1730,15 +1854,17 @@ void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member 
       auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(refTy.getState());
       if (!hiv) continue;
       if (!valueMembersContainMemberNamed(ctx, hiv.getValueMembers(), "filter_pred$0")) continue;
+      if (gatherStreamAlreadyPredFiltered(gatherOp)) continue;
 
+      tuples::ColumnRefAttr predRef;
       bool hasPred = false;
       for (auto& p : gatherOp.getMapping().getMapping()) {
          if (p.first == predMember) {
             hasPred = true;
+            predRef = cm.createRef(&p.second.getColumn());
             break;
          }
       }
-      tuples::ColumnRefAttr predRef;
       if (!hasPred) {
          llvm::StringRef scope = "pred_filter";
          if (!gatherOp.getMapping().getMapping().empty()) {
@@ -1754,21 +1880,9 @@ void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member 
          llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> mappingPairs;
          for (auto& p : gatherOp.getMapping().getMapping()) mappingPairs.push_back({p.first, p.second});
          mappingPairs.push_back({predMember, predDef});
-
-         mlir::OpBuilder gb(gatherOp);
-         gb.setInsertionPointAfter(gatherOp);
-         auto newMapping = subop::ColumnDefMemberMappingAttr::get(gatherOp.getContext(), mappingPairs);
-         auto g2 = gb.create<subop::GatherOp>(gatherOp.getLoc(), gatherOp.getRes(), gatherOp.getRef(), newMapping);
-         gatherOp = g2;
-      } else {
-         for (auto& p : gatherOp.getMapping().getMapping()) {
-            if (p.first == predMember) {
-               predRef = cm.createRef(&p.second.getColumn());
-               break;
-            }
-         }
-         assert(predRef);
+         gatherOp.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, mappingPairs));
       }
+      assert(predRef && "probe pred: missing filter_pred column ref");
 
       mlir::OpBuilder fb(gatherOp);
       fb.setInsertionPointAfter(gatherOp);
@@ -1781,10 +1895,45 @@ void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member 
       orig.replaceUsesWithIf(filtered, [&](mlir::OpOperand& ou) {
          mlir::Operation* owner = ou.getOwner();
          if (owner == filtered.getDefiningOp()) return false;
+         if (owner == gatherOp.getOperation()) return false;
          if (owner->getBlock() != gatherBlock) return false;
          return gatherOp->isBeforeInBlock(owner);
       });
    }
+}
+
+/// Point probe-side `gather` entry refs at the `cache_get` HIV layout (with `filter_pred$0`).
+static void syncProbeGatherRefsToCachedHivLayouts(mlir::ModuleOp module) {
+   auto* ctx = module.getContext();
+   llvm::SmallVector<subop::HashIndexedViewType, 8> cachedHivs;
+   module.walk([&](subop::CacheGetOp get) {
+      auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
+      if (!hiv) return;
+      if (!valueMembersContainMemberNamed(ctx, hiv.getValueMembers(), "filter_pred$0")) return;
+      cachedHivs.push_back(hiv);
+   });
+   if (cachedHivs.empty()) return;
+
+   module.walk([&](subop::GatherOp gather) {
+      auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(gather.getRef().getColumn().type);
+      if (!ler) return;
+      auto oldHiv = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState());
+      if (!oldHiv) return;
+      for (subop::HashIndexedViewType cached : cachedHivs) {
+         if (oldHiv.getKeyMembers() != cached.getKeyMembers()) continue;
+         if (oldHiv.getCompareHashForLookup() != cached.getCompareHashForLookup()) continue;
+         auto expected = subop::LookupEntryRefType::get(ctx, cached);
+         if (gather.getRef().getColumn().type != expected) gather.getRef().getColumn().type = expected;
+         break;
+      }
+   });
+}
+
+void applyJoinBufferProbePredFiltersAfterLayout(mlir::ModuleOp module) {
+   if (!kEnableReuseStateFilterPredReapply) return;
+   syncProbeGatherRefsToCachedHivLayouts(module);
+   subop::Member predMember = makeOrGetPredMember(module.getContext());
+   module.walk([&](subop::ExecutionStepOp step) { insertHashIndexedViewGatherPredFilters(step, predMember); });
 }
 
 /// Forward walk (uses + `merge` + `execution_step` region args) until we see `subop.create_hash_indexed_view`

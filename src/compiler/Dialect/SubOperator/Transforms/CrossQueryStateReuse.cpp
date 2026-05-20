@@ -312,19 +312,13 @@ void applyFilterPredReapplyAfterCacheGetReplacement(
       }
    }
 
-   // Join-buffer `filter_pred$0` can be present on the HIV layout even when there are no
-   // external-table filters to decode (`decodedFilters` empty). Synthetic producers always run
-   // `insertHashIndexedViewGatherPredFilters` in that case; consumers must match or probe-side
-   // gathers leave predicate bits uninitialized and downstream `filter(all_true ...)` drops all rows.
-   if (isJoinBuf || isJoinHiv) {
-      if (joinBufPredProbeInjectedGroups.insert(group.getOperation()).second) {
-         for (mlir::Operation& op : group.getSubOps().front()) {
-            if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(&op)) {
-               insertHashIndexedViewGatherPredFilters(step, predMember);
-            }
-         }
-      }
-   }
+   // HIV probe `filter_pred` filters are inserted after layout propagation via
+   // `applyJoinBufferProbePredFiltersAfterLayout` (see `injectCacheGetsAndDeleteConstructionSteps`
+   // and `rewritePlansWithSyntheticQuery0`).
+   (void)isJoinBuf;
+   (void)isJoinHiv;
+   (void)joinBufPredProbeInjectedGroups;
+   (void)predMember;
 }
 
 struct DonorJoinBufferFilterPredPrep {
@@ -495,7 +489,6 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
    };
 
    llvm::DenseMap<uint64_t, mlir::Value> keyToCached;
-   llvm::DenseSet<mlir::Operation*> joinBufPredProbeInjectedGroups;
 
    auto rwByStepOp = buildRwByStepOpMap(reuse);
 
@@ -528,11 +521,6 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
       mlir::Value c = canonicalizeStateValueForReuse(rv);
       if (!liveFromReturnReuseOnly.contains(c.getAsOpaquePointer()))
          obsoleteStateCanonPtrs.insert(c.getAsOpaquePointer());
-   }
-
-   subop::Member predMember;
-   if (kEnableReuseStateFilterPredReapply) {
-      predMember = makeOrGetPredMember(consumerModule.getContext());
    }
 
    auto rewriteOne = [&](mlir::Value state, uint64_t cacheKey) {
@@ -577,6 +565,11 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
 
       state.replaceAllUsesWith(cached);
 
+      subop::Member predMember;
+      if (kEnableReuseStateFilterPredReapply) {
+         predMember = makeOrGetPredMember(consumerModule.getContext());
+      }
+      llvm::DenseSet<mlir::Operation*> joinBufPredProbeInjectedGroups;
       applyFilterPredReapplyAfterCacheGetReplacement(state, cached, decodedFilters, group, predMember,
                                                      joinBufPredProbeInjectedGroups);
    };
@@ -694,6 +687,14 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
 
    auto mapping = cloneExecutionStepsToQuery0(q0Group, stepsToClone);
 
+   // Cloned synthetic IR still needs join-buffer / HIV `filter_pred$0` layout (applied on donor only
+   // before clone).
+   if (donorFilterPredPrep.layoutApplied && !donorFilterPredPrep.extendBufStates.empty()) {
+      auto reuseSynthetic = collectModuleReuseInfo(*res.query0);
+      rewriteHashmapTypesInModule(*res.query0, donorFilterPredPrep.extendBufStates, &reuseSynthetic);
+      maybeFinalizeModuleAfterJoinBufferFilterPredLayout(*res.query0);
+   }
+
    // Map targets into query0.
    llvm::SmallVector<CacheTarget, 64> targetsQ0;
    targetsQ0.reserve(targets0.size());
@@ -718,17 +719,25 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       return res;
    }
 
+   // Write-side predicate materialization on the synthetic producer (scan → map filter_pred → buffer).
+   {
+      auto reuseSynthetic = collectModuleReuseInfo(*res.query0);
+      auto decodedSynthFilters = maybeDecodeFiltersByCacheTargets(targetsQ0, reuseSynthetic);
+      maybePatchJoinBufferWritersWithFilterPred(targetsQ0, decodedSynthFilters, reuseSynthetic);
+      maybeEnsureJoinBufferFilterPredMaterializeMappings(*res.query0);
+   }
+
    CachedJoinBufferLayoutsByKey producerLayoutsByKey;
    extendSyntheticJoinBuffersToColumnUnion(*res.query0, query0, query1, matches, targetsQ0, mapping,
                                            &producerLayoutsByKey);
+   maybeEnsureJoinBufferFilterPredMaterializeMappings(*res.query0);
 
    // Producer: cache_puts (cloned synthetic IR — needs its own reuse snapshot).
    {
       auto reuseSynthetic = collectModuleReuseInfo(*res.query0);
       insertCachePutsForTargets(*res.query0, targetsQ0, &reuseSynthetic);
+      refreshCachedJoinLayoutsFromSyntheticCachePuts(*res.query0, targetsQ0, producerLayoutsByKey);
    }
-
-   maybeApplySyntheticProducerFilterPredGatherSteps(*res.query0, donorFilterPredPrep.extendBufStates);
 
    injectCacheGetsAndDeleteConstructionSteps(query0, targets0, &reuse0, donorFilterPredPrep.layoutApplied,
                                            donorFilterPredPrep.writePredApplied);
@@ -749,6 +758,12 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
          alignConsumerModulesToCachedJoinLayout(query1, it->second, t.cacheKey);
       }
+   }
+
+   if (kEnableReuseStateFilterPredReapply) {
+      applyJoinBufferProbePredFiltersAfterLayout(query0);
+      applyJoinBufferProbePredFiltersAfterLayout(query1);
+      if (res.query0) applyJoinBufferProbePredFiltersAfterLayout(*res.query0);
    }
 
    return res;

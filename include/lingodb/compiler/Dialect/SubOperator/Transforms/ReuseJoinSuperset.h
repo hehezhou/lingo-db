@@ -37,6 +37,12 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
 void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const CachedJoinBufferLayout& layout,
                                             std::optional<uint64_t> cacheKey = std::nullopt);
 
+/// After \c insertCachePutsForTargets on the synthetic module, re-record layouts from \c cache_put
+/// state types (includes `filter_pred$0` when join-buffer pred reuse is enabled).
+void refreshCachedJoinLayoutsFromSyntheticCachePuts(mlir::ModuleOp synthetic,
+                                                    llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+                                                    CachedJoinBufferLayoutsByKey& layoutsByKey);
+
 } // namespace lingodb::compiler::dialect::subop
 
 #endif

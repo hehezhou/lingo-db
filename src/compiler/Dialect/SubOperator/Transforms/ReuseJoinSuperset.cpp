@@ -1391,4 +1391,25 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
    }
 }
 
+void refreshCachedJoinLayoutsFromSyntheticCachePuts(mlir::ModuleOp synthetic,
+                                                    llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+                                                    CachedJoinBufferLayoutsByKey& layoutsByKey) {
+   auto& mm = synthetic.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (const CacheTarget& t : targetsInSynthetic) {
+      synthetic.walk([&](subop::CachePutOp put) {
+         if (static_cast<uint64_t>(put.getKey()) != t.cacheKey) return;
+         auto hivTy = mlir::dyn_cast<subop::HashIndexedViewType>(put.getState().getType());
+         if (!hivTy) return;
+         CachedJoinBufferLayout layout;
+         layout.producerHiv = hivTy;
+         for (subop::Member m : hivTy.getValueMembers().getMembers()) {
+            layout.payloadMembers.push_back(m);
+            layout.payloadColumnTypes.push_back(mm.getType(m));
+            layout.payloadSemanticKeys.push_back(std::string(mm.getName(m)));
+         }
+         layoutsByKey[t.cacheKey] = std::move(layout);
+      });
+   }
+}
+
 } // namespace lingodb::compiler::dialect::subop

@@ -46,6 +46,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -72,6 +73,52 @@ static bool envFlagEnabled(const char* envVar) {
 static double millisSince(std::chrono::high_resolution_clock::time_point start) {
    auto end = std::chrono::high_resolution_clock::now();
    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+}
+
+static double timingOrZero(const std::unordered_map<std::string, double>& timing, llvm::StringRef key) {
+   auto it = timing.find(key.str());
+   return it != timing.end() ? it->second : 0.0;
+}
+
+/// Per-run timings aligned with `run-sql` / `TimingPrinter` backend keys where possible.
+struct SubOpExecuteTiming {
+   double wallMs = 0;
+   /// SubOp → DB/Arrow lowering (not reported by run-sql as a single bucket).
+   double lowerMs = 0;
+   /// `DefaultCPULLVMBackend`: time inside generated `main()` only (same as run-sql `executionTime`).
+   double executionTime = 0;
+   double lowerToLLVM = 0;
+   double toLLVMIR = 0;
+   double llvmOptimize = 0;
+   double llvmCodeGen = 0;
+
+   double llvmJitMs() const { return lowerToLLVM + toLLVMIR + llvmOptimize + llvmCodeGen; }
+
+   static SubOpExecuteTiming fromBackend(const std::unordered_map<std::string, double>& backendTiming) {
+      SubOpExecuteTiming t;
+      t.executionTime = timingOrZero(backendTiming, "executionTime");
+      t.lowerToLLVM = timingOrZero(backendTiming, "lowerToLLVM");
+      t.toLLVMIR = timingOrZero(backendTiming, "toLLVMIR");
+      t.llvmOptimize = timingOrZero(backendTiming, "llvmOptimize");
+      t.llvmCodeGen = timingOrZero(backendTiming, "llvmCodeGen");
+      return t;
+   }
+
+   void add(const SubOpExecuteTiming& o) {
+      wallMs += o.wallMs;
+      lowerMs += o.lowerMs;
+      executionTime += o.executionTime;
+      lowerToLLVM += o.lowerToLLVM;
+      toLLVMIR += o.toLLVMIR;
+      llvmOptimize += o.llvmOptimize;
+      llvmCodeGen += o.llvmCodeGen;
+   }
+};
+
+static void printTimingSegment(llvm::raw_ostream& os, llvm::StringRef name, const SubOpExecuteTiming& t) {
+   os << "// timing_segment " << name << ": executionTime=" << t.executionTime << " lower_ms=" << t.lowerMs
+      << " llvm_jit_ms=" << t.llvmJitMs() << " (lowerToLLVM=" << t.lowerToLLVM << " toLLVMIR=" << t.toLLVMIR
+      << " llvmOptimize=" << t.llvmOptimize << " llvmCodeGen=" << t.llvmCodeGen << ")\n";
 }
 
 static void dumpModuleToFile(mlir::ModuleOp module, const llvm::Twine& path) {
@@ -273,16 +320,21 @@ static bool lowerFromSubOpLayer(mlir::ModuleOp subopModule, const char* snapshot
    return true;
 }
 
-static void executeFromSubOpLayer(mlir::ModuleOp subopModule,
-                                  lingodb::runtime::ExecutionContext* executionContext) {
+static SubOpExecuteTiming executeFromSubOpLayer(mlir::ModuleOp subopModule,
+                                                lingodb::runtime::ExecutionContext* executionContext) {
    using namespace lingodb::compiler::dialect;
 
+   auto wallStart = std::chrono::high_resolution_clock::now();
+   SubOpExecuteTiming out;
+
+   auto lowerStart = std::chrono::high_resolution_clock::now();
    if (!lowerFromSubOpLayer(subopModule)) {
       subopModule.dump();
       assert(0 && "lowerFromSubOpLayer failed (dumped module above)");
    }
+   out.lowerMs = millisSince(lowerStart);
 
-   // Execute using default LLVM backend and print result.
+   // Same backend as run-sql DEFAULT mode (`createDefaultLLVMBackend()` → optimize=true).
    auto backend = std::shared_ptr<lingodb::execution::ExecutionBackend>(
       lingodb::execution::createDefaultLLVMBackend(/*optimize*/ true).release());
    auto printer = std::shared_ptr<lingodb::execution::ResultProcessor>(
@@ -300,10 +352,18 @@ static void executeFromSubOpLayer(mlir::ModuleOp subopModule,
    };
 
    lingodb::scheduler::awaitEntryTask(std::make_unique<RunWithContextTask>(executionContext, [&]() {
+      // Shared context: required so `cache_put` pointers stay valid for later `cache_get`.
+      // Does not affect `executionTime` (measured around `main()` only). Clear printed result
+      // slot; do not tear down context between synthetic and consumers.
       lingodb::runtime::ExecutionContext::clearResult(0);
       backend->execute(subopModule, executionContext);
       printer->process(executionContext);
+      std::cout.flush();
    }));
+
+   out.add(SubOpExecuteTiming::fromBackend(backend->getTiming()));
+   out.wallMs = millisSince(wallStart);
+   return out;
 }
 
 } // namespace
@@ -522,11 +582,16 @@ int main(int argc, char** argv) {
    const bool skipExecute = (std::getenv("LINGODB_SKIP_EXECUTE") != nullptr);
    if (skipExecute) {
       llvm::outs() << "\n// (LINGODB_SKIP_EXECUTE set: skipping JIT execution)\n";
-      llvm::outs() << "\n// timing: optimization_ms=" << optimizationMs << " execution_ms=0 (skipped)\n";
+      llvm::outs() << "\n// timing: optimization_ms=" << optimizationMs << " execution_time_ms=0 (skipped)\n";
       return 0;
    }
-   double executionMs = 0;
-   llvm::SmallVector<double, 8> executionMsPerRun;
+
+   SubOpExecuteTiming totalExec;
+   SubOpExecuteTiming segmentSynthetic;
+   SubOpExecuteTiming segmentConsumer0;
+   SubOpExecuteTiming segmentConsumer1;
+   llvm::SmallVector<SubOpExecuteTiming, 8> timingPerRun;
+
    // `putCachedState` stores raw pointers into memory registered on the **allocating**
    // `ExecutionContext`. Destroying that context before consumers run leaves entries in the
    // process-global `gCachedStates` map dangling. Use one context for synthetic + both consumers,
@@ -534,51 +599,76 @@ int main(int argc, char** argv) {
    {
       lingodb::runtime::ExecutionContext::clearAllCachedStates();
       auto sharedExecCtx = session->createExecutionContext();
-      auto runOne = [&](mlir::ModuleOp mod, const std::string& label) {
+      auto runOne = [&](mlir::ModuleOp mod, const std::string& label, SubOpExecuteTiming& segment) {
          llvm::outs() << "\n// ============================\n";
          llvm::outs() << label << "\n";
          llvm::outs() << "// ============================\n";
-         mlir::OwningOpRef<mlir::ModuleOp> execModule = mlir::cast<mlir::ModuleOp>(mod->clone());
-         auto tExec = std::chrono::high_resolution_clock::now();
-         executeFromSubOpLayer(*execModule, sharedExecCtx.get());
-         const double oneMs = millisSince(tExec);
-         executionMs += oneMs;
-         executionMsPerRun.push_back(oneMs);
          llvm::outs().flush();
+         mlir::OwningOpRef<mlir::ModuleOp> execModule = mlir::cast<mlir::ModuleOp>(mod->clone());
+         SubOpExecuteTiming one = executeFromSubOpLayer(*execModule, sharedExecCtx.get());
+         segment = one;
+         totalExec.add(one);
+         timingPerRun.push_back(one);
+         // TablePrinter uses std::cout; flush before timing on llvm::outs to preserve log order.
          std::cout.flush();
+         llvm::outs() << "// timing_run executionTime_ms=" << one.executionTime << " lower_ms=" << one.lowerMs
+                      << " llvm_jit_ms=" << one.llvmJitMs() << " execute_wall_ms=" << one.wallMs << "\n";
+         llvm::outs().flush();
          llvm::outs() << "\n";
       };
       // When cross-query rewrite could not map any donor state into the synthetic module, it only
       // contains an empty execution_group shell — skip JIT for that shell.
       if (rewriteRes.numTargetsQuery0Mapped > 0) {
-         runOne(*rewriteRes.query0, "// query[0] (synthetic) execute");
+         runOne(*rewriteRes.query0, "// query[0] (synthetic) execute", segmentSynthetic);
       } else {
          llvm::outs() << "\n// (skip synthetic execute: reuse_targets_q0_mapped==0)\n";
       }
       for (size_t i = 0; i < runs.size(); i++) {
-         runOne(runs[i].module, "// query[" + std::to_string(i) + "] execute");
+         SubOpExecuteTiming& seg = (i == 0) ? segmentConsumer0 : segmentConsumer1;
+         runOne(runs[i].module, "// query[" + std::to_string(i) + "] execute", seg);
       }
    }
    lingodb::runtime::ExecutionContext::clearAllCachedStates();
+
+   auto printPerRun = [&](llvm::StringRef key, auto getter) {
+      llvm::outs() << "// timing_" << key << "_ms: per_run=[";
+      for (size_t i = 0; i < timingPerRun.size(); i++) {
+         if (i) llvm::outs() << ",";
+         llvm::outs() << getter(timingPerRun[i]);
+      }
+      llvm::outs() << "] total=" << getter(totalExec) << "\n";
+   };
+
    llvm::outs() << "\n// timing_compile_ms: per_query=[";
    for (size_t i = 0; i < queryCompileMs.size(); i++) {
       if (i) llvm::outs() << ",";
       llvm::outs() << queryCompileMs[i];
    }
    llvm::outs() << "] rewrite=" << rewriteMs << " total_optimization_ms=" << optimizationMs << "\n";
-   llvm::outs() << "// timing_execution_ms: per_run=[";
-   for (size_t i = 0; i < executionMsPerRun.size(); i++) {
-      if (i) llvm::outs() << ",";
-      llvm::outs() << executionMsPerRun[i];
+
+   llvm::outs() << "// timing_note: executionTime_ms is run-sql `executionTime` (generated main() only).\n";
+   llvm::outs() << "// timing_note: shared ExecutionContext keeps cache_put pointers valid across runs;\n";
+   llvm::outs() << "// timing_note: does not change executionTime; per-run clearResult(0) only. Arena/state\n";
+   llvm::outs() << "// timing_note: may accumulate on the shared context (memory, not timing).\n";
+
+   printPerRun("execution_time", [](const SubOpExecuteTiming& t) { return t.executionTime; });
+   printPerRun("lower_imperative", [](const SubOpExecuteTiming& t) { return t.lowerMs; });
+   printPerRun("llvm_jit", [](const SubOpExecuteTiming& t) { return t.llvmJitMs(); });
+   printPerRun("execute_wall", [](const SubOpExecuteTiming& t) { return t.wallMs; });
+
+   if (rewriteRes.numTargetsQuery0Mapped > 0) {
+      printTimingSegment(llvm::outs(), "synthetic_ir", segmentSynthetic);
    }
-   llvm::outs() << "] total_execution_ms=" << executionMs << "\n";
-   if (rewriteRes.numTargetsQuery0Mapped > 0 && executionMsPerRun.size() >= 3) {
-      double synthMs = executionMsPerRun[0];
-      double consumerMs = 0;
-      for (size_t i = 1; i < executionMsPerRun.size(); ++i) consumerMs += executionMsPerRun[i];
-      llvm::outs() << "// timing_note: synthetic_ms=" << synthMs
-                    << " consumers_only_ms=" << consumerMs << "\n";
-   }
-   llvm::outs() << "// timing: optimization_ms=" << optimizationMs << " execution_ms=" << executionMs << "\n";
+   printTimingSegment(llvm::outs(), "consumer_q0_ir", segmentConsumer0);
+   printTimingSegment(llvm::outs(), "consumer_q1_ir", segmentConsumer1);
+
+   SubOpExecuteTiming consumersOnly;
+   consumersOnly.add(segmentConsumer0);
+   consumersOnly.add(segmentConsumer1);
+   printTimingSegment(llvm::outs(), "consumers_only_ir", consumersOnly);
+   printTimingSegment(llvm::outs(), "all_execute_runs", totalExec);
+
+   llvm::outs() << "// timing: optimization_ms=" << optimizationMs
+                << " execution_time_ms=" << totalExec.executionTime << "\n";
    return 0;
 }

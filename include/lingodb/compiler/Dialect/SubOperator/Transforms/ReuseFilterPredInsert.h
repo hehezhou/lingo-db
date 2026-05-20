@@ -43,6 +43,7 @@ void insertScanRefsPredFilter(ExecutionStepOp step, subop::Member predMember);
 
 void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member predMember);
 
+/// Fill missing `filter_pred$0` materialize mappings from table-scan pushdown filters (or constant true).
 void ensureJoinBufferFilterPredMaterializeMappings(mlir::ModuleOp module);
 
 void propagateSubOpColumnAttrsFromSsaStateLayout(mlir::ModuleOp module,
@@ -64,6 +65,10 @@ decodeFiltersByCacheTargets(llvm::ArrayRef<CacheTarget> targets, const ModuleReu
 /// Re-apply stream-level construction filters at `cache_get` use sites (non-join hashmap/buffer states).
 void materializeRuntimeFiltersAtCacheGetUses(mlir::Value cached,
                                              llvm::ArrayRef<runtime::FilterDescription> decodedFilters);
+
+/// After join-buffer/HIV layout + `propagateSubOpColumnAttrsFromSsaStateLayout`, insert
+/// `filter(all_true [filter_pred])` on HIV `gather`/`lookup` probe paths (must run last).
+void applyJoinBufferProbePredFiltersAfterLayout(mlir::ModuleOp module);
 
 } // namespace lingodb::compiler::dialect::subop
 
