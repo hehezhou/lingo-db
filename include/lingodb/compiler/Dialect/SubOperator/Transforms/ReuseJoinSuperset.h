@@ -31,9 +31,10 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
                                              const mlir::IRMapping& donorToSynthetic,
                                              CachedJoinBufferLayoutsByKey* outLayouts = nullptr);
 
-/// Align a consumer module to the producer union HIV: types from \c cache_get through execution steps /
-/// nested groups, and gather member slots at \c scan_list sites on that HIV's use chain only.
-/// When \p cacheKey is set, only the matching \c subop.cache_get is used as the reuse root.
+/// Align a consumer to the union column layout: HIV payload order matches the cached producer, but existing
+/// columns keep the consumer's \c member$N names and types; union-only columns are inserted (not type-replaced).
+/// Then walk the \c cache_get HIV use chain and update embedded carrier types. Gather mappings are unchanged.
+/// When \p cacheKey is set, only that \c cache_get root is processed.
 void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const CachedJoinBufferLayout& layout,
                                             std::optional<uint64_t> cacheKey = std::nullopt);
 

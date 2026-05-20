@@ -1,4 +1,6 @@
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseJoinSuperset.h"
+#include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseRewriteCommon.h"
+#include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseFilterPredInsert.h"
 #include "lingodb/compiler/Dialect/DB/IR/DBTypes.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseStateClosure.h"
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorOps.h"
@@ -54,9 +56,6 @@ struct JoinBufferUnionPlan {
    /// Buffer/HIV payload members aligned with \p payloadColumns (semantic union, not slot `member$N`).
    llvm::SmallVector<subop::Member, 8> payloadMembers;
 };
-
-static void ingestExternalTableColumnsForUnionScopes(mlir::ModuleOp module,
-                                                     llvm::StringMap<PayloadColumnSpec>& unionCols);
 
 static subop::CreateHashIndexedView findCreateHashIndexedViewForState(
    mlir::Value hiv, const llvm::DenseMap<mlir::Value, llvm::SmallVector<subop::ExecutionStepOp, 8>>& writerStepsByState) {
@@ -143,6 +142,94 @@ static void collectPayloadFromMaterialize(
    }
 }
 
+static mlir::Type memberTypeForIdentifier(subop::TableType tableTy, subop::MemberManager& mm, llvm::StringRef identifier);
+
+static ExternalDatasourceProperty mergeExternalDatasource(const ExternalDatasourceProperty& a,
+                                                        const ExternalDatasourceProperty& b);
+
+/// One \c get_external per module, indexed by \c ExternalDatasourceProperty::tableName (single module walk).
+struct ExternalTableCatalog {
+   struct Entry {
+      subop::GetExternalOp op;
+      ExternalDatasourceProperty ds;
+      subop::TableType tableTy;
+   };
+   llvm::StringMap<llvm::SmallVector<Entry>> byTableName;
+
+   llvm::ArrayRef<Entry> entries(llvm::StringRef tableName) const {
+      auto it = byTableName.find(tableName);
+      if (it == byTableName.end()) return {};
+      return it->second;
+   }
+
+   subop::TableType representativeTableTy(llvm::StringRef tableName) const {
+      auto refs = entries(tableName);
+      if (refs.empty()) return {};
+      return refs.front().tableTy;
+   }
+};
+
+static ExternalTableCatalog buildExternalTableCatalog(mlir::ModuleOp module) {
+   ExternalTableCatalog catalog;
+   if (!module) return catalog;
+   module.walk([&](subop::GetExternalOp ge) {
+      auto ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
+      auto tableTy = mlir::dyn_cast<subop::TableType>(ge.getResult().getType());
+      if (!tableTy) return;
+      catalog.byTableName[ds.tableName].push_back({ge, std::move(ds), tableTy});
+   });
+   return catalog;
+}
+
+static void mergeExternalDatasourceForTable(ExternalDatasourceProperty& merged, bool& haveMerged,
+                                            const ExternalTableCatalog& catalog, llvm::StringRef tableName) {
+   for (const ExternalTableCatalog::Entry& entry : catalog.entries(tableName)) {
+      if (!haveMerged) {
+         merged = entry.ds;
+         haveMerged = true;
+      } else {
+         merged = mergeExternalDatasource(merged, entry.ds);
+      }
+   }
+}
+
+static void ingestExternalTableColumnsForUnionScopes(const ExternalTableCatalog& catalog,
+                                                     llvm::StringMap<PayloadColumnSpec>& unionCols) {
+   if (catalog.byTableName.empty()) return;
+   llvm::StringSet<> scopesInUnion;
+   for (auto& it : unionCols) {
+      if (!it.getValue().scope.empty()) scopesInUnion.insert(it.getValue().scope);
+   }
+   auto* ctx = catalog.byTableName.begin()->second.front().op->getContext();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (const auto& tableIt : catalog.byTableName) {
+      if (!scopesInUnion.contains(tableIt.getKey())) continue;
+      for (const ExternalTableCatalog::Entry& entry : tableIt.getValue()) {
+         for (const auto& map : entry.ds.mapping) {
+            llvm::StringRef leaf = normalizeColumnIdentifier(map.identifier);
+            PayloadColumnSpec spec;
+            spec.scope = entry.ds.tableName;
+            spec.leaf = leaf.str();
+            spec.colType = memberTypeForIdentifier(entry.tableTy, mm, leaf);
+            if (!spec.colType) continue;
+            spec.semanticKey = columnSemanticKey(spec.scope, spec.leaf);
+            unionCols.try_emplace(spec.semanticKey, spec);
+         }
+      }
+   }
+}
+
+static mlir::Type columnTypeForIdentifierInCatalog(const ExternalTableCatalog& catalog, llvm::StringRef tableName,
+                                                   llvm::StringRef identifier) {
+   if (catalog.byTableName.empty()) return {};
+   auto* ctx = catalog.byTableName.begin()->second.front().op->getContext();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (const ExternalTableCatalog::Entry& entry : catalog.entries(tableName)) {
+      if (mlir::Type ty = memberTypeForIdentifier(entry.tableTy, mm, identifier)) return ty;
+   }
+   return {};
+}
+
 static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, const ModuleReuseInfo& reuseA,
                                         const ModuleReuseInfo& reuseB, mlir::ModuleOp modA, mlir::ModuleOp modB) {
    JoinBufferUnionPlan plan;
@@ -188,8 +275,10 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
    };
    ingestHiv(hivA, reuseA);
    ingestHiv(hivB, reuseB);
-   ingestExternalTableColumnsForUnionScopes(modA, unionCols);
-   ingestExternalTableColumnsForUnionScopes(modB, unionCols);
+   ExternalTableCatalog catalogA = buildExternalTableCatalog(modA);
+   ExternalTableCatalog catalogB = buildExternalTableCatalog(modB);
+   ingestExternalTableColumnsForUnionScopes(catalogA, unionCols);
+   ingestExternalTableColumnsForUnionScopes(catalogB, unionCols);
 
    llvm::SmallVector<PayloadColumnSpec*, 8> ordered;
    ordered.reserve(unionCols.size());
@@ -404,49 +493,6 @@ static mlir::Type memberTypeForIdentifier(subop::TableType tableTy, subop::Membe
 static subop::Member tableMemberForIdentifier(subop::TableType tableTy, subop::MemberManager& mm,
                                               llvm::StringRef identifier);
 
-/// Widen union with full external-table columns only for table scopes already present in \p unionCols
-/// (from materialize mappings), keyed by \c ExternalDatasourceProperty::tableName — not a fixed table name.
-static void ingestExternalTableColumnsForUnionScopes(mlir::ModuleOp module,
-                                                     llvm::StringMap<PayloadColumnSpec>& unionCols) {
-   if (!module) return;
-   llvm::StringSet<> scopesInUnion;
-   for (auto& it : unionCols) {
-      if (!it.getValue().scope.empty()) scopesInUnion.insert(it.getValue().scope);
-   }
-   if (scopesInUnion.empty()) return;
-   auto& mm = module.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   module.walk([&](subop::GetExternalOp ge) {
-      auto ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-      if (!scopesInUnion.contains(ds.tableName)) return;
-      auto tableTy = mlir::dyn_cast<subop::TableType>(ge.getResult().getType());
-      if (!tableTy) return;
-      for (const auto& map : ds.mapping) {
-         llvm::StringRef leaf = normalizeColumnIdentifier(map.identifier);
-         PayloadColumnSpec spec;
-         spec.scope = ds.tableName;
-         spec.leaf = leaf.str();
-         spec.colType = memberTypeForIdentifier(tableTy, mm, leaf);
-         if (!spec.colType) continue;
-         spec.semanticKey = columnSemanticKey(spec.scope, spec.leaf);
-         unionCols.try_emplace(spec.semanticKey, spec);
-      }
-   });
-}
-
-static mlir::Type columnTypeForIdentifierInModule(mlir::ModuleOp module, llvm::StringRef tableName,
-                                                llvm::StringRef identifier) {
-   auto& mm = module.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   mlir::Type found;
-   module.walk([&](subop::GetExternalOp ge) {
-      if (found) return;
-      auto ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-      if (ds.tableName != tableName) return;
-      auto tableTy = mlir::cast<subop::TableType>(ge.getResult().getType());
-      if (mlir::Type ty = memberTypeForIdentifier(tableTy, mm, identifier)) found = ty;
-   });
-   return found;
-}
-
 static subop::TableType tableTypeFromMergedExternal(mlir::MLIRContext* ctx, subop::MemberManager& mm,
                                                     const ExternalDatasourceProperty& ds, subop::TableType hintTy,
                                                     llvm::function_ref<mlir::Type(llvm::StringRef)> lookupPeerType) {
@@ -463,20 +509,6 @@ static subop::TableType tableTypeFromMergedExternal(mlir::MLIRContext* ctx, subo
       }
    }
    return subop::TableType::get(ctx, subop::StateMembersAttr::get(ctx, members), hintTy.getFiltered());
-}
-
-static void mergeSupplierExternalFromModule(mlir::ModuleOp module, llvm::StringRef tableName,
-                                            ExternalDatasourceProperty& merged, bool& haveMerged) {
-   module.walk([&](subop::GetExternalOp ge) {
-      auto ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-      if (ds.tableName != tableName) return;
-      if (!haveMerged) {
-         merged = std::move(ds);
-         haveMerged = true;
-      } else {
-         merged = mergeExternalDatasource(merged, ds);
-      }
-   });
 }
 
 static subop::Member tableMemberForIdentifier(subop::TableType tableTy, subop::MemberManager& mm,
@@ -541,19 +573,68 @@ static bool extendGatherMapping(subop::GatherOp gather, subop::Member tableMem, 
    return true;
 }
 
-static void refreshTableStateTypesInModule(mlir::ModuleOp module, mlir::Value tableState, subop::TableType newTy) {
-   tableState.setType(newTy);
-   module.walk([&](mlir::Operation* op) {
-      for (mlir::OpResult r : op->getResults()) {
-         if (r == tableState) r.setType(newTy);
-      }
-      for (mlir::Region& reg : op->getRegions()) {
-         for (mlir::Block& b : reg) {
-            for (mlir::BlockArgument a : b.getArguments()) {
-               if (a == tableState) a.setType(newTy);
+/// Propagate a widened \c !subop.table type along SSA values and \c execution_step operand/block-arg ports.
+static void refreshTableStateTypesInModule(mlir::ModuleOp module, mlir::Value tableStateRoot, subop::TableType newTy) {
+   if (!tableStateRoot || !newTy) return;
+
+   llvm::DenseSet<void*> closure;
+   llvm::SmallVector<mlir::Value, 16> worklist;
+   auto seed = [&](mlir::Value v) {
+      if (!v) return;
+      closure.insert(v.getAsOpaquePointer());
+      worklist.push_back(v);
+   };
+   seed(tableStateRoot);
+   seed(peelBlockArgsToEnclosingOperands(tableStateRoot));
+
+   for (unsigned round = 0; round < 32; ++round) {
+      size_t before = closure.size();
+      expandClosureThroughExecutionStepPorts(module, closure);
+      if (closure.size() == before) break;
+   }
+
+   llvm::DenseSet<void*> visited;
+   while (!worklist.empty()) {
+      mlir::Value v = worklist.pop_back_val();
+      if (!visited.insert(v.getAsOpaquePointer()).second) continue;
+      v.setType(newTy);
+
+      if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+         if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(ba.getOwner()->getParentOp())) {
+            unsigned i = ba.getArgNumber();
+            if (i < step.getNumOperands()) seed(step.getOperand(i));
+         }
+      } else if (mlir::Operation* def = v.getDefiningOp()) {
+         if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(def)) {
+            if (auto ret = mlir::dyn_cast<subop::ExecutionStepReturnOp>(step.getSubOps().front().getTerminator())) {
+               for (unsigned i = 0; i < ret.getNumOperands() && i < step.getNumResults(); ++i) {
+                  if (ret.getOperand(i) == v) seed(step.getResult(i));
+               }
             }
          }
       }
+
+      for (mlir::OpOperand& use : v.getUses()) {
+         mlir::Operation* user = use.getOwner();
+         if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(user)) {
+            unsigned i = use.getOperandNumber();
+            mlir::Block& body = step.getSubOps().front();
+            if (i < body.getNumArguments()) seed(body.getArgument(i));
+         }
+      }
+   }
+
+   synchronizeExecutionStepPortTypes(module, &closure);
+
+   auto* ctx = module.getContext();
+   llvm::SmallVector<subop::Member> refCols;
+   for (subop::Member m : newTy.getMembers().getMembers()) refCols.push_back(m);
+   auto entryRefTy = subop::TableEntryRefType::get(ctx, subop::StateMembersAttr::get(ctx, refCols));
+   module.walk([&](subop::ScanRefsOp scan) {
+      if (!opaqueClosureContains(closure, scan.getState())) return;
+      auto ref = scan.getRef();
+      ref.getColumn().type = entryRefTy;
+      scan.setRefAttr(ref);
    });
 }
 
@@ -634,6 +715,53 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
    });
 }
 
+/// Resolve the external table backing \c scan_refs: block-arg → step operand → reuse map / \c get_external.
+static bool resolveScannedTableExternal(subop::ExecutionStepOp buildStep, mlir::Value tableStateInBody,
+                                       const ModuleReuseInfo& reuse, llvm::StringRef& tableName,
+                                       ExternalDatasourceProperty& ds, bool& haveDs, subop::TableType& tableTy) {
+   mlir::Value external = tableStateInBody;
+   if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(external)) {
+      if (ba.getOwner() == &buildStep.getSubOps().front() && ba.getArgNumber() < buildStep.getNumOperands()) {
+         external = buildStep.getOperand(ba.getArgNumber());
+      }
+   }
+   external = peelBlockArgsToEnclosingOperands(external);
+
+   if (auto ge = mlir::dyn_cast_or_null<subop::GetExternalOp>(external.getDefiningOp())) {
+      ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
+      tableName = ds.tableName;
+      haveDs = true;
+      tableTy = mlir::cast<subop::TableType>(ge.getResult().getType());
+      assert(!tableName.empty());
+      return true;
+   }
+
+   mlir::Value canon = canonicalizeStateValueForReuse(external);
+   if (auto it = findReuseMap(reuse.externalDatasourceByTableState, canon);
+       it != reuse.externalDatasourceByTableState.end()) {
+      ds = it->second;
+      tableName = ds.tableName;
+      haveDs = true;
+      tableTy = mlir::cast<subop::TableType>(external.getType());
+      assert(!tableName.empty());
+      return true;
+   }
+
+   if (auto tableStep = mlir::dyn_cast_or_null<subop::ExecutionStepOp>(external.getDefiningOp())) {
+      for (mlir::Operation& op : tableStep.getSubOps().front().without_terminator()) {
+         if (auto ge = mlir::dyn_cast<subop::GetExternalOp>(&op)) {
+            ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
+            tableName = ds.tableName;
+            haveDs = true;
+            tableTy = mlir::cast<subop::TableType>(ge.getResult().getType());
+            assert(!tableName.empty());
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
 static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::ExecutionStepOp buildStep,
                                          const JoinBufferUnionPlan& plan, subop::BufferType targetBufTy,
                                          const ModuleReuseInfo& reuseSynthetic,
@@ -655,109 +783,67 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
          break;
       }
    }
-   if (!scanOp) return;
+   assert(scanOp && "join superset: buffer build step must contain scan_refs on a table state");
 
    mlir::Value tableState = scanOp.getState();
    subop::TableType mergedSupplierTableTy;
    ExternalDatasourceProperty mergedDs;
    bool haveDs = false;
    llvm::StringRef donorTableName;
-   subop::TableType donorTableTy = mlir::dyn_cast<subop::TableType>(tableState.getType());
-   if (auto ge = mlir::dyn_cast_or_null<subop::GetExternalOp>(tableState.getDefiningOp())) {
-      auto donorDs = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-      donorTableName = donorDs.tableName;
-      mergedDs = std::move(donorDs);
-      haveDs = true;
-   }
-   bool unionTouchesDonorTable = false;
-   if (!donorTableName.empty()) {
-      for (const PayloadColumnSpec& spec : plan.payloadColumns) {
-         if (spec.scope == donorTableName) {
-            unionTouchesDonorTable = true;
-            break;
-         }
-      }
-   }
-   if (unionTouchesDonorTable && !donorTableName.empty()) {
-      for (auto [peerMod, peerHiv] : peerHivs) {
-         if (!peerMod) continue;
-         (void)peerHiv;
-         mergeSupplierExternalFromModule(peerMod, donorTableName, mergedDs, haveDs);
-      }
-      if (donorTableTy && haveDs) {
-         synthetic.walk([&](subop::GetExternalOp ge) {
-            auto donorDs = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-            if (donorDs.tableName != donorTableName) return;
-            mergedDs = mergeExternalDatasource(mergedDs, donorDs);
-         });
-      }
-   }
-   if (unionTouchesDonorTable && haveDs) {
-      auto lookupPeerColumnType = [&](llvm::StringRef identifier) -> mlir::Type {
-         for (auto [peerMod, peerHiv] : peerHivs) {
-            if (!peerMod) continue;
-            (void)peerHiv;
-            if (mlir::Type ty = columnTypeForIdentifierInModule(peerMod, donorTableName, identifier)) return ty;
-         }
-         return {};
-      };
-      subop::TableType hintTy = donorTableTy;
-      if (!hintTy) {
-         for (auto [peerMod, peerHiv] : peerHivs) {
-            if (!peerMod) continue;
-            (void)peerHiv;
-            peerMod.walk([&](subop::GetExternalOp ge) {
-               if (hintTy) return;
-               auto ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-               if (ds.tableName != donorTableName) return;
-               hintTy = mlir::cast<subop::TableType>(ge.getResult().getType());
-            });
-            if (hintTy) break;
-         }
-      }
-      assert(hintTy && "join superset: external table type required for external merge");
-      auto newTableTy = tableTypeFromMergedExternal(ctx, mm, mergedDs, hintTy, lookupPeerColumnType);
-      for (auto& map : mergedDs.mapping) {
-         if (subop::Member m = tableMemberForIdentifier(newTableTy, mm, map.identifier))
-            map.memberName = mm.getName(m);
-      }
-      llvm::sort(mergedDs.mapping, [](const auto& x, const auto& y) { return x.memberName < y.memberName; });
-      std::string hex = lingodb::utility::serializeToHexString(mergedDs);
-      synthetic.walk([&](subop::GetExternalOp ge) {
-         auto ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-         if (ds.tableName != mergedDs.tableName) return;
-         ge.setDescrAttr(mlir::StringAttr::get(ctx, hex));
-         refreshTableStateTypesInModule(synthetic, ge.getResult(), newTableTy);
-      });
+   subop::TableType donorTableTy;
+   assert(resolveScannedTableExternal(buildStep, tableState, reuseSynthetic, donorTableName, mergedDs, haveDs,
+                                      donorTableTy) &&
+          "join superset: scan_refs must resolve to an external table");
 
-      auto refDef = scanOp.getRef();
-      llvm::SmallVector<subop::Member> refCols;
-      for (subop::Member m : newTableTy.getMembers().getMembers()) refCols.push_back(m);
-      refDef.getColumn().type = subop::TableEntryRefType::get(ctx, subop::StateMembersAttr::get(ctx, refCols));
-      scanOp.setRefAttr(refDef);
-      mergedSupplierTableTy = newTableTy;
-      if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(scanOp->getParentOp())) {
-         for (mlir::Value operand : step->getOperands()) {
-            if (mlir::isa<subop::TableType>(operand.getType())) operand.setType(newTableTy);
-         }
+   assert(llvm::any_of(plan.payloadColumns, [&](const PayloadColumnSpec& spec) {
+             return spec.scope == donorTableName;
+          }) &&
+          "join superset: union plan must include donor external table scope");
+
+   ExternalTableCatalog syntheticCatalog = buildExternalTableCatalog(synthetic);
+   llvm::SmallVector<ExternalTableCatalog, 2> peerCatalogs;
+   peerCatalogs.reserve(peerHivs.size());
+   for (auto [peerMod, peerHiv] : peerHivs) {
+      (void)peerHiv;
+      peerCatalogs.push_back(peerMod ? buildExternalTableCatalog(peerMod) : ExternalTableCatalog{});
+   }
+   for (const ExternalTableCatalog& peerCat : peerCatalogs) {
+      mergeExternalDatasourceForTable(mergedDs, haveDs, peerCat, donorTableName);
+   }
+   mergeExternalDatasourceForTable(mergedDs, haveDs, syntheticCatalog, donorTableName);
+   assert(haveDs && "join superset: merged external datasource required for donor table");
+
+   auto lookupPeerColumnType = [&](llvm::StringRef identifier) -> mlir::Type {
+      for (const ExternalTableCatalog& peerCat : peerCatalogs) {
+         if (mlir::Type ty = columnTypeForIdentifierInCatalog(peerCat, donorTableName, identifier)) return ty;
       }
+      return {};
+   };
+   subop::TableType hintTy = donorTableTy;
+   assert(hintTy && "join superset: resolveScannedTableExternal must provide donor table type");
+   auto newTableTy = tableTypeFromMergedExternal(ctx, mm, mergedDs, hintTy, lookupPeerColumnType);
+   for (auto& map : mergedDs.mapping) {
+      if (subop::Member m = tableMemberForIdentifier(newTableTy, mm, map.identifier))
+         map.memberName = mm.getName(m);
+   }
+   llvm::sort(mergedDs.mapping, [](const auto& x, const auto& y) { return x.memberName < y.memberName; });
+   std::string hex = lingodb::utility::serializeToHexString(mergedDs);
+   auto geIt = syntheticCatalog.byTableName.find(donorTableName);
+   assert(geIt != syntheticCatalog.byTableName.end() && !geIt->second.empty() &&
+          "join superset: synthetic module must contain get_external for donor table");
+   for (ExternalTableCatalog::Entry& entry : geIt->second) {
+      entry.op.setDescrAttr(mlir::StringAttr::get(ctx, hex));
+      refreshTableStateTypesInModule(synthetic, entry.op.getResult(), newTableTy);
    }
 
-   subop::GatherOp firstTableGather;
-   for (mlir::Operation& op : body.without_terminator()) {
-      if (!scanOp->isBeforeInBlock(&op)) continue;
-      auto g = mlir::dyn_cast<subop::GatherOp>(&op);
-      if (!g) continue;
-      if (g.getStream() == scanOp.getRes()) {
-         firstTableGather = g;
-         break;
-      }
-   }
+   refreshTableStateTypesInModule(synthetic, tableState, newTableTy);
+   mergedSupplierTableTy = newTableTy;
+
    subop::MaterializeOp matOp;
    buildStep.walk([&](subop::MaterializeOp m) {
       if (getInnerBufferTypeForMaterializeState(m.getState().getType())) matOp = m;
    });
-   if (!matOp) return;
+   assert(matOp && "join superset: buffer build step must materialize into join buffer");
 
    auto collectMaterializedKeys = [&]() {
       std::unordered_set<std::string> keys;
@@ -771,6 +857,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    std::unordered_set<std::string> materializedKeys = collectMaterializedKeys();
 
    subop::MapOp hashMapOp = findJoinHashMapBeforeMaterialize(body, matOp);
+   assert(hashMapOp);
 
    auto appendMaterializeMember = [&](subop::Member bufMem, tuples::ColumnDefAttr colDef) {
       llvm::SmallVector<subop::RefMappingPairT> matPairs;
@@ -819,11 +906,9 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
       }
       subop::TableType tableTy = mergedSupplierTableTy;
       if (!tableTy) tableTy = mlir::dyn_cast<subop::TableType>(scanOp.getState().getType());
+      assert(tableTy && "join superset: table type required for payload column gather");
       subop::Member tableMem = tableMemberForIdentifier(tableTy, mm, spec.leaf);
-      if (!tableMem) {
-         ++payloadSlotInPlan;
-         continue;
-      }
+      assert(tableMem && "join superset: union payload column must exist in merged table layout");
 
       llvm::StringRef scope = spec.scope;
       if (scope.empty() && templateGather && templateCm) {
@@ -832,65 +917,25 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
          (void)leaf0;
          scope = scope0;
       }
-      if (scope.empty()) {
-         ++payloadSlotInPlan;
-         continue;
-      }
+      assert(!scope.empty() && "join superset: payload column scope required");
       tuples::ColumnDefAttr colDef = cm.createDef(spec.scope, spec.leaf);
       colDef.getColumn().type = spec.colType;
       assert(static_cast<size_t>(payloadSlotInPlan) < plan.payloadMembers.size() &&
              "join superset: payload slot out of range");
       subop::Member bufMem = plan.payloadMembers[payloadSlotInPlan];
 
-      auto tableScanRefForGather = [&]() -> tuples::ColumnRefAttr {
-         if (firstTableGather) return firstTableGather.getRef();
-         if (templateGather) return templateGather.getRef();
-         auto refDef = scanOp.getRef();
-         return cm.createRef(&refDef.getColumn());
-      };
-
-      bool grafted = false;
-      if (hashMapOp) {
-         mlir::Value mapStream = hashMapOp.getResult();
-         subop::GatherOp gatherOnMap = findTableGatherOnStream(body, mapStream, matOp);
-         if (gatherOnMap && extendGatherMapping(gatherOnMap, tableMem, colDef, ctx)) {
-            matOp->setOperand(0, gatherOnMap.getRes());
-            appendMaterializeMember(bufMem, colDef);
-            grafted = true;
-         } else {
-            mlir::OpBuilder gb(hashMapOp);
-            gb.setInsertionPointAfter(hashMapOp);
-            auto mapping = subop::ColumnDefMemberMappingAttr::get(
-               ctx, llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>>{{tableMem, colDef}});
-            auto gatherTy = firstTableGather ? firstTableGather.getRes().getType() : mapStream.getType();
-            auto gatherLoc = templateGather ? templateGather.getLoc() : hashMapOp.getLoc();
-            auto newGather = gb.create<subop::GatherOp>(gatherLoc, gatherTy, mapStream, tableScanRefForGather(), mapping);
-            matOp->setOperand(0, newGather.getRes());
-            appendMaterializeMember(bufMem, colDef);
-            grafted = true;
-         }
-      }
-
-      if (!grafted) {
-         mlir::Operation* insertAfter = scanOp;
-         for (mlir::Operation& op : body.without_terminator()) {
-            if (&op == scanOp.getOperation()) continue;
-            if (!scanOp->isBeforeInBlock(&op)) continue;
-            if (mlir::isa<subop::GatherOp, subop::MapOp, subop::ReduceOp>(&op) && op.isBeforeInBlock(matOp)) {
-               insertAfter = &op;
-            }
-         }
-         mlir::OpBuilder gb(insertAfter);
-         gb.setInsertionPointAfter(insertAfter);
-         auto mapping = subop::ColumnDefMemberMappingAttr::get(
-            ctx, llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>>{{tableMem, colDef}});
-         mlir::Value streamIn = insertAfter->getResult(0);
-         auto gatherTy = firstTableGather ? firstTableGather.getRes().getType() : streamIn.getType();
-         auto gatherLoc = templateGather ? templateGather.getLoc() : scanOp.getLoc();
-         auto newGather = gb.create<subop::GatherOp>(gatherLoc, gatherTy, streamIn, tableScanRefForGather(), mapping);
-         matOp->setOperand(0, newGather.getRes());
-         appendMaterializeMember(bufMem, colDef);
-      }
+      mlir::Value mapStream = hashMapOp.getResult();
+      mlir::OpBuilder gb(hashMapOp);
+      gb.setInsertionPointAfter(hashMapOp);
+      auto mapping = subop::ColumnDefMemberMappingAttr::get(
+         ctx, llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>>{{tableMem, colDef}});
+      auto gatherTy = mapStream.getType();
+      auto refDef = scanOp.getRef();
+      auto gatherRef = cm.createRef(&refDef.getColumn());
+      auto newGather = gb.create<subop::GatherOp>(mlir::UnknownLoc::get(ctx), gatherTy, mapStream,
+                                                   gatherRef, mapping);
+      matOp->setOperand(0, newGather.getRes());
+      appendMaterializeMember(bufMem, colDef);
 
       materializedKeys.insert(spec.semanticKey);
       ++payloadSlotInPlan;
@@ -995,29 +1040,12 @@ static void setValueCarrierType(mlir::Value v, subop::HashIndexedViewType produc
 
 struct ConsumerCachedHivSites {
    llvm::DenseSet<void*> ssaClosure;
-   llvm::DenseSet<void*> scanListOps;
-   /// Consumer HIV layout before union alignment (from \c cache_get), for LER/HIV type guards.
    subop::HashIndexedViewType consumerHivBeforeAlign = nullptr;
 };
 
 static void addToSsaClosure(mlir::Value v, ConsumerCachedHivSites& sites) {
    if (!v) return;
    sites.ssaClosure.insert(v.getAsOpaquePointer());
-}
-
-static bool ssaClosureContains(const ConsumerCachedHivSites& sites, mlir::Value v) {
-   return v && sites.ssaClosure.contains(v.getAsOpaquePointer());
-}
-
-static bool isGatherUnderCachedScanList(subop::GatherOp gather, const ConsumerCachedHivSites& sites) {
-   mlir::Block* b = gather->getBlock();
-   if (!b) return false;
-   for (void* p : sites.scanListOps) {
-      auto* scanOp = static_cast<mlir::Operation*>(p);
-      if (scanOp->getBlock() != b) continue;
-      if (scanOp->isBeforeInBlock(gather.getOperation())) return true;
-   }
-   return false;
 }
 
 static bool isJoinProbeCompilerScope(llvm::StringRef scope) { return scope.starts_with("lookup_u_"); }
@@ -1062,143 +1090,19 @@ static subop::Member cloneMemberToContext(subop::Member srcMember, mlir::MLIRCon
                                         allowMemberTypeUpdate);
 }
 
-static CachedJoinBufferLayout cloneLayoutForContext(const CachedJoinBufferLayout& src, mlir::MLIRContext* dstCtx) {
-   if (!src.producerHiv) return {};
-   mlir::MLIRContext* srcCtx = src.producerHiv.getContext();
-   if (srcCtx == dstCtx) return src;
-
-   subop::HashIndexedViewType srcHiv = src.producerHiv;
-   llvm::SmallVector<subop::Member> keyMembers;
-   llvm::SmallVector<subop::Member> valMembers;
-   const bool allowMemberTypeUpdate = (srcCtx != dstCtx);
-   for (subop::Member m : srcHiv.getKeyMembers().getMembers()) {
-      keyMembers.push_back(cloneMemberToContext(m, srcCtx, dstCtx, allowMemberTypeUpdate));
-   }
-   for (subop::Member m : srcHiv.getValueMembers().getMembers()) {
-      valMembers.push_back(cloneMemberToContext(m, srcCtx, dstCtx, allowMemberTypeUpdate));
-   }
-
-   CachedJoinBufferLayout out;
-   out.producerHiv = subop::HashIndexedViewType::get(
-      dstCtx, subop::StateMembersAttr::get(dstCtx, keyMembers), subop::StateMembersAttr::get(dstCtx, valMembers),
-      srcHiv.getCompareHashForLookup());
-   out.payloadSemanticKeys = src.payloadSemanticKeys;
-   out.payloadMembers.reserve(src.payloadMembers.size());
-   out.payloadColumnTypes.reserve(src.payloadColumnTypes.size());
-   for (size_t i = 0; i < src.payloadMembers.size(); ++i) {
-      out.payloadMembers.push_back(cloneMemberToContext(src.payloadMembers[i], srcCtx, dstCtx, allowMemberTypeUpdate));
-      out.payloadColumnTypes.push_back(cloneTypeToContext(src.payloadColumnTypes[i], dstCtx));
-   }
-   return out;
+static void handleScanListSite(subop::ScanListOp scanList, subop::HashIndexedViewType consumerHiv,
+                               subop::HashIndexedViewType consumerHivBeforeAlign) {
+   setValueCarrierType(scanList.getList(), consumerHiv, consumerHivBeforeAlign);
+   auto* ctx = scanList.getContext();
+   auto expectedLer = subop::LookupEntryRefType::get(ctx, consumerHiv);
+   auto& col = scanList.getElem().getColumn();
+   if (mlir::isa<subop::LookupEntryRefType>(col.type) && col.type != expectedLer) col.type = expectedLer;
 }
 
-/// Sync lookup-entry-ref column types only on \c scan_list / gather tied to \p sites.
-static void syncConsumerLookupEntryRefColumnTypes(mlir::ModuleOp consumer, subop::HashIndexedViewType producerHiv,
-                                                  const ConsumerCachedHivSites& sites) {
-   auto* ctx = consumer.getContext();
-   auto expectedLer = subop::LookupEntryRefType::get(ctx, producerHiv);
-   consumer.walk([&](subop::ScanListOp scan) {
-      if (!ssaClosureContains(sites, scan.getList())) return;
-      auto& col = scan.getElem().getColumn();
-      auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(col.type);
-      if (!ler || !lookupEntryRefEmbedsHashIndexedView(ler)) return;
-      if (col.type != expectedLer) col.type = expectedLer;
-   });
-   consumer.walk([&](subop::GatherOp gather) {
-      if (!isGatherUnderCachedScanList(gather, sites)) return;
-      auto& col = gather.getRef().getColumn();
-      auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(col.type);
-      if (!ler || !lookupEntryRefEmbedsHashIndexedView(ler)) return;
-      if (col.type != expectedLer) col.type = expectedLer;
-   });
-}
-
-static void syncConsumerLookupListColumnAttrs(mlir::ModuleOp consumer, subop::HashIndexedViewType producerHiv,
-                                            const ConsumerCachedHivSites& sites) {
-   auto* ctx = consumer.getContext();
-   auto expectedListTy =
-      subop::ListType::get(ctx, subop::LookupEntryRefType::get(ctx, producerHiv));
-   consumer.walk([&](subop::LookupOp op) {
-      if (!ssaClosureContains(sites, op.getState())) return;
-      if (op.getRef().getColumn().type != expectedListTy) op.getRef().getColumn().type = expectedListTy;
-   });
-}
-
-static void remapSupplierPayloadGatherMembersInBlock(mlir::MLIRContext* ctx, mlir::Block& block,
-                                                      const CachedJoinBufferLayout& layout,
-                                                      const ConsumerCachedHivSites& sites) {
-   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
-   llvm::StringMap<subop::Member> semanticToMember;
-   assert(layout.payloadSemanticKeys.size() == layout.payloadMembers.size());
-   for (size_t i = 0; i < layout.payloadSemanticKeys.size(); ++i) {
-      semanticToMember[layout.payloadSemanticKeys[i]] = layout.payloadMembers[i];
-   }
-   block.walk([&](subop::GatherOp gather) {
-      if (!isGatherUnderCachedScanList(gather, sites)) return;
-      if (!mlir::isa<subop::LookupEntryRefType>(gather.getRef().getColumn().type)) return;
-      auto mapping = gather.getMapping();
-      llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> out;
-      bool changed = false;
-      for (auto [mem, def] : mapping.getMapping()) {
-         subop::Member newMem = mem;
-         auto [scope, leaf] = cm.getName(&def.getColumn());
-         if (!isJoinProbeCompilerScope(scope)) {
-            if (auto it = semanticToMember.find(columnSemanticKey(scope, leaf));
-                it != semanticToMember.end() && newMem != it->second) {
-               newMem = it->second;
-               changed = true;
-            }
-         }
-         out.push_back({newMem, def});
-      }
-      if (changed) gather.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, out));
-   });
-}
-
-static void remapSupplierPayloadGatherMembers(mlir::ModuleOp consumer, const CachedJoinBufferLayout& layout,
-                                              const ConsumerCachedHivSites& sites) {
-   auto* ctx = consumer.getContext();
-   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
-   llvm::StringMap<subop::Member> semanticToMember;
-   assert(layout.payloadSemanticKeys.size() == layout.payloadMembers.size());
-   for (size_t i = 0; i < layout.payloadSemanticKeys.size(); ++i) {
-      semanticToMember[layout.payloadSemanticKeys[i]] = layout.payloadMembers[i];
-   }
-   consumer.walk([&](subop::GatherOp gather) {
-      if (!isGatherUnderCachedScanList(gather, sites)) return;
-      if (!mlir::isa<subop::LookupEntryRefType>(gather.getRef().getColumn().type)) return;
-      auto mapping = gather.getMapping();
-      llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> out;
-      bool changed = false;
-      for (auto [mem, def] : mapping.getMapping()) {
-         subop::Member newMem = mem;
-         auto [scope, leaf] = cm.getName(&def.getColumn());
-         if (!isJoinProbeCompilerScope(scope)) {
-            if (auto it = semanticToMember.find(columnSemanticKey(scope, leaf));
-                it != semanticToMember.end() && newMem != it->second) {
-               newMem = it->second;
-               changed = true;
-            }
-         }
-         out.push_back({newMem, def});
-      }
-      if (changed) gather.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, out));
-   });
-}
-
-static void handleScanListSite(subop::ScanListOp scanList, subop::HashIndexedViewType producerHiv,
-                               subop::HashIndexedViewType consumerHivBeforeAlign, const CachedJoinBufferLayout& layout,
-                               ConsumerCachedHivSites& sites) {
-   setValueCarrierType(scanList.getList(), producerHiv, consumerHivBeforeAlign);
-   sites.scanListOps.insert(scanList.getOperation());
-   remapSupplierPayloadGatherMembersInBlock(scanList->getContext(), *scanList->getBlock(), layout, sites);
-}
-
-/// Walk every use of cached HIV SSA: execution_step / nested_execution_group ports (recurse),
-/// \c scan_list (fix types + gather slots), \c lookup (list carrier). Other uses assert.
-static void buildConsumerCachedHivSitesFromRoot(mlir::Value root, subop::HashIndexedViewType producerHiv,
-                                                subop::HashIndexedViewType consumerHivBeforeAlign,
-                                                const CachedJoinBufferLayout& layout, ConsumerCachedHivSites& sites) {
+/// From \c cache_get HIV: recurse through port args; at \c scan_list update list/entry-ref types only.
+static void traverseConsumerHivUsesFromRoot(mlir::Value root, subop::HashIndexedViewType consumerHiv,
+                                            subop::HashIndexedViewType consumerHivBeforeAlign,
+                                            ConsumerCachedHivSites& sites) {
    llvm::DenseSet<void*> visited;
    llvm::SmallVector<mlir::Value> worklist;
    auto enqueue = [&](mlir::Value val) {
@@ -1207,12 +1111,12 @@ static void buildConsumerCachedHivSitesFromRoot(mlir::Value root, subop::HashInd
       worklist.push_back(val);
    };
 
-   setValueCarrierType(root, producerHiv, consumerHivBeforeAlign);
+   setValueCarrierType(root, consumerHiv, consumerHivBeforeAlign);
    enqueue(root);
 
    while (!worklist.empty()) {
       mlir::Value v = worklist.pop_back_val();
-      if (typeEmbedsHashIndexedView(v.getType())) setValueCarrierType(v, producerHiv, consumerHivBeforeAlign);
+      if (typeEmbedsHashIndexedView(v.getType())) setValueCarrierType(v, consumerHiv, consumerHivBeforeAlign);
 
       for (mlir::Operation* user : v.getUsers()) {
          if (auto ret = mlir::dyn_cast<subop::ExecutionStepReturnOp>(user)) {
@@ -1220,7 +1124,7 @@ static void buildConsumerCachedHivSitesFromRoot(mlir::Value root, subop::HashInd
             if (!step) continue;
             for (unsigned i = 0; i < ret.getNumOperands() && i < step.getNumResults(); ++i) {
                if (ret.getOperand(i) != v) continue;
-               setValueCarrierType(step.getResult(i), producerHiv, consumerHivBeforeAlign);
+               setValueCarrierType(step.getResult(i), consumerHiv, consumerHivBeforeAlign);
                enqueue(step.getResult(i));
             }
             continue;
@@ -1231,8 +1135,8 @@ static void buildConsumerCachedHivSitesFromRoot(mlir::Value root, subop::HashInd
             mlir::Block& body = step.getSubOps().front();
             assert(i < body.getNumArguments() && "execution_step operand without block argument");
             mlir::BlockArgument barg = body.getArgument(i);
-            setValueCarrierType(barg, producerHiv, consumerHivBeforeAlign);
-            if (i < step.getNumResults()) setValueCarrierType(step.getResult(i), producerHiv, consumerHivBeforeAlign);
+            setValueCarrierType(barg, consumerHiv, consumerHivBeforeAlign);
+            if (i < step.getNumResults()) setValueCarrierType(step.getResult(i), consumerHiv, consumerHivBeforeAlign);
             enqueue(barg);
             if (i < step.getNumResults()) enqueue(step.getResult(i));
             continue;
@@ -1243,7 +1147,7 @@ static void buildConsumerCachedHivSitesFromRoot(mlir::Value root, subop::HashInd
             mlir::Block& body = neg.getSubOps().front();
             assert(i < body.getNumArguments());
             mlir::BlockArgument barg = body.getArgument(i);
-            setValueCarrierType(barg, producerHiv, consumerHivBeforeAlign);
+            setValueCarrierType(barg, consumerHiv, consumerHivBeforeAlign);
             enqueue(barg);
             continue;
          }
@@ -1253,7 +1157,7 @@ static void buildConsumerCachedHivSitesFromRoot(mlir::Value root, subop::HashInd
             auto* ctx = v.getContext();
             auto listRef = lookup.getRef();
             mlir::Type expectedListTy =
-               subop::ListType::get(ctx, subop::LookupEntryRefType::get(ctx, producerHiv));
+               subop::ListType::get(ctx, subop::LookupEntryRefType::get(ctx, consumerHiv));
             if (listRef.getColumn().type != expectedListTy) listRef.getColumn().type = expectedListTy;
             for (mlir::Operation* streamUser : lookup.getResult().getUsers()) {
                auto nm = mlir::dyn_cast<subop::NestedMapOp>(streamUser);
@@ -1262,7 +1166,7 @@ static void buildConsumerCachedHivSitesFromRoot(mlir::Value root, subop::HashInd
                assert(!reg.empty());
                for (mlir::BlockArgument barg : reg.front().getArguments()) {
                   if (!typeEmbedsHashIndexedView(barg.getType())) continue;
-                  setValueCarrierType(barg, producerHiv, consumerHivBeforeAlign);
+                  setValueCarrierType(barg, consumerHiv, consumerHivBeforeAlign);
                   enqueue(barg);
                }
             }
@@ -1271,7 +1175,7 @@ static void buildConsumerCachedHivSitesFromRoot(mlir::Value root, subop::HashInd
 
          if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(user)) {
             assert(scanList.getList() == v && "scan_list list operand must be the carrier value");
-            handleScanListSite(scanList, producerHiv, consumerHivBeforeAlign, layout, sites);
+            handleScanListSite(scanList, consumerHiv, consumerHivBeforeAlign);
             continue;
          }
 
@@ -1305,30 +1209,6 @@ static void refreshAllEmbeddedHivCarrierTypes(mlir::ModuleOp module, subop::Hash
    }
 }
 
-static void refreshEmbeddedHivCarrierTypesInClosure(mlir::ModuleOp module, subop::HashIndexedViewType producerHiv,
-                                                    const ConsumerCachedHivSites& sites) {
-   auto* ctx = module.getContext();
-   auto refreshValue = [&](mlir::Value val) {
-      if (!ssaClosureContains(sites, val)) return;
-      if (mlir::Type nt = replaceEmbeddedHivInType(ctx, val.getType(), producerHiv, nullptr);
-          nt != val.getType()) {
-         val.setType(nt);
-      }
-   };
-   module.walk([&](mlir::Operation* op) {
-      if (!opOperandsOrNestedBlockArgsTouchClosure(op, sites.ssaClosure)) return;
-      for (mlir::Value r : op->getResults()) refreshValue(r);
-      for (mlir::Region& reg : op->getRegions()) {
-         for (mlir::Block& block : reg) {
-            for (mlir::BlockArgument a : block.getArguments()) refreshValue(a);
-         }
-      }
-   });
-   for (void* p : sites.ssaClosure) {
-      refreshValue(mlir::Value::getFromOpaquePointer(p));
-   }
-}
-
 static void syncExecutionStepPortsForModule(mlir::ModuleOp module, const llvm::DenseSet<void*>* closureFilter) {
    synchronizeExecutionStepPortTypes(module, closureFilter);
 }
@@ -1339,32 +1219,38 @@ struct ConsumerColumnBinding {
 };
 
 /// Resolve a consumer member for a union payload slot from probe-side gather/materialize mappings.
+/// Matches by semantic column identity only (not producer union types).
 static std::optional<subop::Member> findConsumerMemberForPayloadSlot(
-   llvm::StringRef semanticKey, mlir::Type slotTy,
-   const llvm::StringMap<ConsumerColumnBinding>& semanticToConsumer, subop::MemberManager& mm) {
-   auto matchesSlot = [&](const ConsumerColumnBinding& b) { return b.columnType == slotTy; };
-
+   llvm::StringRef semanticKey, const llvm::StringMap<ConsumerColumnBinding>& semanticToConsumer,
+   subop::MemberManager& mm) {
    if (!semanticKey.starts_with("member$")) {
       if (auto it = semanticToConsumer.find(semanticKey); it != semanticToConsumer.end()) {
-         if (matchesSlot(it->second)) return it->second.member;
+         return it->second.member;
       }
       llvm::StringRef wantLeaf = normalizeColumnIdentifier(semanticKeyLeaf(semanticKey));
+      llvm::SmallVector<subop::Member, 4> byLeaf;
       for (const auto& entry : semanticToConsumer) {
          if (normalizeColumnIdentifier(semanticKeyLeaf(entry.getKey())) != wantLeaf) continue;
-         if (matchesSlot(entry.second)) return entry.second.member;
+         byLeaf.push_back(entry.second.member);
       }
+      if (byLeaf.size() == 1) return byLeaf.front();
    }
 
    // Layout metadata may still carry producer `member$N` labels; fall back to unique probe column types.
-   llvm::SmallVector<subop::Member, 4> byType;
-   for (const auto& entry : semanticToConsumer) {
-      if (matchesSlot(entry.second)) byType.push_back(entry.second.member);
-   }
-   if (byType.size() == 1) return byType.front();
-   if (byType.size() > 1 && semanticKey == "member$0") {
-      for (subop::Member m : byType) {
-         if (mm.getName(m) == "member$0") return m;
+   if (semanticKey == "member$0") {
+      for (const auto& entry : semanticToConsumer) {
+         if (mm.getName(entry.second.member) == "member$0") return entry.second.member;
       }
+   }
+   return std::nullopt;
+}
+
+static std::optional<subop::Member> findConsumerMemberByName(llvm::StringRef name,
+                                                             subop::HashIndexedViewType consumerHivBeforeAlign) {
+   if (!consumerHivBeforeAlign) return std::nullopt;
+   auto& mm = consumerHivBeforeAlign.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (subop::Member m : consumerHivBeforeAlign.getValueMembers().getMembers()) {
+      if (mm.getName(m) == name) return m;
    }
    return std::nullopt;
 }
@@ -1395,9 +1281,9 @@ static void collectConsumerPayloadSemanticMembers(mlir::ModuleOp consumer,
    });
 }
 
-/// Per-consumer HIV for \c cache_get: same payload column types and physical order as the producer union layout,
-/// but member names follow the consumer's pre-reuse HIV when that query already had the column, otherwise a fresh
-/// \c member$N slot.
+/// Per-consumer HIV for \c cache_get: payload physical order follows the cached producer layout, but each slot
+/// reuses the consumer's own \c member$N name and column type when that query already had the column; union-only
+/// columns are inserted with producer types under fresh \c member$N slots (no type overwrite on existing members).
 static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp consumer,
                                                                 subop::HashIndexedViewType producerHiv,
                                                                 const CachedJoinBufferLayout& layout,
@@ -1413,30 +1299,37 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    llvm::StringMap<subop::Member> assignedBySemantic;
    assert(layout.payloadSemanticKeys.size() == layout.payloadMembers.size());
 
-   for (size_t i = 0; i < layout.payloadSemanticKeys.size(); ++i) {
-      mlir::Type ty = layout.payloadColumnTypes[i];
-      llvm::StringRef semKey = layout.payloadSemanticKeys[i];
-      if (semKey.starts_with("filter_pred")) continue;
-      subop::Member consumerMem;
-      std::optional<subop::Member> reused;
-      // Union plan always places the join-key column first (i32 suppkey for supplier HIV).
-      if (i == 0 && mlir::isa<mlir::IntegerType>(ty)) {
-         consumerMem = mm.getOrCreateMemberDirect("member$0", ty, /*allowTypeUpdate=*/true);
-      } else {
-      reused =
-         findConsumerMemberForPayloadSlot(semKey, ty, semanticToConsumer, mm);
+   auto ensureConsumerMember = [&](std::optional<subop::Member> reused, mlir::Type producerSlotTy) -> subop::Member {
       if (reused) {
-         consumerMem = mm.getOrCreateMemberDirect(mm.getName(*reused), ty, /*allowTypeUpdate=*/true);
-      } else {
-         llvm::SmallVector<subop::Member, 8> bump;
-         if (consumerHivBeforeAlign) {
-            for (subop::Member m : consumerHivBeforeAlign.getValueMembers().getMembers()) bump.push_back(m);
-         }
-         for (const auto& assigned : assignedBySemantic) bump.push_back(assigned.second);
-         unsigned nextSlot = nextPayloadMemberSlot(mm, assignedBySemantic, bump);
-         consumerMem = mm.createMemberDirect("member$" + std::to_string(nextSlot), ty);
+         mlir::Type consumerTy = mm.getType(*reused);
+         return mm.getOrCreateMemberDirect(mm.getName(*reused), consumerTy, /*allowTypeUpdate=*/false);
       }
+      llvm::SmallVector<subop::Member, 8> bump;
+      if (consumerHivBeforeAlign) {
+         for (subop::Member m : consumerHivBeforeAlign.getValueMembers().getMembers()) bump.push_back(m);
       }
+      for (const auto& assigned : assignedBySemantic) bump.push_back(assigned.second);
+      unsigned nextSlot = nextPayloadMemberSlot(mm, assignedBySemantic, bump);
+      return mm.createMemberDirect("member$" + std::to_string(nextSlot), producerSlotTy);
+   };
+
+   for (size_t i = 0; i < layout.payloadSemanticKeys.size(); ++i) {
+      mlir::Type producerSlotTy = layout.payloadColumnTypes[i];
+      llvm::StringRef semKey = layout.payloadSemanticKeys[i];
+      subop::Member producerMem = layout.payloadMembers[i];
+
+      if (semKey.starts_with("filter_pred")) {
+         subop::Member consumerMem = makeOrGetPredMember(ctx);
+         assignedBySemantic[semKey] = consumerMem;
+         producerPayloadToConsumer[producerMem] = consumerMem;
+         continue;
+      }
+
+      std::optional<subop::Member> reused = findConsumerMemberForPayloadSlot(semKey, semanticToConsumer, mm);
+      if (!reused && i == 0) {
+         reused = findConsumerMemberByName("member$0", consumerHivBeforeAlign);
+      }
+      subop::Member consumerMem = ensureConsumerMember(reused, producerSlotTy);
       assignedBySemantic[semKey] = consumerMem;
       producerPayloadToConsumer[layout.payloadMembers[i]] = consumerMem;
    }
@@ -1446,15 +1339,22 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    for (subop::Member m : producerHiv.getValueMembers().getMembers()) {
       if (auto it = producerPayloadToConsumer.find(m); it != producerPayloadToConsumer.end()) {
          valueMembers.push_back(it->second);
+      } else if (consumerHivBeforeAlign) {
+         if (auto reused = findConsumerMemberByName(mm.getName(m), consumerHivBeforeAlign)) {
+            valueMembers.push_back(
+               mm.getOrCreateMemberDirect(mm.getName(*reused), mm.getType(*reused), /*allowTypeUpdate=*/false));
+         } else {
+            valueMembers.push_back(cloneMemberToContext(m, producerHiv.getContext(), ctx, /*allowMemberTypeUpdate=*/false));
+         }
       } else {
-         valueMembers.push_back(m);
+         valueMembers.push_back(cloneMemberToContext(m, producerHiv.getContext(), ctx, /*allowMemberTypeUpdate=*/false));
       }
    }
 
    mlir::MLIRContext* producerCtx = producerHiv.getContext();
    llvm::SmallVector<subop::Member> keyMembers;
    for (subop::Member m : producerHiv.getKeyMembers().getMembers()) {
-      keyMembers.push_back(cloneMemberToContext(m, producerCtx, ctx, /*allowMemberTypeUpdate=*/true));
+      keyMembers.push_back(cloneMemberToContext(m, producerCtx, ctx, /*allowMemberTypeUpdate=*/false));
    }
    auto consumerHiv = subop::HashIndexedViewType::get(
       ctx, subop::StateMembersAttr::get(ctx, keyMembers), subop::StateMembersAttr::get(ctx, valueMembers),
@@ -1463,9 +1363,18 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    outConsumerLayout = layout;
    outConsumerLayout.producerHiv = consumerHiv;
    outConsumerLayout.payloadMembers.clear();
+   outConsumerLayout.payloadColumnTypes.clear();
    outConsumerLayout.payloadMembers.reserve(layout.payloadMembers.size());
+   outConsumerLayout.payloadColumnTypes.reserve(layout.payloadMembers.size());
    for (subop::Member m : layout.payloadMembers) {
-      outConsumerLayout.payloadMembers.push_back(producerPayloadToConsumer[m]);
+      subop::Member consumerMem;
+      if (auto it = producerPayloadToConsumer.find(m); it != producerPayloadToConsumer.end()) {
+         consumerMem = it->second;
+      } else {
+         consumerMem = cloneMemberToContext(m, producerCtx, ctx, /*allowMemberTypeUpdate=*/false);
+      }
+      outConsumerLayout.payloadMembers.push_back(consumerMem);
+      outConsumerLayout.payloadColumnTypes.push_back(mm.getType(consumerMem));
    }
    return consumerHiv;
 }
@@ -1476,38 +1385,25 @@ void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const Cache
                                             std::optional<uint64_t> cacheKey) {
    if (!layout.producerHiv) return;
 
-   // Keep producer \c Member handles in the synthetic/producer context only. Cloning payload members into the
-   // consumer \c MemberManager would reuse names like \c member$1 with conflicting types across queries.
    subop::HashIndexedViewType producerHiv = layout.producerHiv;
    ConsumerCachedHivSites sites;
-   CachedJoinBufferLayout consumerLayout;
    subop::HashIndexedViewType consumerHiv = nullptr;
 
    consumer.walk([&](subop::CacheGetOp get) {
       if (cacheKey && static_cast<uint64_t>(get.getKey()) != *cacheKey) return;
 
       sites.consumerHivBeforeAlign = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
+      CachedJoinBufferLayout consumerLayout;
       consumerHiv = buildConsumerAlignedHivType(consumer, producerHiv, layout, sites.consumerHivBeforeAlign,
-                                                consumerLayout);
+                                                  consumerLayout);
       get.getResult().setType(consumerHiv);
-      buildConsumerCachedHivSitesFromRoot(get.getResult(), consumerHiv, nullptr, consumerLayout, sites);
+      traverseConsumerHivUsesFromRoot(get.getResult(), consumerHiv, sites.consumerHivBeforeAlign, sites);
    });
 
    if (sites.ssaClosure.empty() || !consumerHiv) return;
 
    expandClosureThroughExecutionStepPorts(consumer, sites.ssaClosure);
-
-   // Force every embedded HIV/LER in the cached closure to `consumerHiv`. Intermediate layouts
-   // (e.g. filter_pred-extended pre-align carriers on nested_map block args) must not survive.
-   refreshEmbeddedHivCarrierTypesInClosure(consumer, consumerHiv, sites);
-   refreshAllEmbeddedHivCarrierTypes(consumer, consumerHiv);
    syncExecutionStepPortsForModule(consumer, &sites.ssaClosure);
-   syncConsumerLookupListColumnAttrs(consumer, consumerHiv, sites);
-   syncConsumerLookupEntryRefColumnTypes(consumer, consumerHiv, sites);
-   remapSupplierPayloadGatherMembers(consumer, consumerLayout, sites);
-   syncExecutionStepPortsForModule(consumer, &sites.ssaClosure);
-   refreshAllEmbeddedHivCarrierTypes(consumer, consumerHiv);
-   syncExecutionStepPortsForModule(consumer, nullptr);
 }
 
 void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::ModuleOp query0, mlir::ModuleOp query1,
@@ -1588,31 +1484,18 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
 
 void resyncConsumerCachedHivCarrierTypesFromCacheGet(mlir::ModuleOp consumer,
                                                      std::optional<uint64_t> cacheKey) {
-   (void)collectModuleReuseInfo(consumer);
    consumer.walk([&](subop::CacheGetOp get) {
       if (cacheKey && static_cast<uint64_t>(get.getKey()) != *cacheKey) return;
       auto canonicalHiv = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
       if (!canonicalHiv) return;
 
-      // Probe `filter_pred` insertion can leave narrow pre-align HIV types on `nested_map` block
-      // arguments outside the cache_get backward closure; refresh the whole module.
+      ConsumerCachedHivSites sites;
+      traverseConsumerHivUsesFromRoot(get.getResult(), canonicalHiv, nullptr, sites);
+      expandClosureThroughExecutionStepPorts(consumer, sites.ssaClosure);
+      syncExecutionStepPortsForModule(consumer, &sites.ssaClosure);
+      // `filter_pred` insertion can touch carriers outside the cache_get use closure.
       refreshAllEmbeddedHivCarrierTypes(consumer, canonicalHiv);
       syncExecutionStepPortsForModule(consumer, nullptr);
-      auto* ctx = consumer.getContext();
-      auto expectedLer = subop::LookupEntryRefType::get(ctx, canonicalHiv);
-      auto expectedListTy = subop::ListType::get(ctx, expectedLer);
-      consumer.walk([&](subop::LookupOp op) {
-         if (op.getRef().getColumn().type != expectedListTy) op.getRef().getColumn().type = expectedListTy;
-      });
-      consumer.walk([&](subop::ScanListOp scan) {
-         auto& col = scan.getElem().getColumn();
-         if (col.type != expectedLer) col.type = expectedLer;
-      });
-      consumer.walk([&](subop::GatherOp gather) {
-         if (!mlir::isa<subop::LookupEntryRefType>(gather.getRef().getColumn().type)) return;
-         auto& col = gather.getRef().getColumn();
-         if (col.type != expectedLer) col.type = expectedLer;
-      });
    });
 }
 

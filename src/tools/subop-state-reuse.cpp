@@ -502,26 +502,25 @@ int main(int argc, char** argv) {
       runs[0].module, runs[1].module, firstPair);
    const double rewriteMs = millisSince(tRewrite);
    optimizationMs += rewriteMs;
-   if (mlir::failed(mlir::verify(runs[0].module)) || mlir::failed(mlir::verify(runs[1].module)) ||
-       (rewriteRes.query0 && mlir::failed(mlir::verify(*rewriteRes.query0)))) {
-      llvm::errs() << kToolName << ": MLIR verification failed after cross-query reuse rewrite"
-                   << " (optimization_ms=" << optimizationMs << ")\n";
-      return 1;
-   }
    llvm::outs() << "\n// reuse_targets: query[0]=" << rewriteRes.numTargetsQuery0
                   << " query[1]=" << rewriteRes.numTargetsQuery1 << "\n";
    llvm::outs() << "\n// reuse_targets_q0_mapped: " << rewriteRes.numTargetsQuery0Mapped << "\n";
 
    const char* dumpSubOpDir = std::getenv("LINGODB_DUMP_SUBOP_DIR");
-   const bool dumpLowering = envFlagEnabled("LINGODB_DUMP_LOWERING");
-   if (dumpLowering && dumpSubOpDir) {
+   // With `LINGODB_DUMP_SUBOP_DIR`, replay lowering into `snapshots/` by default.
+   // Set `LINGODB_DUMP_LOWERING=0` to write only `consumer-subop.mlir`.
+   const char* dumpLoweringEnv = std::getenv("LINGODB_DUMP_LOWERING");
+   const bool dumpLoweringSnapshots =
+      dumpSubOpDir && (!dumpLoweringEnv || dumpLoweringEnv[0] == '\0' || envFlagEnabled("LINGODB_DUMP_LOWERING"));
+   if (dumpSubOpDir) {
       auto dumpScenario = [&](mlir::ModuleOp mod, const llvm::Twine& outDir, llvm::StringRef scenarioName) {
          const std::string dir = outDir.str();
          llvm::sys::fs::create_directories(dir);
          dumpModuleToFile(mod, dir + "/consumer-subop.mlir");
+         if (!dumpLoweringSnapshots) return true;
          mlir::OwningOpRef<mlir::ModuleOp> clone = mlir::cast<mlir::ModuleOp>(mod->clone());
          const bool ok = lowerFromSubOpLayer(*clone, dir.c_str(), /*snapshotLabel=*/{});
-         llvm::errs() << "[dump] " << scenarioName << " lowerDB " << (ok ? "OK" : "FAILED") << "\n";
+         llvm::errs() << "[dump] " << scenarioName << " lowering " << (ok ? "OK" : "FAILED") << "\n";
          return ok;
       };
 
@@ -531,16 +530,13 @@ int main(int argc, char** argv) {
       }
       dumpScenario(runs[0].module, base + "/rewrite-query0-test.sql", "rewrite-query0-test.sql");
       dumpScenario(runs[1].module, base + "/rewrite-query1-test2.sql", "rewrite-query1-test2.sql");
-   } else if (dumpSubOpDir) {
-      const std::string base(dumpSubOpDir);
-      if (rewriteRes.query0 && rewriteRes.numTargetsQuery0Mapped > 0) {
-         llvm::sys::fs::create_directories(base + "/rewrite-synthetic-query0");
-         dumpModuleToFile(*rewriteRes.query0, base + "/rewrite-synthetic-query0/consumer-subop.mlir");
-      }
-      llvm::sys::fs::create_directories(base + "/rewrite-query0-test.sql");
-      llvm::sys::fs::create_directories(base + "/rewrite-query1-test2.sql");
-      dumpModuleToFile(runs[0].module, base + "/rewrite-query0-test.sql/consumer-subop.mlir");
-      dumpModuleToFile(runs[1].module, base + "/rewrite-query1-test2.sql/consumer-subop.mlir");
+   }
+
+   if (mlir::failed(mlir::verify(runs[0].module)) || mlir::failed(mlir::verify(runs[1].module)) ||
+       (rewriteRes.query0 && mlir::failed(mlir::verify(*rewriteRes.query0)))) {
+      llvm::errs() << kToolName << ": MLIR verification failed after cross-query reuse rewrite"
+                   << " (optimization_ms=" << optimizationMs << ")\n";
+      return 1;
    }
 
    // Optional heavy debug printing (can be huge / sometimes crashes when IR is malformed).
