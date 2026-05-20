@@ -43,6 +43,11 @@ void refreshCachedJoinLayoutsFromSyntheticCachePuts(mlir::ModuleOp synthetic,
                                                     llvm::ArrayRef<CacheTarget> targetsInSynthetic,
                                                     CachedJoinBufferLayoutsByKey& layoutsByKey);
 
+/// After probe-side \c filter_pred$0 insertion, re-push the \c cache_get HIV layout through the reuse
+/// SSA closure so nested \c lookup_entry_ref carriers match the aligned consumer member layout.
+void resyncConsumerCachedHivCarrierTypesFromCacheGet(mlir::ModuleOp consumer,
+                                                     std::optional<uint64_t> cacheKey = std::nullopt);
+
 } // namespace lingodb::compiler::dialect::subop
 
 #endif

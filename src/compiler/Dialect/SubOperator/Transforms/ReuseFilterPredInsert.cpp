@@ -1917,6 +1917,14 @@ static void syncProbeGatherRefsToCachedHivInClosure(mlir::ModuleOp module, subop
 
 void applyJoinBufferProbePredFiltersAfterLayout(mlir::ModuleOp module) {
    if (!kEnableReuseStateFilterPredReapply) return;
+   // Consumers that only read a shared cached HIV (no local join-buffer materialize) already
+   // inherit write-side `filter_pred$0` from the producer; re-inserting probe filters breaks lowering.
+   bool hasLocalJoinBufferMaterialize = false;
+   module.walk([&](subop::MaterializeOp mat) {
+      if (getInnerBufferTypeForMaterializeState(mat.getState().getType())) hasLocalJoinBufferMaterialize = true;
+   });
+   if (!hasLocalJoinBufferMaterialize) return;
+
    auto reuse = collectModuleReuseInfo(module);
    subop::Member predMember = makeOrGetPredMember(module.getContext());
    module.walk([&](subop::CacheGetOp get) {

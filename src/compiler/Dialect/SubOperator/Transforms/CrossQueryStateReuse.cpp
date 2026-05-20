@@ -461,6 +461,12 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
    }
    const ModuleReuseInfo& reuse = *reuseBeforeMutation;
 
+   llvm::DenseMap<void*, mlir::Type> cacheGetStateTypeBeforePredLayout;
+   for (const CacheTarget& t : targets) {
+      if (!t.state) continue;
+      cacheGetStateTypeBeforePredLayout[t.state.getAsOpaquePointer()] = t.state.getType();
+   }
+
    if (kEnableReuseStateFilterPredReapply && !joinBufferHashmapLayoutAlreadyApplied) {
       maybeExtendJoinBufferHashmapLayoutForFilterPred(consumerModule, targets, reuse);
    }
@@ -555,11 +561,16 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
       }
 
       auto group = findEnclosingExecutionGroup(state);
+      mlir::Type cacheGetTy = state.getType();
+      if (auto itTy = cacheGetStateTypeBeforePredLayout.find(state.getAsOpaquePointer());
+          itTy != cacheGetStateTypeBeforePredLayout.end()) {
+         cacheGetTy = itTy->second;
+      }
       mlir::Value cached;
       if (auto it = keyToCached.find(cacheKey); it != keyToCached.end()) {
          cached = it->second;
       } else {
-         cached = insertCacheGetAtExecutionGroupStart(group, state.getType(), cacheKey);
+         cached = insertCacheGetAtExecutionGroupStart(group, cacheGetTy, cacheKey);
          keyToCached[cacheKey] = cached;
       }
 
@@ -764,6 +775,12 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       applyJoinBufferProbePredFiltersAfterLayout(query0);
       applyJoinBufferProbePredFiltersAfterLayout(query1);
       if (res.query0) applyJoinBufferProbePredFiltersAfterLayout(*res.query0);
+   }
+   for (auto& t : targets0) {
+      resyncConsumerCachedHivCarrierTypesFromCacheGet(query0, t.cacheKey);
+   }
+   for (auto& t : targets1) {
+      resyncConsumerCachedHivCarrierTypesFromCacheGet(query1, t.cacheKey);
    }
 
    return res;
