@@ -1902,38 +1902,37 @@ void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member 
    }
 }
 
-/// Point probe-side `gather` entry refs at the `cache_get` HIV layout (with `filter_pred$0`).
-static void syncProbeGatherRefsToCachedHivLayouts(mlir::ModuleOp module) {
+/// Point probe-side `gather` entry refs at the cached HIV layout, only on the \p closure SSA use chain.
+static void syncProbeGatherRefsToCachedHivInClosure(mlir::ModuleOp module, subop::HashIndexedViewType cachedHiv,
+                                                    const llvm::DenseSet<void*>& closure) {
    auto* ctx = module.getContext();
-   llvm::SmallVector<subop::HashIndexedViewType, 8> cachedHivs;
-   module.walk([&](subop::CacheGetOp get) {
-      auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
-      if (!hiv) return;
-      if (!valueMembersContainMemberNamed(ctx, hiv.getValueMembers(), "filter_pred$0")) return;
-      cachedHivs.push_back(hiv);
-   });
-   if (cachedHivs.empty()) return;
-
+   auto expected = subop::LookupEntryRefType::get(ctx, cachedHiv);
    module.walk([&](subop::GatherOp gather) {
+      if (!opOperandsOrNestedBlockArgsTouchClosure(gather.getOperation(), closure)) return;
       auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(gather.getRef().getColumn().type);
-      if (!ler) return;
-      auto oldHiv = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState());
-      if (!oldHiv) return;
-      for (subop::HashIndexedViewType cached : cachedHivs) {
-         if (oldHiv.getKeyMembers() != cached.getKeyMembers()) continue;
-         if (oldHiv.getCompareHashForLookup() != cached.getCompareHashForLookup()) continue;
-         auto expected = subop::LookupEntryRefType::get(ctx, cached);
-         if (gather.getRef().getColumn().type != expected) gather.getRef().getColumn().type = expected;
-         break;
-      }
+      if (!ler || !mlir::isa<subop::HashIndexedViewType>(ler.getState())) return;
+      if (gather.getRef().getColumn().type != expected) gather.getRef().getColumn().type = expected;
    });
 }
 
 void applyJoinBufferProbePredFiltersAfterLayout(mlir::ModuleOp module) {
    if (!kEnableReuseStateFilterPredReapply) return;
-   syncProbeGatherRefsToCachedHivLayouts(module);
+   auto reuse = collectModuleReuseInfo(module);
    subop::Member predMember = makeOrGetPredMember(module.getContext());
-   module.walk([&](subop::ExecutionStepOp step) { insertHashIndexedViewGatherPredFilters(step, predMember); });
+   module.walk([&](subop::CacheGetOp get) {
+      auto cachedHiv = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
+      if (!cachedHiv) return;
+      if (!valueMembersContainMemberNamed(module.getContext(), cachedHiv.getValueMembers(), "filter_pred$0")) return;
+
+      JoinBufferHivSsaClosure closure = computeJoinBufferHivSsaClosure({get.getResult()}, reuse);
+      expandClosureThroughExecutionStepPorts(module, closure.opaque);
+      syncProbeGatherRefsToCachedHivInClosure(module, cachedHiv, closure.opaque);
+
+      module.walk([&](subop::ExecutionStepOp step) {
+         if (!executionStepTouchesClosure(step, closure.opaque)) return;
+         insertHashIndexedViewGatherPredFilters(step, predMember);
+      });
+   });
 }
 
 /// Forward walk (uses + `merge` + `execution_step` region args) until we see `subop.create_hash_indexed_view`

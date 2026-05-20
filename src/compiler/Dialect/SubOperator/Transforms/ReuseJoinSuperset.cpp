@@ -14,6 +14,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include <algorithm>
 #include <cassert>
 #include <unordered_set>
@@ -54,7 +55,8 @@ struct JoinBufferUnionPlan {
    llvm::SmallVector<subop::Member, 8> payloadMembers;
 };
 
-static void ingestExternalSupplierColumns(mlir::ModuleOp module, llvm::StringMap<PayloadColumnSpec>& unionCols);
+static void ingestExternalTableColumnsForUnionScopes(mlir::ModuleOp module,
+                                                     llvm::StringMap<PayloadColumnSpec>& unionCols);
 
 static subop::CreateHashIndexedView findCreateHashIndexedViewForState(
    mlir::Value hiv, const llvm::DenseMap<mlir::Value, llvm::SmallVector<subop::ExecutionStepOp, 8>>& writerStepsByState) {
@@ -186,8 +188,8 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
    };
    ingestHiv(hivA, reuseA);
    ingestHiv(hivB, reuseB);
-   ingestExternalSupplierColumns(modA, unionCols);
-   ingestExternalSupplierColumns(modB, unionCols);
+   ingestExternalTableColumnsForUnionScopes(modA, unionCols);
+   ingestExternalTableColumnsForUnionScopes(modB, unionCols);
 
    llvm::SmallVector<PayloadColumnSpec*, 8> ordered;
    ordered.reserve(unionCols.size());
@@ -344,9 +346,14 @@ static void applyBufferLayoutToSsaClosure(mlir::ModuleOp module, llvm::ArrayRef<
    synchronizeExecutionStepPortTypes(module, &closure);
 }
 
-static void alignBufferMergeThreadLocalsWithMergeResult(mlir::ModuleOp module) {
+static void alignBufferMergeThreadLocalsWithMergeResult(mlir::ModuleOp module,
+                                                        const llvm::DenseSet<void*>* closureFilter) {
    auto* ctx = module.getContext();
    module.walk([&](subop::MergeOp merge) {
+      if (closureFilter && !opaqueClosureContains(*closureFilter, merge.getRes()) &&
+          !opaqueClosureContains(*closureFilter, merge.getThreadLocal())) {
+         return;
+      }
       auto resBuf = mlir::dyn_cast<subop::BufferType>(merge.getRes().getType());
       if (!resBuf) return;
       auto targetTl = subop::ThreadLocalType::get(ctx, mlir::cast<subop::State>(resBuf));
@@ -397,17 +404,26 @@ static mlir::Type memberTypeForIdentifier(subop::TableType tableTy, subop::Membe
 static subop::Member tableMemberForIdentifier(subop::TableType tableTy, subop::MemberManager& mm,
                                               llvm::StringRef identifier);
 
-static void ingestExternalSupplierColumns(mlir::ModuleOp module, llvm::StringMap<PayloadColumnSpec>& unionCols) {
+/// Widen union with full external-table columns only for table scopes already present in \p unionCols
+/// (from materialize mappings), keyed by \c ExternalDatasourceProperty::tableName — not a fixed table name.
+static void ingestExternalTableColumnsForUnionScopes(mlir::ModuleOp module,
+                                                     llvm::StringMap<PayloadColumnSpec>& unionCols) {
    if (!module) return;
+   llvm::StringSet<> scopesInUnion;
+   for (auto& it : unionCols) {
+      if (!it.getValue().scope.empty()) scopesInUnion.insert(it.getValue().scope);
+   }
+   if (scopesInUnion.empty()) return;
    auto& mm = module.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    module.walk([&](subop::GetExternalOp ge) {
       auto ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-      if (ds.tableName != "supplier") return;
-      auto tableTy = mlir::cast<subop::TableType>(ge.getResult().getType());
+      if (!scopesInUnion.contains(ds.tableName)) return;
+      auto tableTy = mlir::dyn_cast<subop::TableType>(ge.getResult().getType());
+      if (!tableTy) return;
       for (const auto& map : ds.mapping) {
          llvm::StringRef leaf = normalizeColumnIdentifier(map.identifier);
          PayloadColumnSpec spec;
-         spec.scope = "supplier";
+         spec.scope = ds.tableName;
          spec.leaf = leaf.str();
          spec.colType = memberTypeForIdentifier(tableTy, mm, leaf);
          if (!spec.colType) continue;
@@ -603,7 +619,8 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
       if (changed) op.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, out));
    });
    module.walk([&](subop::LookupOp op) {
-      if (!shouldUpdateOp(op.getOperation()) && op.getState().getType() != producerHiv) return;
+      if (!shouldUpdateOp(op.getOperation())) return;
+      if (closureFilter && !opaqueClosureContains(*closureFilter, op.getState())) return;
       auto r = op.getRef();
       if (r.getColumn().type != expectedListTy) {
          r.getColumn().type = expectedListTy;
@@ -644,35 +661,43 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    subop::TableType mergedSupplierTableTy;
    ExternalDatasourceProperty mergedDs;
    bool haveDs = false;
-   llvm::StringRef supplierTableName = "supplier";
-   for (auto [peerMod, peerHiv] : peerHivs) {
-      if (!peerMod) continue;
-      (void)peerHiv;
-      mergeSupplierExternalFromModule(peerMod, supplierTableName, mergedDs, haveDs);
-   }
+   llvm::StringRef donorTableName;
    subop::TableType donorTableTy = mlir::dyn_cast<subop::TableType>(tableState.getType());
    if (auto ge = mlir::dyn_cast_or_null<subop::GetExternalOp>(tableState.getDefiningOp())) {
       auto donorDs = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-      supplierTableName = donorDs.tableName;
-      if (!haveDs) {
-         mergedDs = std::move(donorDs);
-         haveDs = true;
-      } else {
-         mergedDs = mergeExternalDatasource(mergedDs, donorDs);
-      }
-   } else if (donorTableTy && haveDs) {
-      synthetic.walk([&](subop::GetExternalOp ge) {
-         auto donorDs = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-         if (donorDs.tableName != supplierTableName) return;
-         mergedDs = mergeExternalDatasource(mergedDs, donorDs);
-      });
+      donorTableName = donorDs.tableName;
+      mergedDs = std::move(donorDs);
+      haveDs = true;
    }
-   if (haveDs) {
+   bool unionTouchesDonorTable = false;
+   if (!donorTableName.empty()) {
+      for (const PayloadColumnSpec& spec : plan.payloadColumns) {
+         if (spec.scope == donorTableName) {
+            unionTouchesDonorTable = true;
+            break;
+         }
+      }
+   }
+   if (unionTouchesDonorTable && !donorTableName.empty()) {
+      for (auto [peerMod, peerHiv] : peerHivs) {
+         if (!peerMod) continue;
+         (void)peerHiv;
+         mergeSupplierExternalFromModule(peerMod, donorTableName, mergedDs, haveDs);
+      }
+      if (donorTableTy && haveDs) {
+         synthetic.walk([&](subop::GetExternalOp ge) {
+            auto donorDs = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
+            if (donorDs.tableName != donorTableName) return;
+            mergedDs = mergeExternalDatasource(mergedDs, donorDs);
+         });
+      }
+   }
+   if (unionTouchesDonorTable && haveDs) {
       auto lookupPeerColumnType = [&](llvm::StringRef identifier) -> mlir::Type {
          for (auto [peerMod, peerHiv] : peerHivs) {
             if (!peerMod) continue;
             (void)peerHiv;
-            if (mlir::Type ty = columnTypeForIdentifierInModule(peerMod, supplierTableName, identifier)) return ty;
+            if (mlir::Type ty = columnTypeForIdentifierInModule(peerMod, donorTableName, identifier)) return ty;
          }
          return {};
       };
@@ -684,13 +709,13 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
             peerMod.walk([&](subop::GetExternalOp ge) {
                if (hintTy) return;
                auto ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-               if (ds.tableName != supplierTableName) return;
+               if (ds.tableName != donorTableName) return;
                hintTy = mlir::cast<subop::TableType>(ge.getResult().getType());
             });
             if (hintTy) break;
          }
       }
-      assert(hintTy && "join superset: supplier table type required for external merge");
+      assert(hintTy && "join superset: external table type required for external merge");
       auto newTableTy = tableTypeFromMergedExternal(ctx, mm, mergedDs, hintTy, lookupPeerColumnType);
       for (auto& map : mergedDs.mapping) {
          if (subop::Member m = tableMemberForIdentifier(newTableTy, mm, map.identifier))
@@ -807,7 +832,10 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
          (void)leaf0;
          scope = scope0;
       }
-      if (scope.empty()) scope = "supplier";
+      if (scope.empty()) {
+         ++payloadSlotInPlan;
+         continue;
+      }
       tuples::ColumnDefAttr colDef = cm.createDef(spec.scope, spec.leaf);
       colDef.getColumn().type = spec.colType;
       assert(static_cast<size_t>(payloadSlotInPlan) < plan.payloadMembers.size() &&
@@ -909,9 +937,8 @@ static void applyUnionPlanToSyntheticHiv(mlir::ModuleOp synthetic, mlir::Value s
    }
 
    applyBufferLayoutToSsaClosure(synthetic, roots, targetMembers, reuseSynthetic);
-   alignBufferMergeThreadLocalsWithMergeResult(synthetic);
-
    JoinBufferHivSsaClosure joinClosure = computeJoinBufferHivSsaClosure(roots, reuseSynthetic);
+   alignBufferMergeThreadLocalsWithMergeResult(synthetic, &joinClosure.opaque);
    subop::HashIndexedViewType prodHiv;
    for (mlir::Value v : joinClosure.values) {
       if (auto h = mlir::dyn_cast<subop::HashIndexedViewType>(v.getType())) {
