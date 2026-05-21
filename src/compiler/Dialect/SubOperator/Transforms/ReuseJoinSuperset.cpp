@@ -660,11 +660,7 @@ static void refreshTableStateTypesInModule(mlir::ModuleOp module, mlir::Value ta
    seed(tableStateRoot);
    seed(peelBlockArgsToEnclosingOperands(tableStateRoot));
 
-   for (unsigned round = 0; round < 32; ++round) {
-      size_t before = closure.size();
-      expandClosureThroughExecutionStepPorts(module, closure);
-      if (closure.size() == before) break;
-   }
+   expandClosureThroughExecutionStepPorts(module, closure);
 
    llvm::DenseSet<void*> visited;
    while (!worklist.empty()) {

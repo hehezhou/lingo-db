@@ -23,7 +23,7 @@ bool opaqueClosureContains(const llvm::DenseSet<void*>& closure, mlir::Value v) 
 /// with step results whenever either side is already in \p closure (fixpoint over the join
 /// buffer → HIV SSA region).
 void expandClosureThroughExecutionStepPorts(mlir::ModuleOp module, llvm::DenseSet<void*>& closure) {
-   for (unsigned round = 0; round < 32; ++round) {
+   for (;;) {
       size_t before = closure.size();
       module.walk([&](subop::ExecutionStepOp step) {
          mlir::Block& body = step.getSubOps().front();
@@ -79,7 +79,7 @@ bool opOperandsOrNestedBlockArgsTouchClosure(mlir::Operation* op, const llvm::De
 /// and step operands. When \p closureFilter is non-null, only touch steps that reach the join
 /// buffer / HIV closure (derived from `computeJoinBufferHivSsaClosure`).
 void synchronizeExecutionStepPortTypes(mlir::ModuleOp module, const llvm::DenseSet<void*>* closureFilter) {
-   for (unsigned iter = 0; iter < 8; ++iter) {
+   for (;;) {
       bool changed = false;
       module.walk([&](subop::ExecutionStepReturnOp ret) {
          auto* parent = ret->getParentOp();

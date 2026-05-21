@@ -837,34 +837,32 @@ void propagateSubOpColumnAttrsFromSsaStateLayout(mlir::ModuleOp module,
 /// three-field buffer and LLVM translation hits stuck `builtin.unrealized_conversion_cast`.
 void alignBufferMergeThreadLocalsWithExtendedMergeResult(mlir::ModuleOp module) {
    auto* ctx = module.getContext();
-   for (unsigned round = 0; round < 1; ++round) {
-      module.walk([&](subop::MergeOp merge) {
-         auto resBuf = mlir::dyn_cast<subop::BufferType>(merge.getRes().getType());
-         if (!resBuf || !valueMembersContainMemberNamed(ctx, resBuf.getMembers(), "filter_pred$0")) return;
-         auto targetTl = subop::ThreadLocalType::get(ctx, mlir::cast<subop::State>(resBuf));
+   module.walk([&](subop::MergeOp merge) {
+      auto resBuf = mlir::dyn_cast<subop::BufferType>(merge.getRes().getType());
+      if (!resBuf || !valueMembersContainMemberNamed(ctx, resBuf.getMembers(), "filter_pred$0")) return;
+      auto targetTl = subop::ThreadLocalType::get(ctx, mlir::cast<subop::State>(resBuf));
 
-         llvm::SmallDenseSet<void*> seen;
-         llvm::SmallVector<mlir::Value, 16> worklist;
-         worklist.push_back(merge.getThreadLocal());
-         while (!worklist.empty()) {
-            mlir::Value v = worklist.back();
-            worklist.pop_back();
-            void* k = v.getAsOpaquePointer();
-            if (!seen.insert(k).second) continue;
-            v.setType(targetTl);
+      llvm::SmallDenseSet<void*> seen;
+      llvm::SmallVector<mlir::Value, 16> worklist;
+      worklist.push_back(merge.getThreadLocal());
+      while (!worklist.empty()) {
+         mlir::Value v = worklist.back();
+         worklist.pop_back();
+         void* k = v.getAsOpaquePointer();
+         if (!seen.insert(k).second) continue;
+         v.setType(targetTl);
 
-            if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(v)) {
-               mlir::Block* owner = ba.getOwner();
-               mlir::Operation* parentOp = owner->getParentOp();
-               if (!parentOp && owner->getParent()) parentOp = owner->getParent()->getParentOp();
-               if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(parentOp)) {
-                  unsigned idx = ba.getArgNumber();
-                  if (idx < step.getNumOperands()) worklist.push_back(step.getOperand(idx));
-               }
+         if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+            mlir::Block* owner = ba.getOwner();
+            mlir::Operation* parentOp = owner->getParentOp();
+            if (!parentOp && owner->getParent()) parentOp = owner->getParent()->getParentOp();
+            if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(parentOp)) {
+               unsigned idx = ba.getArgNumber();
+               if (idx < step.getNumOperands()) worklist.push_back(step.getOperand(idx));
             }
          }
-      });
-   }
+      }
+   });
 }
 
 static constexpr llvm::StringLiteral kHashmapLookupInitPredExtendedAttr = "lingo.hashmap_lookup_init_pred_extended";
@@ -965,8 +963,7 @@ void rewriteHashmapTypesInModule(mlir::ModuleOp module,
 
 static llvm::SmallVector<runtime::FilterDescription, 8>
 decodeExternalFiltersForTableState(mlir::Value tableState) {
-   for (int i = 0; i < 8; ++i) {
-      tableState = peelBlockArgsToEnclosingOperands(tableState);
+   for (;;) {
       if (auto ge = mlir::dyn_cast<subop::GetExternalOp>(tableState.getDefiningOp())) {
          auto ds = lingodb::utility::deserializeFromHexString<runtime::ExternalDatasourceProperty>(ge.getDescr());
          return llvm::SmallVector<runtime::FilterDescription, 8>(ds.filterDescriptions.begin(),
@@ -981,6 +978,9 @@ decodeExternalFiltersForTableState(mlir::Value tableState) {
             }
          }
       }
+      mlir::Value peeled = peelBlockArgsToEnclosingOperands(tableState);
+      if (peeled == tableState) break;
+      tableState = peeled;
    }
    return {};
 }
