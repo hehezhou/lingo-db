@@ -241,7 +241,8 @@ static bool resolveScannedTableExternal(subop::ExecutionStepOp buildStep, mlir::
    }
 
    if (auto tableStep = mlir::dyn_cast_or_null<subop::ExecutionStepOp>(external.getDefiningOp())) {
-      if (!isExternalTableRefStep(tableStep)) return false;
+      assert(isExternalTableRefStep(tableStep) &&
+             "scan_refs table state must come from external table_ref construction step");
       subop::GetExternalOp ge = findUniqueGetExternalInTableRefStep(tableStep);
       ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
       tableName = ds.tableName;
@@ -267,19 +268,24 @@ static std::optional<subop::GetExternalOp> resolveGetExternalOpForScannedTable(s
    if (auto ge = mlir::dyn_cast_or_null<subop::GetExternalOp>(external.getDefiningOp())) return ge;
 
    if (auto tableStep = mlir::dyn_cast_or_null<subop::ExecutionStepOp>(external.getDefiningOp())) {
-      if (!isExternalTableRefStep(tableStep)) return std::nullopt;
+      assert(isExternalTableRefStep(tableStep) &&
+             "scan_refs table state must come from external table_ref construction step");
       return findUniqueGetExternalInTableRefStep(tableStep);
    }
 
    mlir::Value canon = canonicalizeStateValueForReuse(external);
-   if (auto it = findReuseMap(reuse.externalDatasourceByTableState, canon);
-       it != reuse.externalDatasourceByTableState.end()) {
-      for (auto& rw : reuse.steps) {
+   if (findReuseMap(reuse.externalDatasourceByTableState, canon) !=
+       reuse.externalDatasourceByTableState.end()) {
+      subop::GetExternalOp ge;
+      for (const ModuleReuseInfo::StepRW& rw : reuse.steps) {
          subop::ExecutionStepOp step = rw.step;
          if (!isExternalTableRefStep(step)) continue;
          if (canonicalizeStateValueForReuse(step.getResult(0)) != canon) continue;
-         return findUniqueGetExternalInTableRefStep(step);
+         assert(!ge && "table state must map to exactly one external table_ref step");
+         ge = findUniqueGetExternalInTableRefStep(step);
       }
+      assert(ge && "scan_refs must resolve to get_external in table construction step");
+      return ge;
    }
    return std::nullopt;
 }
@@ -288,20 +294,19 @@ static void ingestExternalTableColumnsFromBuildStepScan(subop::ExecutionStepOp b
                                                         const ModuleReuseInfo& reuse,
                                                         llvm::StringMap<PayloadColumnSpec>& unionCols) {
    subop::ScanRefsOp scanOp = findTableScanRefsInBuildStep(buildStep);
-   if (!scanOp) return;
+   assert(scanOp && "join union ingest: build step must contain scan_refs on a table state");
 
    llvm::StringRef tableName;
    ExternalDatasourceProperty ds;
    bool haveDs = false;
    subop::TableType tableTy;
-   if (!resolveScannedTableExternal(buildStep, scanOp.getState(), reuse, tableName, ds, haveDs, tableTy) || !haveDs)
-      return;
+   assert(resolveScannedTableExternal(buildStep, scanOp.getState(), reuse, tableName, ds, haveDs, tableTy) && haveDs);
 
    llvm::StringSet<> scopesInUnion;
    for (auto& it : unionCols) {
       if (!it.getValue().scope.empty()) scopesInUnion.insert(it.getValue().scope);
    }
-   if (!scopesInUnion.contains(tableName)) return;
+   assert(scopesInUnion.contains(tableName) && "union plan must already reference donor external table scope");
 
    auto& mm = buildStep.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    for (const auto& map : ds.mapping) {
@@ -310,7 +315,7 @@ static void ingestExternalTableColumnsFromBuildStepScan(subop::ExecutionStepOp b
       spec.scope = tableName.str();
       spec.leaf = leaf.str();
       spec.colType = memberTypeForIdentifier(tableTy, mm, leaf);
-      if (!spec.colType) continue;
+      assert(spec.colType && "external table mapping column must exist on scanned table type");
       spec.semanticKey = columnSemanticKey(spec.scope, spec.leaf);
       unionCols.try_emplace(spec.semanticKey, spec);
    }
@@ -320,15 +325,14 @@ static void mergePeerExternalFromBuildStepScan(ExternalDatasourceProperty& merge
                                              subop::ExecutionStepOp peerBuild, const ModuleReuseInfo& reusePeer,
                                              llvm::StringRef donorTableName) {
    subop::ScanRefsOp scanOp = findTableScanRefsInBuildStep(peerBuild);
-   if (!scanOp) return;
+   assert(scanOp && "join union patch: peer build step must contain scan_refs on a table state");
    llvm::StringRef peerTableName;
    ExternalDatasourceProperty peerDs;
    bool havePeer = false;
    subop::TableType peerTy;
-   if (!resolveScannedTableExternal(peerBuild, scanOp.getState(), reusePeer, peerTableName, peerDs, havePeer, peerTy) ||
-       !havePeer) {
-      return;
-   }
+   assert(resolveScannedTableExternal(peerBuild, scanOp.getState(), reusePeer, peerTableName, peerDs, havePeer,
+                                      peerTy) &&
+          havePeer);
    if (peerTableName != donorTableName) return;
    if (!haveMerged) {
       merged = peerDs;
@@ -342,17 +346,18 @@ static mlir::Type columnTypeForIdentifierFromPeerBuildScan(subop::ExecutionStepO
                                                            const ModuleReuseInfo& reusePeer,
                                                            llvm::StringRef donorTableName, llvm::StringRef identifier) {
    subop::ScanRefsOp scanOp = findTableScanRefsInBuildStep(peerBuild);
-   if (!scanOp) return {};
+   assert(scanOp && "join union patch: peer build step must contain scan_refs on a table state");
    llvm::StringRef peerTableName;
    ExternalDatasourceProperty peerDs;
    bool havePeer = false;
    subop::TableType peerTy;
-   if (!resolveScannedTableExternal(peerBuild, scanOp.getState(), reusePeer, peerTableName, peerDs, havePeer, peerTy) ||
-       !havePeer || peerTableName != donorTableName) {
-      return {};
-   }
+   assert(resolveScannedTableExternal(peerBuild, scanOp.getState(), reusePeer, peerTableName, peerDs, havePeer,
+                                      peerTy) &&
+          havePeer && peerTableName == donorTableName);
    auto& mm = peerBuild.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   return memberTypeForIdentifier(peerTy, mm, identifier);
+   mlir::Type ty = memberTypeForIdentifier(peerTy, mm, identifier);
+   assert(ty && "peer scanned table must contain union payload column");
+   return ty;
 }
 
 static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, const ModuleReuseInfo& reuseA,

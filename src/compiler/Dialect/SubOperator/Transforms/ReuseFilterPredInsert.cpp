@@ -963,22 +963,34 @@ void rewriteHashmapTypesInModule(mlir::ModuleOp module,
    alignBufferMergeThreadLocalsWithExtendedMergeResult(module);
 }
 
+static subop::GetExternalOp findUniqueGetExternalInTableRefStep(subop::ExecutionStepOp tableStep) {
+   assert(isExternalTableRefStep(tableStep) && "expected external table_ref construction step");
+   subop::GetExternalOp ge;
+   for (mlir::Operation& op : tableStep.getSubOps().front().without_terminator()) {
+      if (auto g = mlir::dyn_cast<subop::GetExternalOp>(&op)) {
+         assert(!ge && "table_ref step must contain exactly one get_external");
+         ge = g;
+      }
+   }
+   assert(ge && "table_ref step must contain get_external");
+   return ge;
+}
+
 static llvm::SmallVector<runtime::FilterDescription, 8>
 decodeExternalFiltersForTableState(mlir::Value tableState) {
    for (;;) {
-      if (auto ge = mlir::dyn_cast<subop::GetExternalOp>(tableState.getDefiningOp())) {
+      if (auto ge = mlir::dyn_cast_or_null<subop::GetExternalOp>(tableState.getDefiningOp())) {
          auto ds = lingodb::utility::deserializeFromHexString<runtime::ExternalDatasourceProperty>(ge.getDescr());
          return llvm::SmallVector<runtime::FilterDescription, 8>(ds.filterDescriptions.begin(),
                                                                  ds.filterDescriptions.end());
       }
-      if (auto prevStep = mlir::dyn_cast<ExecutionStepOp>(tableState.getDefiningOp())) {
-         for (mlir::Operation& op : prevStep.getSubOps().front().without_terminator()) {
-            if (auto ge = mlir::dyn_cast<subop::GetExternalOp>(&op)) {
-               auto ds = lingodb::utility::deserializeFromHexString<runtime::ExternalDatasourceProperty>(ge.getDescr());
-               return llvm::SmallVector<runtime::FilterDescription, 8>(ds.filterDescriptions.begin(),
-                                                                       ds.filterDescriptions.end());
-            }
-         }
+      if (auto tableStep = mlir::dyn_cast_or_null<ExecutionStepOp>(tableState.getDefiningOp())) {
+         assert(isExternalTableRefStep(tableStep) &&
+                "table state must come from external table_ref construction step");
+         subop::GetExternalOp ge = findUniqueGetExternalInTableRefStep(tableStep);
+         auto ds = lingodb::utility::deserializeFromHexString<runtime::ExternalDatasourceProperty>(ge.getDescr());
+         return llvm::SmallVector<runtime::FilterDescription, 8>(ds.filterDescriptions.begin(),
+                                                                 ds.filterDescriptions.end());
       }
       mlir::Value peeled = peelBlockArgsToEnclosingOperands(tableState);
       if (peeled == tableState) break;
