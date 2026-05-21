@@ -36,7 +36,15 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
 /// Then walk the \c cache_get HIV use chain and update embedded carrier types. Gather mappings are unchanged.
 /// When \p cacheKey is set, only that \c cache_get root is processed.
 void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const CachedJoinBufferLayout& layout,
-                                            std::optional<uint64_t> cacheKey = std::nullopt);
+                                            std::optional<uint64_t> cacheKey = std::nullopt,
+                                            std::optional<unsigned> consumerReuseQueryIndex = std::nullopt);
+
+/// After union widening, materialize each per-query \c filter_pred$N on the synthetic join-buffer writer
+/// using that query's table-scan pushdown filters.
+void patchSyntheticJoinBufferFilterPredsFromMatchedQueries(
+   mlir::ModuleOp synthetic, mlir::ModuleOp query0, mlir::ModuleOp query1,
+   llvm::ArrayRef<CrossQueryStateMatchPair> matches, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+   const CachedJoinBufferLayoutsByKey& layoutsByKey);
 
 /// After \c insertCachePutsForTargets on the synthetic module, re-record layouts from \c cache_put
 /// state types (includes `filter_pred$0` when join-buffer pred reuse is enabled).

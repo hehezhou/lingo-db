@@ -97,6 +97,7 @@ class MemberManager {
       assert(false && "Member not found");
       return nullptr;
    }
+   bool hasMemberDirect(llvm::StringRef name) const { return members.contains(name.str()); }
    const std::string& getName(Member member) const {
       return member.internal->name;
    }

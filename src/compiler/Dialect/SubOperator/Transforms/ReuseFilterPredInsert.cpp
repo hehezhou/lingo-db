@@ -18,13 +18,22 @@
 
 namespace lingodb::compiler::dialect::subop {
 
-subop::Member makeOrGetPredMember(mlir::MLIRContext* ctx) {
+static std::optional<unsigned> parseFilterPredMemberSlot(llvm::StringRef memberName) {
+   if (!memberName.consume_front("filter_pred$")) return std::nullopt;
+   unsigned slot = 0;
+   if (memberName.getAsInteger(10, slot)) return std::nullopt;
+   return slot;
+}
+
+subop::Member makeOrGetPredMemberForSlot(mlir::MLIRContext* ctx, unsigned slot) {
    auto* d = ctx->getLoadedDialect<subop::SubOperatorDialect>();
    assert(d && "SubOperatorDialect must be loaded");
    auto& mm = d->getMemberManager();
-   // Stable name. If it already exists, type must match.
-   return mm.createMemberDirect("filter_pred$0", mlir::IntegerType::get(ctx, 1));
+   std::string name = ("filter_pred$" + llvm::Twine(slot)).str();
+   return mm.getOrCreateMemberDirect(name, mlir::IntegerType::get(ctx, 1), /*allowTypeUpdate=*/false);
 }
+
+subop::Member makeOrGetPredMember(mlir::MLIRContext* ctx) { return makeOrGetPredMemberForSlot(ctx, 0); }
 
 /// `subop.materialize` may write into `!subop.buffer<...>` or `!subop.thread_local<!subop.buffer<...>>`.
 static subop::BufferType getInnerBufferTypeForMaterializeState(mlir::Type stateTy) {
@@ -976,8 +985,7 @@ decodeExternalFiltersForTableState(mlir::Value tableState) {
    return {};
 }
 
-/// Decode pushdown filters from the external table descriptor on the `scan_refs` in this step.
-static llvm::SmallVector<runtime::FilterDescription, 8>
+llvm::SmallVector<runtime::FilterDescription, 8>
 decodeFiltersFromTableScanInExecutionStep(ExecutionStepOp step) {
    mlir::Block& body = step.getSubOps().front();
    subop::ScanRefsOp scanOp;
@@ -1110,8 +1118,10 @@ materializeRuntimeFiltersAsPredicateColumn(mlir::OpBuilder& b,
    assert(!filters.empty());
 
    auto& cm = b.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
-   std::string scopeName = cm.getUniqueScope("delay_filter_pred");
-   tuples::ColumnDefAttr predDef = cm.createDef(scopeName, predLeafName.str());
+   std::string scopeSeed = "delay_filter_pred";
+   if (auto slot = parseFilterPredMemberSlot(predLeafName)) scopeSeed = ("delay_filter_pred$" + llvm::Twine(*slot)).str();
+   std::string scopeName = cm.getUniqueScope(scopeSeed);
+   tuples::ColumnDefAttr predDef = cm.createDef(scopeName, "filter_pred");
    predDef.getColumn().type = b.getI1Type();
    // Keep predicate column def alive; column ref created where needed.
 
@@ -1429,9 +1439,86 @@ void insertWriteSidePredIntoHashMapConstructionStep(ExecutionStepOp step,
 }
 
 /// Join hash build via `growing buffer` + `create_hash_indexed_view`: materialize `filter_pred$0` from table scan.
-void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
-                                                          llvm::ArrayRef<runtime::FilterDescription> filters) {
-   if (filters.empty()) return;
+std::optional<subop::Member> findFilterPredMemberOnHashIndexedView(subop::HashIndexedViewType hiv) {
+   if (!hiv) return std::nullopt;
+   auto* ctx = hiv.getContext();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (subop::Member m : hiv.getValueMembers().getMembers()) {
+      if (mm.getName(m).starts_with("filter_pred")) return m;
+   }
+   return std::nullopt;
+}
+
+void materializeConstantTruePredMemberOnBufferMaterialize(subop::MaterializeOp matOp,
+                                                                 llvm::StringRef predMemberName,
+                                                                 bool updateStreamOperand) {
+   auto* ctx = matOp.getContext();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(matOp.getState().getType());
+   assert(bufTy);
+   subop::Member predMember;
+   for (auto m : bufTy.getMembers().getMembers()) {
+      if (mm.getName(m) == predMemberName) {
+         predMember = m;
+         break;
+      }
+   }
+   assert(predMember);
+
+   mlir::Value feedForPred = matOp.getStream();
+   while (mlir::Operation* def = feedForPred.getDefiningOp()) {
+      auto mapOp = mlir::dyn_cast<subop::MapOp>(def);
+      if (!mapOp || mapOp.getComputedCols().size() != 1) break;
+      auto defAttr = mlir::cast<tuples::ColumnDefAttr>(mapOp.getComputedCols()[0]);
+      if (!mlir::isa<mlir::IntegerType>(defAttr.getColumn().type)) break;
+      feedForPred = mapOp.getStream();
+   }
+
+   mlir::OpBuilder pb(matOp);
+   mlir::Location loc = matOp.getLoc();
+   pb.setInsertionPointAfter(feedForPred.getDefiningOp() ? feedForPred.getDefiningOp() : matOp.getOperation());
+   std::string scopeSeed = "reuse_write_pred_const";
+   if (auto slot = parseFilterPredMemberSlot(predMemberName)) scopeSeed = ("reuse_write_pred_const$" + llvm::Twine(*slot)).str();
+   std::string sc = cm.getUniqueScope(scopeSeed);
+   tuples::ColumnDefAttr def = cm.createDef(sc, "t");
+   def.getColumn().type = mlir::IntegerType::get(ctx, 1);
+   subop::MapCreationHelper helper(ctx);
+   helper.buildBlock(pb, [&](mlir::OpBuilder& rb) {
+      mlir::Value t = rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+      rb.create<tuples::ReturnOp>(loc, mlir::ValueRange{t});
+   });
+   auto mapOp = pb.create<subop::MapOp>(loc, tuples::TupleStreamType::get(ctx), feedForPred, pb.getArrayAttr({def}),
+                                        helper.getColRefs());
+   mapOp.getFn().push_back(helper.getMapBlock());
+   if (updateStreamOperand) matOp->setOperand(0, mapOp.getResult());
+
+   tuples::ColumnRefAttr predColRef = cm.createRef(&def.getColumn());
+   llvm::SmallVector<subop::RefMappingPairT> pairs;
+   for (auto& pr : matOp.getMapping().getMapping()) {
+      if (pr.first != predMember) pairs.push_back(pr);
+   }
+   pairs.push_back({predMember, predColRef});
+   matOp.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, pairs));
+}
+
+void insertWriteSidePredIntoBufferConstructionStepForPredMember(
+   ExecutionStepOp step, llvm::ArrayRef<runtime::FilterDescription> filters, llvm::StringRef predMemberName) {
+   if (filters.empty()) {
+      subop::MaterializeOp matOp;
+      step.getOperation()->walk([&](subop::MaterializeOp m) {
+         subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(m.getState().getType());
+         if (!bufTy) return mlir::WalkResult::advance();
+         if (!valueMembersContainMemberNamed(step.getContext(), bufTy.getMembers(), predMemberName))
+            return mlir::WalkResult::advance();
+         matOp = m;
+         return mlir::WalkResult::interrupt();
+      });
+      assert(matOp && "write_pred_buf: expected materialize for empty filters");
+      materializeConstantTruePredMemberOnBufferMaterialize(matOp, predMemberName, /*updateStreamOperand=*/true);
+      return;
+   }
+
    mlir::Block& body = step.getSubOps().front();
 
    subop::ScanRefsOp scanOp;
@@ -1554,38 +1641,42 @@ void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
    step.getOperation()->walk([&](subop::MaterializeOp m) {
       subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(m.getState().getType());
       if (!bufTy) return mlir::WalkResult::advance();
-      if (!valueMembersContainMemberNamed(step.getContext(), bufTy.getMembers(), "filter_pred$0"))
+      if (!valueMembersContainMemberNamed(step.getContext(), bufTy.getMembers(), predMemberName))
          return mlir::WalkResult::advance();
       matOp = m;
       return mlir::WalkResult::interrupt();
    });
-   assert(matOp && "write_pred_buf: expected materialize into join buffer with filter_pred$0");
+   assert(matOp && "write_pred_buf: expected materialize into join buffer with filter_pred member");
 
+   auto& cmPred = matOp.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    mlir::Value feedForPred = matOp.getStream();
    while (mlir::Operation* def = feedForPred.getDefiningOp()) {
       auto mapOp = mlir::dyn_cast<subop::MapOp>(def);
       if (!mapOp || mapOp.getComputedCols().size() != 1) break;
       auto defAttr = mlir::cast<tuples::ColumnDefAttr>(mapOp.getComputedCols()[0]);
       if (!mlir::isa<mlir::IntegerType>(defAttr.getColumn().type)) break;
+      auto [scope, leaf] = cmPred.getName(&defAttr.getColumn());
+      (void)leaf;
+      if (llvm::StringRef(scope).contains("delay_filter_pred")) break;
       feedForPred = mapOp.getStream();
    }
 
    mlir::OpBuilder pb(matOp);
-   pb.setInsertionPointAfter(feedForPred.getDefiningOp());
+   pb.setInsertionPointAfter(feedForPred.getDefiningOp() ? feedForPred.getDefiningOp() : matOp.getOperation());
    auto [predStream, predDef] = materializeRuntimeFiltersAsPredicateColumn(
-      pb, matOp.getLoc(), feedForPred, colByName, filters, "filter_pred");
+      pb, matOp.getLoc(), feedForPred, colByName, filters, predMemberName);
 
    subop::Member predMember;
    {
       subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(matOp.getState().getType());
       assert(bufTy && "write_pred_buf: materialize state must be buffer or thread_local<buffer>");
       for (auto m : bufTy.getMembers().getMembers()) {
-         if (mm.getName(m) == "filter_pred$0") {
+         if (mm.getName(m) == predMemberName) {
             predMember = m;
             break;
          }
       }
-      assert(predMember && "write_pred_buf: filter_pred$0 missing on buffer type");
+      assert(predMember && "write_pred_buf: filter_pred member missing on buffer type");
    }
 
    tuples::ColumnRefAttr predColRef = cm.createRef(&predDef.getColumn());
@@ -1596,6 +1687,11 @@ void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
    pairs.push_back({predMember, predColRef});
    matOp.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(step.getContext(), pairs));
    matOp->setOperand(0, predStream);
+}
+
+void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
+                                                   llvm::ArrayRef<runtime::FilterDescription> filters) {
+   insertWriteSidePredIntoBufferConstructionStepForPredMember(step, filters, "filter_pred$0");
 }
 
 /// `rewriteHashmapTypesInModule` can extend join buffers with `filter_pred$0` before the writer maps it.
@@ -1839,7 +1935,17 @@ static bool gatherStreamAlreadyPredFiltered(subop::GatherOp gatherOp) {
    return false;
 }
 
-/// After `lookup` / `scan_list` on `!subop.hash_indexed_view<...>` with `filter_pred$0`, re-check the stored bool.
+static void stripPredMemberFromGatherMapping(subop::GatherOp gatherOp, subop::Member predMember) {
+   auto* ctx = gatherOp.getContext();
+   llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> pairs;
+   for (auto& p : gatherOp.getMapping().getMapping()) {
+      if (p.first != predMember) pairs.push_back(p);
+   }
+   gatherOp.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, pairs));
+}
+
+/// After `lookup` / `scan_list` on `!subop.hash_indexed_view<...>` with `filter_pred$N`, re-check the stored
+/// bool once per execution step (first HIV `gather` in block order). Later HIV gathers only carry payload columns.
 void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member predMember) {
    auto* ctx = step.getContext();
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
@@ -1847,14 +1953,25 @@ void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member 
 
    llvm::SmallVector<subop::GatherOp> gathers;
    step.getOperation()->walk([&](subop::GatherOp g) { gathers.push_back(g); });
+   llvm::sort(gathers, [](subop::GatherOp a, subop::GatherOp b) { return a->isBeforeInBlock(b); });
 
+   bool appliedHivPredProbe = false;
    for (subop::GatherOp gatherOp : gathers) {
       auto refTy = mlir::dyn_cast<subop::LookupEntryRefType>(gatherOp.getRef().getColumn().type);
       if (!refTy) continue;
       auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(refTy.getState());
       if (!hiv) continue;
-      if (!valueMembersContainMemberNamed(ctx, hiv.getValueMembers(), "filter_pred$0")) continue;
-      if (gatherStreamAlreadyPredFiltered(gatherOp)) continue;
+      llvm::StringRef predMemberName = mm.getName(predMember);
+      if (!valueMembersContainMemberNamed(ctx, hiv.getValueMembers(), predMemberName)) continue;
+
+      if (appliedHivPredProbe) {
+         stripPredMemberFromGatherMapping(gatherOp, predMember);
+         continue;
+      }
+      if (gatherStreamAlreadyPredFiltered(gatherOp)) {
+         appliedHivPredProbe = true;
+         continue;
+      }
 
       tuples::ColumnRefAttr predRef;
       bool hasPred = false;
@@ -1899,16 +2016,18 @@ void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member 
          if (owner->getBlock() != gatherBlock) return false;
          return gatherOp->isBeforeInBlock(owner);
       });
+      appliedHivPredProbe = true;
    }
 }
 
-/// Point probe-side `gather` entry refs at the cached HIV layout, only on the \p closure SSA use chain.
+/// Point probe-side `gather` entry refs at the cached HIV layout. When \p closure is null, update all
+/// HIV entry gathers in the module.
 static void syncProbeGatherRefsToCachedHivInClosure(mlir::ModuleOp module, subop::HashIndexedViewType cachedHiv,
-                                                    const llvm::DenseSet<void*>& closure) {
+                                                    const llvm::DenseSet<void*>* closure) {
    auto* ctx = module.getContext();
    auto expected = subop::LookupEntryRefType::get(ctx, cachedHiv);
    module.walk([&](subop::GatherOp gather) {
-      if (!opOperandsOrNestedBlockArgsTouchClosure(gather.getOperation(), closure)) return;
+      if (closure && !opOperandsOrNestedBlockArgsTouchClosure(gather.getOperation(), *closure)) return;
       auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(gather.getRef().getColumn().type);
       if (!ler || !mlir::isa<subop::HashIndexedViewType>(ler.getState())) return;
       if (gather.getRef().getColumn().type != expected) gather.getRef().getColumn().type = expected;
@@ -1917,28 +2036,29 @@ static void syncProbeGatherRefsToCachedHivInClosure(mlir::ModuleOp module, subop
 
 void applyJoinBufferProbePredFiltersAfterLayout(mlir::ModuleOp module) {
    if (!kEnableReuseStateFilterPredReapply) return;
-   // Consumers that only read a shared cached HIV (no local join-buffer materialize) already
-   // inherit write-side `filter_pred$0` from the producer; re-inserting probe filters breaks lowering.
-   bool hasLocalJoinBufferMaterialize = false;
+   bool needsProbePred = false;
    module.walk([&](subop::MaterializeOp mat) {
-      if (getInnerBufferTypeForMaterializeState(mat.getState().getType())) hasLocalJoinBufferMaterialize = true;
+      if (getInnerBufferTypeForMaterializeState(mat.getState().getType())) needsProbePred = true;
    });
-   if (!hasLocalJoinBufferMaterialize) return;
+   if (!needsProbePred) {
+      module.walk([&](subop::CacheGetOp get) {
+         if (needsProbePred) return;
+         auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
+         if (findFilterPredMemberOnHashIndexedView(hiv)) needsProbePred = true;
+      });
+   }
+   if (!needsProbePred) return;
 
-   auto reuse = collectModuleReuseInfo(module);
-   subop::Member predMember = makeOrGetPredMember(module.getContext());
    module.walk([&](subop::CacheGetOp get) {
       auto cachedHiv = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
       if (!cachedHiv) return;
-      if (!valueMembersContainMemberNamed(module.getContext(), cachedHiv.getValueMembers(), "filter_pred$0")) return;
+      std::optional<subop::Member> predMember = findFilterPredMemberOnHashIndexedView(cachedHiv);
+      if (!predMember) return;
 
-      JoinBufferHivSsaClosure closure = computeJoinBufferHivSsaClosure({get.getResult()}, reuse);
-      expandClosureThroughExecutionStepPorts(module, closure.opaque);
-      syncProbeGatherRefsToCachedHivInClosure(module, cachedHiv, closure.opaque);
+      syncProbeGatherRefsToCachedHivInClosure(module, cachedHiv, /*closure=*/nullptr);
 
       module.walk([&](subop::ExecutionStepOp step) {
-         if (!executionStepTouchesClosure(step, closure.opaque)) return;
-         insertHashIndexedViewGatherPredFilters(step, predMember);
+         insertHashIndexedViewGatherPredFilters(step, *predMember);
       });
    });
 }

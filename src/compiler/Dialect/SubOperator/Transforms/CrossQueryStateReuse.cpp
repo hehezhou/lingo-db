@@ -741,6 +741,8 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    CachedJoinBufferLayoutsByKey producerLayoutsByKey;
    extendSyntheticJoinBuffersToColumnUnion(*res.query0, query0, query1, matches, targetsQ0, mapping,
                                            &producerLayoutsByKey);
+   patchSyntheticJoinBufferFilterPredsFromMatchedQueries(*res.query0, query0, query1, matches, targetsQ0,
+                                                         producerLayoutsByKey);
    maybeEnsureJoinBufferFilterPredMaterializeMappings(*res.query0);
 
    // Producer: cache_puts (cloned synthetic IR — needs its own reuse snapshot).
@@ -762,12 +764,12 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
 
    for (auto& t : targets0) {
       if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
-         alignConsumerModulesToCachedJoinLayout(query0, it->second, t.cacheKey);
+         alignConsumerModulesToCachedJoinLayout(query0, it->second, t.cacheKey, 0);
       }
    }
    for (auto& t : targets1) {
       if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
-         alignConsumerModulesToCachedJoinLayout(query1, it->second, t.cacheKey);
+         alignConsumerModulesToCachedJoinLayout(query1, it->second, t.cacheKey, 1);
       }
    }
 

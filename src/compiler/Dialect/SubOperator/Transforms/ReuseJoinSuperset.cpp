@@ -1,4 +1,5 @@
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseJoinSuperset.h"
+#include "lingodb/compiler/Dialect/SubOperator/Transforms/CrossQueryStateReuse.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseRewriteCommon.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseFilterPredInsert.h"
 #include "lingodb/compiler/Dialect/DB/IR/DBTypes.h"
@@ -34,6 +35,36 @@ static llvm::StringRef stripMemberSuffix(llvm::StringRef name) {
 
 static std::string columnSemanticKey(llvm::StringRef scope, llvm::StringRef leaf) {
    return (scope + "\x1f" + leaf).str();
+}
+
+static constexpr llvm::StringRef kReuseFilterPredScope = "reuse_filter_pred";
+
+static bool isFilterPredPayloadColumn(llvm::StringRef memberName, llvm::StringRef leaf) {
+   return memberName.starts_with("filter_pred") || leaf == "filter_pred";
+}
+
+static std::optional<unsigned> parseFilterPredMemberSlot(llvm::StringRef memberName) {
+   if (!memberName.consume_front("filter_pred$")) return std::nullopt;
+   unsigned slot = 0;
+   if (memberName.getAsInteger(10, slot)) return std::nullopt;
+   return slot;
+}
+
+/// Union payload key for per-query write-side predicates on a shared table→HIV chain.
+static std::string reuseFilterPredSemanticKey(unsigned reuseQueryIndex) {
+   return columnSemanticKey(kReuseFilterPredScope, llvm::Twine(reuseQueryIndex).str());
+}
+
+static bool parseReuseFilterPredSemanticKey(llvm::StringRef semanticKey, unsigned& reuseQueryIndex) {
+   size_t sep = semanticKey.find('\x1f');
+   if (sep == llvm::StringRef::npos) return false;
+   if (semanticKey.take_front(sep) != kReuseFilterPredScope) return false;
+   return !semanticKey.drop_front(sep + 1).getAsInteger(10, reuseQueryIndex);
+}
+
+static bool parseFilterPredLayoutSemanticKey(llvm::StringRef semanticKey, unsigned& predIndex) {
+   if (parseReuseFilterPredSemanticKey(semanticKey, predIndex)) return true;
+   return static_cast<bool>(parseFilterPredMemberSlot(semanticKey));
 }
 
 static llvm::StringRef normalizeColumnIdentifier(llvm::StringRef identifier) {
@@ -127,17 +158,23 @@ static subop::ExecutionStepOp findBufferBuildStepWithTableScan(mlir::ModuleOp mo
 static void collectPayloadFromMaterialize(
    subop::MaterializeOp mat, llvm::StringRef linkMemberName, llvm::StringRef hashMemberName, subop::MemberManager& mm,
    lingodb::compiler::dialect::tuples::ColumnManager& cm, llvm::StringRef joinKeyMemberName,
-   llvm::StringMap<PayloadColumnSpec>& out) {
+   llvm::StringMap<PayloadColumnSpec>& out, std::optional<unsigned> reuseQueryIndex) {
    for (auto& [member, colRef] : mat.getMapping().getMapping()) {
       llvm::StringRef memName = mm.getName(member);
       if (memName == linkMemberName || memName == hashMemberName) continue;
       auto [scope, leaf] = cm.getName(&colRef.getColumn());
       PayloadColumnSpec spec;
-      spec.scope = scope;
-      spec.leaf = leaf;
       spec.colType = colRef.getColumn().type;
-      spec.semanticKey = columnSemanticKey(scope, leaf);
       spec.isJoinKey = !joinKeyMemberName.empty() && memName == joinKeyMemberName;
+      if (reuseQueryIndex && isFilterPredPayloadColumn(memName, leaf)) {
+         spec.scope = kReuseFilterPredScope.str();
+         spec.leaf = llvm::Twine(*reuseQueryIndex).str();
+         spec.semanticKey = reuseFilterPredSemanticKey(*reuseQueryIndex);
+      } else {
+         spec.scope = scope;
+         spec.leaf = leaf;
+         spec.semanticKey = columnSemanticKey(scope, leaf);
+      }
       out.try_emplace(spec.semanticKey, spec);
    }
 }
@@ -253,7 +290,7 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
    llvm::StringRef hashMemberName = mm.getName(plan.hashMember);
 
    llvm::StringMap<PayloadColumnSpec> unionCols;
-   auto ingestHiv = [&](mlir::Value h, const ModuleReuseInfo& reuse) {
+   auto ingestHiv = [&](mlir::Value h, const ModuleReuseInfo& reuse, unsigned reuseQueryIndex) {
       auto& cm = h.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
       mlir::Value canon = resolveCacheTargetStateForReuse(h, reuse);
       mlir::Value buf = canon;
@@ -270,11 +307,20 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
       if (!buildStep) return;
       buildStep.walk([&](subop::MaterializeOp mat) {
          if (!getInnerBufferTypeForMaterializeState(mat.getState().getType())) return;
-         collectPayloadFromMaterialize(mat, linkMemberName, hashMemberName, mm, cm, joinKeyMemberName, unionCols);
+         collectPayloadFromMaterialize(mat, linkMemberName, hashMemberName, mm, cm, joinKeyMemberName, unionCols,
+                                       reuseQueryIndex);
       });
+      if (kEnableReuseStateFilterPredReapply && buildStep) {
+         PayloadColumnSpec predSpec;
+         predSpec.scope = kReuseFilterPredScope.str();
+         predSpec.leaf = llvm::Twine(reuseQueryIndex).str();
+         predSpec.colType = mlir::IntegerType::get(h.getContext(), 1);
+         predSpec.semanticKey = reuseFilterPredSemanticKey(reuseQueryIndex);
+         unionCols.try_emplace(predSpec.semanticKey, predSpec);
+      }
    };
-   ingestHiv(hivA, reuseA);
-   ingestHiv(hivB, reuseB);
+   ingestHiv(hivA, reuseA, 0);
+   ingestHiv(hivB, reuseB, 1);
    ExternalTableCatalog catalogA = buildExternalTableCatalog(modA);
    ExternalTableCatalog catalogB = buildExternalTableCatalog(modB);
    ingestExternalTableColumnsForUnionScopes(catalogA, unionCols);
@@ -307,11 +353,21 @@ static unsigned nextPayloadMemberSlot(subop::MemberManager& mm, const llvm::Stri
    unsigned maxSlot = 0;
    auto bump = [&](subop::Member m) {
       if (auto slot = parseMemberSlot(mm.getName(m))) maxSlot = std::max(maxSlot, *slot + 1);
+      if (auto predSlot = parseFilterPredMemberSlot(mm.getName(m))) maxSlot = std::max(maxSlot, *predSlot + 1);
    };
    for (const auto& it : bySemanticKey) bump(it.second);
    for (subop::Member m : assigned) bump(m);
    return maxSlot;
 }
+
+static subop::Member allocUnusedPayloadMemberSlot(subop::MemberManager& mm, mlir::Type colType, unsigned& nextSlot) {
+   for (;; ++nextSlot) {
+      std::string name = "member$" + std::to_string(nextSlot);
+      if (!mm.hasMemberDirect(name)) return mm.createMemberDirect(name, colType);
+   }
+}
+
+static mlir::Type cloneTypeToContext(mlir::Type ty, mlir::MLIRContext* ctx);
 
 static void collectSemanticKeyToMemberFromMaterialize(
    subop::MaterializeOp mat, subop::Member linkM, subop::Member hashM, subop::MemberManager& mm,
@@ -335,14 +391,31 @@ static void assignPayloadMembersForPlan(subop::MemberManager& mm, lingodb::compi
    plan.payloadMembers.clear();
    plan.payloadMembers.reserve(plan.payloadColumns.size());
    unsigned nextSlot = nextPayloadMemberSlot(mm, bySemanticKey, plan.payloadMembers);
+   if (subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(matOp.getState().getType())) {
+      for (subop::Member m : bufTy.getMembers().getMembers()) {
+         if (m == plan.linkMember || m == plan.hashMember) continue;
+         if (auto slot = parseMemberSlot(mm.getName(m))) nextSlot = std::max(nextSlot, *slot + 1);
+         if (auto predSlot = parseFilterPredMemberSlot(mm.getName(m))) nextSlot = std::max(nextSlot, *predSlot + 1);
+      }
+   }
+   mlir::MLIRContext* synthCtx = matOp.getContext();
+   subop::Member canonicalPredMember = makeOrGetPredMemberForSlot(matOp.getContext(), 0);
+   mlir::Type canonicalPredTy = mm.getType(canonicalPredMember);
    for (const PayloadColumnSpec& spec : plan.payloadColumns) {
+      unsigned predIdx = 0;
+      if (parseReuseFilterPredSemanticKey(spec.semanticKey, predIdx)) {
+         plan.payloadMembers.push_back(mm.getOrCreateMemberDirect(
+            "filter_pred$" + llvm::Twine(predIdx).str(), canonicalPredTy, /*allowTypeUpdate=*/false));
+         continue;
+      }
       if (auto it = bySemanticKey.find(spec.semanticKey); it != bySemanticKey.end()) {
-         assert(mm.getType(it->second) == spec.colType && "join superset: reused member type must match union column");
+         mlir::Type wantTy = cloneTypeToContext(spec.colType, synthCtx);
+         assert(mm.getType(it->second) == wantTy && "join superset: reused member type must match union column");
          plan.payloadMembers.push_back(it->second);
          continue;
       }
-      std::string name = "member$" + std::to_string(nextSlot++);
-      plan.payloadMembers.push_back(mm.createMemberDirect(name, spec.colType));
+      mlir::Type slotTy = cloneTypeToContext(spec.colType, synthCtx);
+      plan.payloadMembers.push_back(allocUnusedPayloadMemberSlot(mm, slotTy, nextSlot));
    }
 }
 
@@ -877,6 +950,11 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
 
    int payloadSlotInPlan = 0;
    for (const PayloadColumnSpec& spec : plan.payloadColumns) {
+      unsigned reusePredQueryIdx = 0;
+      if (parseReuseFilterPredSemanticKey(spec.semanticKey, reusePredQueryIdx)) {
+         ++payloadSlotInPlan;
+         continue;
+      }
       if (isPayloadMaterialized(spec)) {
          ++payloadSlotInPlan;
          continue;
@@ -1288,6 +1366,7 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
                                                                 subop::HashIndexedViewType producerHiv,
                                                                 const CachedJoinBufferLayout& layout,
                                                                 subop::HashIndexedViewType consumerHivBeforeAlign,
+                                                                std::optional<unsigned> consumerReuseQueryIndex,
                                                                 CachedJoinBufferLayout& outConsumerLayout) {
    auto* ctx = consumer.getContext();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
@@ -1296,6 +1375,7 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    collectConsumerPayloadSemanticMembers(consumer, semanticToConsumer);
 
    llvm::DenseMap<subop::Member, subop::Member> producerPayloadToConsumer;
+   llvm::DenseSet<subop::Member> excludedProducerPredSlots;
    llvm::StringMap<subop::Member> assignedBySemantic;
    assert(layout.payloadSemanticKeys.size() == layout.payloadMembers.size());
 
@@ -1310,7 +1390,8 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
       }
       for (const auto& assigned : assignedBySemantic) bump.push_back(assigned.second);
       unsigned nextSlot = nextPayloadMemberSlot(mm, assignedBySemantic, bump);
-      return mm.createMemberDirect("member$" + std::to_string(nextSlot), producerSlotTy);
+      mlir::Type slotTy = cloneTypeToContext(producerSlotTy, ctx);
+      return allocUnusedPayloadMemberSlot(mm, slotTy, nextSlot);
    };
 
    for (size_t i = 0; i < layout.payloadSemanticKeys.size(); ++i) {
@@ -1318,8 +1399,13 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
       llvm::StringRef semKey = layout.payloadSemanticKeys[i];
       subop::Member producerMem = layout.payloadMembers[i];
 
-      if (semKey.starts_with("filter_pred")) {
-         subop::Member consumerMem = makeOrGetPredMember(ctx);
+      unsigned predIdx = 0;
+      if (parseFilterPredLayoutSemanticKey(semKey, predIdx)) {
+         if (consumerReuseQueryIndex && predIdx != *consumerReuseQueryIndex) {
+            excludedProducerPredSlots.insert(producerMem);
+            continue;
+         }
+         subop::Member consumerMem = makeOrGetPredMemberForSlot(ctx, predIdx);
          assignedBySemantic[semKey] = consumerMem;
          producerPayloadToConsumer[producerMem] = consumerMem;
          continue;
@@ -1337,6 +1423,7 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    llvm::SmallVector<subop::Member> valueMembers;
    valueMembers.reserve(producerHiv.getValueMembers().getMembers().size());
    for (subop::Member m : producerHiv.getValueMembers().getMembers()) {
+      if (excludedProducerPredSlots.contains(m)) continue;
       if (auto it = producerPayloadToConsumer.find(m); it != producerPayloadToConsumer.end()) {
          valueMembers.push_back(it->second);
       } else if (consumerHivBeforeAlign) {
@@ -1364,9 +1451,13 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    outConsumerLayout.producerHiv = consumerHiv;
    outConsumerLayout.payloadMembers.clear();
    outConsumerLayout.payloadColumnTypes.clear();
+   outConsumerLayout.payloadSemanticKeys.clear();
    outConsumerLayout.payloadMembers.reserve(layout.payloadMembers.size());
    outConsumerLayout.payloadColumnTypes.reserve(layout.payloadMembers.size());
-   for (subop::Member m : layout.payloadMembers) {
+   outConsumerLayout.payloadSemanticKeys.reserve(layout.payloadMembers.size());
+   for (size_t i = 0; i < layout.payloadMembers.size(); ++i) {
+      subop::Member m = layout.payloadMembers[i];
+      if (excludedProducerPredSlots.contains(m)) continue;
       subop::Member consumerMem;
       if (auto it = producerPayloadToConsumer.find(m); it != producerPayloadToConsumer.end()) {
          consumerMem = it->second;
@@ -1375,14 +1466,72 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
       }
       outConsumerLayout.payloadMembers.push_back(consumerMem);
       outConsumerLayout.payloadColumnTypes.push_back(mm.getType(consumerMem));
+      outConsumerLayout.payloadSemanticKeys.push_back(layout.payloadSemanticKeys[i]);
    }
    return consumerHiv;
 }
 
+static void patchSyntheticJoinBufferFilterPredsImpl(
+   mlir::ModuleOp synthetic, mlir::ModuleOp query0, mlir::ModuleOp query1,
+   llvm::ArrayRef<CrossQueryStateMatchPair> matches, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+   const CachedJoinBufferLayoutsByKey& layoutsByKey) {
+   if (!kEnableReuseStateFilterPredReapply) return;
+
+   auto reuse0 = collectModuleReuseInfo(query0);
+   auto reuse1 = collectModuleReuseInfo(query1);
+   auto reuseSynthetic = collectModuleReuseInfo(synthetic);
+
+   llvm::DenseMap<uint64_t, const CrossQueryStateMatchPair*> matchByKey;
+   for (const auto& m : matches) {
+      if (!m.stateA || !m.stateB) continue;
+      matchByKey[m.cacheKey] = &m;
+   }
+
+   for (const CacheTarget& t : targetsInSynthetic) {
+      auto itL = layoutsByKey.find(t.cacheKey);
+      auto itM = matchByKey.find(t.cacheKey);
+      if (itL == layoutsByKey.end() || itM == matchByKey.end()) continue;
+      const CachedJoinBufferLayout& layout = itL->second;
+      const CrossQueryStateMatchPair& match = *itM->second;
+
+      mlir::Value synthHiv = t.state;
+      if (!mlir::isa<subop::HashIndexedViewType>(synthHiv.getType())) continue;
+      mlir::Value mergedBuf = synthHiv;
+      if (auto it = reuseSynthetic.hashIndexedViewFromMergedBuffer.find(synthHiv);
+          it != reuseSynthetic.hashIndexedViewFromMergedBuffer.end()) {
+         mergedBuf = it->second;
+      }
+      subop::ExecutionStepOp buildStep = findBufferBuildStepWithTableMaterialize(mergedBuf, reuseSynthetic);
+      if (!buildStep) continue;
+
+      auto& mm = synthetic.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+      mlir::Value hivs[] = {resolveCacheTargetStateForReuse(match.stateA, reuse0),
+                            resolveCacheTargetStateForReuse(match.stateB, reuse1)};
+      ModuleReuseInfo* reuses[] = {&reuse0, &reuse1};
+
+      for (size_t i = 0; i < layout.payloadSemanticKeys.size(); ++i) {
+         unsigned qIdx = 0;
+         if (!parseReuseFilterPredSemanticKey(layout.payloadSemanticKeys[i], qIdx)) continue;
+         llvm::StringRef predName = mm.getName(layout.payloadMembers[i]);
+         auto filters = decodeFiltersForStateFromWriterSteps(hivs[qIdx], *reuses[qIdx]);
+         if (filters.empty()) filters = decodeFiltersFromTableScanInExecutionStep(buildStep);
+         insertWriteSidePredIntoBufferConstructionStepForPredMember(buildStep, filters, predName);
+      }
+   }
+}
+
 } // namespace
 
+void patchSyntheticJoinBufferFilterPredsFromMatchedQueries(
+   mlir::ModuleOp synthetic, mlir::ModuleOp query0, mlir::ModuleOp query1,
+   llvm::ArrayRef<CrossQueryStateMatchPair> matches, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+   const CachedJoinBufferLayoutsByKey& layoutsByKey) {
+   patchSyntheticJoinBufferFilterPredsImpl(synthetic, query0, query1, matches, targetsInSynthetic, layoutsByKey);
+}
+
 void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const CachedJoinBufferLayout& layout,
-                                            std::optional<uint64_t> cacheKey) {
+                                            std::optional<uint64_t> cacheKey,
+                                            std::optional<unsigned> consumerReuseQueryIndex) {
    if (!layout.producerHiv) return;
 
    subop::HashIndexedViewType producerHiv = layout.producerHiv;
@@ -1395,7 +1544,7 @@ void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const Cache
       sites.consumerHivBeforeAlign = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
       CachedJoinBufferLayout consumerLayout;
       consumerHiv = buildConsumerAlignedHivType(consumer, producerHiv, layout, sites.consumerHivBeforeAlign,
-                                                  consumerLayout);
+                                                  consumerReuseQueryIndex, consumerLayout);
       get.getResult().setType(consumerHiv);
       traverseConsumerHivUsesFromRoot(get.getResult(), consumerHiv, sites.consumerHivBeforeAlign, sites);
    });
@@ -1435,18 +1584,24 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
          continue;
       }
 
+      JoinBufferUnionPlan plan = buildUnionPlan(hivA, hivB, reuse0, reuse1, query0, query1);
+      if (plan.payloadColumns.empty()) continue;
+
+      unsigned reuseFilterPredSlots = 0;
+      for (const PayloadColumnSpec& spec : plan.payloadColumns) {
+         unsigned qIdx = 0;
+         if (parseReuseFilterPredSemanticKey(spec.semanticKey, qIdx)) ++reuseFilterPredSlots;
+      }
       auto fpA = reuse0.joinBuildStoredValueMembersByState.find(hivA);
       auto fpB = reuse1.joinBuildStoredValueMembersByState.find(hivB);
       if (fpA != reuse0.joinBuildStoredValueMembersByState.end() &&
-          fpB != reuse1.joinBuildStoredValueMembersByState.end() && fpA->second == fpB->second) {
+          fpB != reuse1.joinBuildStoredValueMembersByState.end() && fpA->second == fpB->second &&
+          reuseFilterPredSlots < 2) {
          continue;
       }
 
       mlir::Value synthHiv = t.state;
       if (!mlir::isa<subop::HashIndexedViewType>(synthHiv.getType())) continue;
-
-      JoinBufferUnionPlan plan = buildUnionPlan(hivA, hivB, reuse0, reuse1, query0, query1);
-      if (plan.payloadColumns.empty()) continue;
 
       auto reuseSynthetic = collectModuleReuseInfo(synthetic);
       applyUnionPlanToSyntheticHiv(synthetic, synthHiv, plan, reuseSynthetic, query0, hivA, reuse0, query1, hivB,

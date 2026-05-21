@@ -17,6 +17,9 @@ namespace lingodb::compiler::dialect::subop {
 
 subop::Member makeOrGetPredMember(mlir::MLIRContext* ctx);
 
+/// Payload member for per-query reuse predicates (`filter_pred$N`, \p slot from semantic key).
+subop::Member makeOrGetPredMemberForSlot(mlir::MLIRContext* ctx, unsigned slot);
+
 bool valueMembersContainMemberNamed(mlir::MLIRContext* ctx, subop::StateMembersAttr members, llvm::StringRef name);
 
 llvm::SmallVector<mlir::Value, 8> collectJoinBuffersFeedingHashIndexedView(llvm::ArrayRef<mlir::Value> candidates,
@@ -33,11 +36,24 @@ llvm::SmallVector<runtime::FilterDescription, 8> decodeFiltersForStateFromWriter
    mlir::Value state, const ModuleReuseInfo& reuse,
    const llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*>* rwByStepOp = nullptr);
 
+llvm::SmallVector<runtime::FilterDescription, 8> decodeFiltersFromTableScanInExecutionStep(
+   ExecutionStepOp step);
+
 void insertWriteSidePredIntoHashMapConstructionStep(ExecutionStepOp step,
                                                     llvm::ArrayRef<runtime::FilterDescription> filters);
 
 void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
                                                    llvm::ArrayRef<runtime::FilterDescription> filters);
+
+/// Like \c insertWriteSidePredIntoBufferConstructionStep but targets \p predMemberName (e.g. \c filter_pred$1).
+void insertWriteSidePredIntoBufferConstructionStepForPredMember(
+   ExecutionStepOp step, llvm::ArrayRef<runtime::FilterDescription> filters, llvm::StringRef predMemberName);
+
+void materializeConstantTruePredMemberOnBufferMaterialize(subop::MaterializeOp matOp, llvm::StringRef predMemberName,
+                                                           bool updateStreamOperand);
+
+/// First \c filter_pred$N member on a hash-indexed view (consumer probe after layout align).
+std::optional<subop::Member> findFilterPredMemberOnHashIndexedView(subop::HashIndexedViewType hiv);
 
 void insertScanRefsPredFilter(ExecutionStepOp step, subop::Member predMember);
 
