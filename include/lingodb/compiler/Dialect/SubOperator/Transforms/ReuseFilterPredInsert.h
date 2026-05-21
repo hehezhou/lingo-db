@@ -39,6 +39,10 @@ llvm::SmallVector<runtime::FilterDescription, 8> decodeFiltersForStateFromWriter
 llvm::SmallVector<runtime::FilterDescription, 8> decodeFiltersFromTableScanInExecutionStep(
    ExecutionStepOp step);
 
+/// Keep only filters whose \c columnName maps to a column on the step's table \c scan_refs.
+llvm::SmallVector<runtime::FilterDescription, 8> restrictFiltersToTableScanInExecutionStep(
+   ExecutionStepOp step, llvm::ArrayRef<runtime::FilterDescription> filters);
+
 void insertWriteSidePredIntoHashMapConstructionStep(ExecutionStepOp step,
                                                     llvm::ArrayRef<runtime::FilterDescription> filters);
 

@@ -1509,8 +1509,11 @@ static void patchSyntheticJoinBufferFilterPredsImpl(
          unsigned qIdx = 0;
          if (!parseReuseFilterPredSemanticKey(layout.payloadSemanticKeys[i], qIdx)) continue;
          llvm::StringRef predName = mm.getName(layout.payloadMembers[i]);
-         auto filters = decodeFiltersForStateFromWriterSteps(hivs[qIdx], *reuses[qIdx]);
-         if (filters.empty()) filters = decodeFiltersFromTableScanInExecutionStep(buildStep);
+         auto filters = decodeFiltersFromTableScanInExecutionStep(buildStep);
+         if (filters.empty()) {
+            filters = decodeFiltersForStateFromWriterSteps(hivs[qIdx], *reuses[qIdx]);
+            filters = restrictFiltersToTableScanInExecutionStep(buildStep, filters);
+         }
          insertWriteSidePredIntoBufferConstructionStepForPredMember(buildStep, filters, predName);
       }
    }
