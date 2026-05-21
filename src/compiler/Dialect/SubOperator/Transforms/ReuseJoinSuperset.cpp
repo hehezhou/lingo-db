@@ -184,87 +184,175 @@ static mlir::Type memberTypeForIdentifier(subop::TableType tableTy, subop::Membe
 static ExternalDatasourceProperty mergeExternalDatasource(const ExternalDatasourceProperty& a,
                                                         const ExternalDatasourceProperty& b);
 
-/// One \c get_external per module, indexed by \c ExternalDatasourceProperty::tableName (single module walk).
-struct ExternalTableCatalog {
-   struct Entry {
-      subop::GetExternalOp op;
-      ExternalDatasourceProperty ds;
-      subop::TableType tableTy;
-   };
-   llvm::StringMap<llvm::SmallVector<Entry>> byTableName;
-
-   llvm::ArrayRef<Entry> entries(llvm::StringRef tableName) const {
-      auto it = byTableName.find(tableName);
-      if (it == byTableName.end()) return {};
-      return it->second;
+static subop::ScanRefsOp findTableScanRefsInBuildStep(subop::ExecutionStepOp buildStep) {
+   mlir::Block& body = buildStep.getSubOps().front();
+   for (mlir::Operation& op : body.without_terminator()) {
+      auto s = mlir::dyn_cast<subop::ScanRefsOp>(&op);
+      if (!s) continue;
+      if (mlir::isa<subop::TableType>(s.getState().getType())) return s;
    }
-
-   subop::TableType representativeTableTy(llvm::StringRef tableName) const {
-      auto refs = entries(tableName);
-      if (refs.empty()) return {};
-      return refs.front().tableTy;
-   }
-};
-
-static ExternalTableCatalog buildExternalTableCatalog(mlir::ModuleOp module) {
-   ExternalTableCatalog catalog;
-   if (!module) return catalog;
-   module.walk([&](subop::GetExternalOp ge) {
-      auto ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-      auto tableTy = mlir::dyn_cast<subop::TableType>(ge.getResult().getType());
-      if (!tableTy) return;
-      catalog.byTableName[ds.tableName].push_back({ge, std::move(ds), tableTy});
-   });
-   return catalog;
+   return {};
 }
 
-static void mergeExternalDatasourceForTable(ExternalDatasourceProperty& merged, bool& haveMerged,
-                                            const ExternalTableCatalog& catalog, llvm::StringRef tableName) {
-   for (const ExternalTableCatalog::Entry& entry : catalog.entries(tableName)) {
-      if (!haveMerged) {
-         merged = entry.ds;
-         haveMerged = true;
-      } else {
-         merged = mergeExternalDatasource(merged, entry.ds);
+/// Unique \c get_external in an external-table construction step (\c isExternalTableRefStep).
+static subop::GetExternalOp findUniqueGetExternalInTableRefStep(subop::ExecutionStepOp tableStep) {
+   assert(isExternalTableRefStep(tableStep) && "expected external table_ref construction step");
+   subop::GetExternalOp ge;
+   for (mlir::Operation& op : tableStep.getSubOps().front().without_terminator()) {
+      if (auto g = mlir::dyn_cast<subop::GetExternalOp>(&op)) {
+         assert(!ge && "table_ref step must contain exactly one get_external");
+         ge = g;
       }
    }
+   assert(ge && "table_ref step must contain get_external");
+   return ge;
 }
 
-static void ingestExternalTableColumnsForUnionScopes(const ExternalTableCatalog& catalog,
-                                                     llvm::StringMap<PayloadColumnSpec>& unionCols) {
-   if (catalog.byTableName.empty()) return;
+/// Resolve the external table backing \c scan_refs: block-arg → step operand → reuse map → table_ref step.
+static bool resolveScannedTableExternal(subop::ExecutionStepOp buildStep, mlir::Value tableStateInBody,
+                                       const ModuleReuseInfo& reuse, llvm::StringRef& tableName,
+                                       ExternalDatasourceProperty& ds, bool& haveDs, subop::TableType& tableTy) {
+   mlir::Value external = tableStateInBody;
+   if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(external)) {
+      if (ba.getOwner() == &buildStep.getSubOps().front() && ba.getArgNumber() < buildStep.getNumOperands()) {
+         external = buildStep.getOperand(ba.getArgNumber());
+      }
+   }
+   external = peelBlockArgsToEnclosingOperands(external);
+
+   if (auto ge = mlir::dyn_cast_or_null<subop::GetExternalOp>(external.getDefiningOp())) {
+      ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
+      tableName = ds.tableName;
+      haveDs = true;
+      tableTy = mlir::cast<subop::TableType>(ge.getResult().getType());
+      assert(!tableName.empty());
+      return true;
+   }
+
+   mlir::Value canon = canonicalizeStateValueForReuse(external);
+   if (auto it = findReuseMap(reuse.externalDatasourceByTableState, canon);
+       it != reuse.externalDatasourceByTableState.end()) {
+      ds = it->second;
+      tableName = ds.tableName;
+      haveDs = true;
+      tableTy = mlir::cast<subop::TableType>(external.getType());
+      assert(!tableName.empty());
+      return true;
+   }
+
+   if (auto tableStep = mlir::dyn_cast_or_null<subop::ExecutionStepOp>(external.getDefiningOp())) {
+      if (!isExternalTableRefStep(tableStep)) return false;
+      subop::GetExternalOp ge = findUniqueGetExternalInTableRefStep(tableStep);
+      ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
+      tableName = ds.tableName;
+      haveDs = true;
+      tableTy = mlir::cast<subop::TableType>(ge.getResult().getType());
+      assert(!tableName.empty());
+      return true;
+   }
+   return false;
+}
+
+static std::optional<subop::GetExternalOp> resolveGetExternalOpForScannedTable(subop::ExecutionStepOp buildStep,
+                                                                               mlir::Value tableStateInBody,
+                                                                               const ModuleReuseInfo& reuse) {
+   mlir::Value external = tableStateInBody;
+   if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(external)) {
+      if (ba.getOwner() == &buildStep.getSubOps().front() && ba.getArgNumber() < buildStep.getNumOperands()) {
+         external = buildStep.getOperand(ba.getArgNumber());
+      }
+   }
+   external = peelBlockArgsToEnclosingOperands(external);
+
+   if (auto ge = mlir::dyn_cast_or_null<subop::GetExternalOp>(external.getDefiningOp())) return ge;
+
+   if (auto tableStep = mlir::dyn_cast_or_null<subop::ExecutionStepOp>(external.getDefiningOp())) {
+      if (!isExternalTableRefStep(tableStep)) return std::nullopt;
+      return findUniqueGetExternalInTableRefStep(tableStep);
+   }
+
+   mlir::Value canon = canonicalizeStateValueForReuse(external);
+   if (auto it = findReuseMap(reuse.externalDatasourceByTableState, canon);
+       it != reuse.externalDatasourceByTableState.end()) {
+      for (auto& rw : reuse.steps) {
+         subop::ExecutionStepOp step = rw.step;
+         if (!isExternalTableRefStep(step)) continue;
+         if (canonicalizeStateValueForReuse(step.getResult(0)) != canon) continue;
+         return findUniqueGetExternalInTableRefStep(step);
+      }
+   }
+   return std::nullopt;
+}
+
+static void ingestExternalTableColumnsFromBuildStepScan(subop::ExecutionStepOp buildStep,
+                                                        const ModuleReuseInfo& reuse,
+                                                        llvm::StringMap<PayloadColumnSpec>& unionCols) {
+   subop::ScanRefsOp scanOp = findTableScanRefsInBuildStep(buildStep);
+   if (!scanOp) return;
+
+   llvm::StringRef tableName;
+   ExternalDatasourceProperty ds;
+   bool haveDs = false;
+   subop::TableType tableTy;
+   if (!resolveScannedTableExternal(buildStep, scanOp.getState(), reuse, tableName, ds, haveDs, tableTy) || !haveDs)
+      return;
+
    llvm::StringSet<> scopesInUnion;
    for (auto& it : unionCols) {
       if (!it.getValue().scope.empty()) scopesInUnion.insert(it.getValue().scope);
    }
-   auto* ctx = catalog.byTableName.begin()->second.front().op->getContext();
-   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   for (const auto& tableIt : catalog.byTableName) {
-      if (!scopesInUnion.contains(tableIt.getKey())) continue;
-      for (const ExternalTableCatalog::Entry& entry : tableIt.getValue()) {
-         for (const auto& map : entry.ds.mapping) {
-            llvm::StringRef leaf = normalizeColumnIdentifier(map.identifier);
-            PayloadColumnSpec spec;
-            spec.scope = entry.ds.tableName;
-            spec.leaf = leaf.str();
-            spec.colType = memberTypeForIdentifier(entry.tableTy, mm, leaf);
-            if (!spec.colType) continue;
-            spec.semanticKey = columnSemanticKey(spec.scope, spec.leaf);
-            unionCols.try_emplace(spec.semanticKey, spec);
-         }
-      }
+   if (!scopesInUnion.contains(tableName)) return;
+
+   auto& mm = buildStep.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (const auto& map : ds.mapping) {
+      llvm::StringRef leaf = normalizeColumnIdentifier(map.identifier);
+      PayloadColumnSpec spec;
+      spec.scope = tableName.str();
+      spec.leaf = leaf.str();
+      spec.colType = memberTypeForIdentifier(tableTy, mm, leaf);
+      if (!spec.colType) continue;
+      spec.semanticKey = columnSemanticKey(spec.scope, spec.leaf);
+      unionCols.try_emplace(spec.semanticKey, spec);
    }
 }
 
-static mlir::Type columnTypeForIdentifierInCatalog(const ExternalTableCatalog& catalog, llvm::StringRef tableName,
-                                                   llvm::StringRef identifier) {
-   if (catalog.byTableName.empty()) return {};
-   auto* ctx = catalog.byTableName.begin()->second.front().op->getContext();
-   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   for (const ExternalTableCatalog::Entry& entry : catalog.entries(tableName)) {
-      if (mlir::Type ty = memberTypeForIdentifier(entry.tableTy, mm, identifier)) return ty;
+static void mergePeerExternalFromBuildStepScan(ExternalDatasourceProperty& merged, bool& haveMerged,
+                                             subop::ExecutionStepOp peerBuild, const ModuleReuseInfo& reusePeer,
+                                             llvm::StringRef donorTableName) {
+   subop::ScanRefsOp scanOp = findTableScanRefsInBuildStep(peerBuild);
+   if (!scanOp) return;
+   llvm::StringRef peerTableName;
+   ExternalDatasourceProperty peerDs;
+   bool havePeer = false;
+   subop::TableType peerTy;
+   if (!resolveScannedTableExternal(peerBuild, scanOp.getState(), reusePeer, peerTableName, peerDs, havePeer, peerTy) ||
+       !havePeer) {
+      return;
    }
-   return {};
+   if (peerTableName != donorTableName) return;
+   if (!haveMerged) {
+      merged = peerDs;
+      haveMerged = true;
+   } else {
+      merged = mergeExternalDatasource(merged, peerDs);
+   }
+}
+
+static mlir::Type columnTypeForIdentifierFromPeerBuildScan(subop::ExecutionStepOp peerBuild,
+                                                           const ModuleReuseInfo& reusePeer,
+                                                           llvm::StringRef donorTableName, llvm::StringRef identifier) {
+   subop::ScanRefsOp scanOp = findTableScanRefsInBuildStep(peerBuild);
+   if (!scanOp) return {};
+   llvm::StringRef peerTableName;
+   ExternalDatasourceProperty peerDs;
+   bool havePeer = false;
+   subop::TableType peerTy;
+   if (!resolveScannedTableExternal(peerBuild, scanOp.getState(), reusePeer, peerTableName, peerDs, havePeer, peerTy) ||
+       !havePeer || peerTableName != donorTableName) {
+      return {};
+   }
+   auto& mm = peerBuild.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   return memberTypeForIdentifier(peerTy, mm, identifier);
 }
 
 static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, const ModuleReuseInfo& reuseA,
@@ -318,13 +406,10 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
          predSpec.semanticKey = reuseFilterPredSemanticKey(reuseQueryIndex);
          unionCols.try_emplace(predSpec.semanticKey, predSpec);
       }
+      if (buildStep) ingestExternalTableColumnsFromBuildStepScan(buildStep, reuse, unionCols);
    };
    ingestHiv(hivA, reuseA, 0);
    ingestHiv(hivB, reuseB, 1);
-   ExternalTableCatalog catalogA = buildExternalTableCatalog(modA);
-   ExternalTableCatalog catalogB = buildExternalTableCatalog(modB);
-   ingestExternalTableColumnsForUnionScopes(catalogA, unionCols);
-   ingestExternalTableColumnsForUnionScopes(catalogB, unionCols);
 
    llvm::SmallVector<PayloadColumnSpec*, 8> ordered;
    ordered.reserve(unionCols.size());
@@ -784,53 +869,6 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
    });
 }
 
-/// Resolve the external table backing \c scan_refs: block-arg → step operand → reuse map / \c get_external.
-static bool resolveScannedTableExternal(subop::ExecutionStepOp buildStep, mlir::Value tableStateInBody,
-                                       const ModuleReuseInfo& reuse, llvm::StringRef& tableName,
-                                       ExternalDatasourceProperty& ds, bool& haveDs, subop::TableType& tableTy) {
-   mlir::Value external = tableStateInBody;
-   if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(external)) {
-      if (ba.getOwner() == &buildStep.getSubOps().front() && ba.getArgNumber() < buildStep.getNumOperands()) {
-         external = buildStep.getOperand(ba.getArgNumber());
-      }
-   }
-   external = peelBlockArgsToEnclosingOperands(external);
-
-   if (auto ge = mlir::dyn_cast_or_null<subop::GetExternalOp>(external.getDefiningOp())) {
-      ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-      tableName = ds.tableName;
-      haveDs = true;
-      tableTy = mlir::cast<subop::TableType>(ge.getResult().getType());
-      assert(!tableName.empty());
-      return true;
-   }
-
-   mlir::Value canon = canonicalizeStateValueForReuse(external);
-   if (auto it = findReuseMap(reuse.externalDatasourceByTableState, canon);
-       it != reuse.externalDatasourceByTableState.end()) {
-      ds = it->second;
-      tableName = ds.tableName;
-      haveDs = true;
-      tableTy = mlir::cast<subop::TableType>(external.getType());
-      assert(!tableName.empty());
-      return true;
-   }
-
-   if (auto tableStep = mlir::dyn_cast_or_null<subop::ExecutionStepOp>(external.getDefiningOp())) {
-      for (mlir::Operation& op : tableStep.getSubOps().front().without_terminator()) {
-         if (auto ge = mlir::dyn_cast<subop::GetExternalOp>(&op)) {
-            ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(ge.getDescr());
-            tableName = ds.tableName;
-            haveDs = true;
-            tableTy = mlir::cast<subop::TableType>(ge.getResult().getType());
-            assert(!tableName.empty());
-            return true;
-         }
-      }
-   }
-   return false;
-}
-
 static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::ExecutionStepOp buildStep,
                                          const JoinBufferUnionPlan& plan, subop::BufferType targetBufTy,
                                          const ModuleReuseInfo& reuseSynthetic,
@@ -843,15 +881,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    auto& mm = subDialect->getMemberManager();
    auto& cm = tupleDialect->getColumnManager();
 
-   subop::ScanRefsOp scanOp;
-   for (mlir::Operation& op : body.without_terminator()) {
-      auto s = mlir::dyn_cast<subop::ScanRefsOp>(&op);
-      if (!s) continue;
-      if (mlir::isa<subop::TableType>(s.getState().getType())) {
-         scanOp = s;
-         break;
-      }
-   }
+   subop::ScanRefsOp scanOp = findTableScanRefsInBuildStep(buildStep);
    assert(scanOp && "join superset: buffer build step must contain scan_refs on a table state");
 
    mlir::Value tableState = scanOp.getState();
@@ -869,22 +899,40 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
           }) &&
           "join superset: union plan must include donor external table scope");
 
-   ExternalTableCatalog syntheticCatalog = buildExternalTableCatalog(synthetic);
-   llvm::SmallVector<ExternalTableCatalog, 2> peerCatalogs;
-   peerCatalogs.reserve(peerHivs.size());
-   for (auto [peerMod, peerHiv] : peerHivs) {
-      (void)peerHiv;
-      peerCatalogs.push_back(peerMod ? buildExternalTableCatalog(peerMod) : ExternalTableCatalog{});
+   for (size_t pi = 0; pi < peerHivs.size(); ++pi) {
+      auto [peerMod, peerHiv] = peerHivs[pi];
+      if (!peerMod || !peerHiv) continue;
+      const ModuleReuseInfo& reusePeer = *peerReuses[pi];
+      mlir::Value peerCanon = resolveCacheTargetStateForReuse(peerHiv, reusePeer);
+      mlir::Value peerBuf = peerCanon;
+      if (auto it = reusePeer.hashIndexedViewFromMergedBuffer.find(peerCanon);
+          it != reusePeer.hashIndexedViewFromMergedBuffer.end()) {
+         peerBuf = it->second;
+      }
+      subop::ExecutionStepOp peerBuild = findBufferBuildStepWithTableMaterialize(peerBuf, reusePeer);
+      if (!peerBuild) peerBuild = findBufferBuildStepWithTableScan(peerMod);
+      if (peerBuild) mergePeerExternalFromBuildStepScan(mergedDs, haveDs, peerBuild, reusePeer, donorTableName);
    }
-   for (const ExternalTableCatalog& peerCat : peerCatalogs) {
-      mergeExternalDatasourceForTable(mergedDs, haveDs, peerCat, donorTableName);
-   }
-   mergeExternalDatasourceForTable(mergedDs, haveDs, syntheticCatalog, donorTableName);
    assert(haveDs && "join superset: merged external datasource required for donor table");
 
    auto lookupPeerColumnType = [&](llvm::StringRef identifier) -> mlir::Type {
-      for (const ExternalTableCatalog& peerCat : peerCatalogs) {
-         if (mlir::Type ty = columnTypeForIdentifierInCatalog(peerCat, donorTableName, identifier)) return ty;
+      for (size_t pi = 0; pi < peerHivs.size(); ++pi) {
+         auto [peerMod, peerHiv] = peerHivs[pi];
+         if (!peerMod || !peerHiv) continue;
+         const ModuleReuseInfo& reusePeer = *peerReuses[pi];
+         mlir::Value peerCanon = resolveCacheTargetStateForReuse(peerHiv, reusePeer);
+         mlir::Value peerBuf = peerCanon;
+         if (auto it = reusePeer.hashIndexedViewFromMergedBuffer.find(peerCanon);
+             it != reusePeer.hashIndexedViewFromMergedBuffer.end()) {
+            peerBuf = it->second;
+         }
+         subop::ExecutionStepOp peerBuild = findBufferBuildStepWithTableMaterialize(peerBuf, reusePeer);
+         if (!peerBuild) peerBuild = findBufferBuildStepWithTableScan(peerMod);
+         if (!peerBuild) continue;
+         if (mlir::Type ty =
+                columnTypeForIdentifierFromPeerBuildScan(peerBuild, reusePeer, donorTableName, identifier)) {
+            return ty;
+         }
       }
       return {};
    };
@@ -897,13 +945,11 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    }
    llvm::sort(mergedDs.mapping, [](const auto& x, const auto& y) { return x.memberName < y.memberName; });
    std::string hex = lingodb::utility::serializeToHexString(mergedDs);
-   auto geIt = syntheticCatalog.byTableName.find(donorTableName);
-   assert(geIt != syntheticCatalog.byTableName.end() && !geIt->second.empty() &&
-          "join superset: synthetic module must contain get_external for donor table");
-   for (ExternalTableCatalog::Entry& entry : geIt->second) {
-      entry.op.setDescrAttr(mlir::StringAttr::get(ctx, hex));
-      refreshTableStateTypesInModule(synthetic, entry.op.getResult(), newTableTy);
-   }
+   std::optional<subop::GetExternalOp> synthGe =
+      resolveGetExternalOpForScannedTable(buildStep, tableState, reuseSynthetic);
+   assert(synthGe && "join superset: scan_refs must resolve to get_external in table construction step");
+   synthGe->setDescrAttr(mlir::StringAttr::get(ctx, hex));
+   refreshTableStateTypesInModule(synthetic, synthGe->getResult(), newTableTy);
 
    refreshTableStateTypesInModule(synthetic, tableState, newTableTy);
    mergedSupplierTableTy = newTableTy;

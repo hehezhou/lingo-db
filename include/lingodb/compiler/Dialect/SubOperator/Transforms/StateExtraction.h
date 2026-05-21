@@ -22,6 +22,9 @@ namespace lingodb::compiler::dialect::subop {
 /// (`writerStepsByState`, `mergedFromThreadLocal`, `createOnlyStepForState`).
 mlir::Value canonicalizeStateValueForReuse(mlir::Value v);
 
+/// Step body is a single \c get_external feeding the step return (external table construction).
+bool isExternalTableRefStep(subop::ExecutionStepOp step);
+
 void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os);
 
 /// For each `execution_group`, print top-level ops in block order with indices that match

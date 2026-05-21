@@ -316,23 +316,6 @@ bool intersectsMembers(const llvm::SmallVector<subop::Member>& a, const llvm::Sm
    return false;
 }
 
-bool isExternalTableRefStep(subop::ExecutionStepOp step) {
-   auto& block = step.getSubOps().front();
-   auto ops = block.without_terminator();
-   if (std::distance(ops.begin(), ops.end()) != 1) {
-      return false;
-   }
-   auto* onlyOp = &*ops.begin();
-   if (!mlir::isa<subop::GetExternalOp>(onlyOp)) {
-      return false;
-   }
-   auto ret = mlir::cast<subop::ExecutionStepReturnOp>(block.getTerminator());
-   if (ret.getInputs().size() != 1) {
-      return false;
-   }
-   return ret.getInputs()[0].getDefiningOp() == onlyOp;
-}
-
 bool isCreateOnlyExecutionStep(subop::ExecutionStepOp step) {
    auto& block = step.getSubOps().front();
    for (auto& op : block.without_terminator()) {
@@ -1853,6 +1836,23 @@ static void printExecutionGroupStepLines(GroupOp group, llvm::raw_ostream& os, l
    }
 }
 } // namespace
+
+bool isExternalTableRefStep(subop::ExecutionStepOp step) {
+   auto& block = step.getSubOps().front();
+   auto ops = block.without_terminator();
+   if (std::distance(ops.begin(), ops.end()) != 1) {
+      return false;
+   }
+   auto* onlyOp = &*ops.begin();
+   if (!mlir::isa<subop::GetExternalOp>(onlyOp)) {
+      return false;
+   }
+   auto ret = mlir::cast<subop::ExecutionStepReturnOp>(block.getTerminator());
+   if (ret.getInputs().size() != 1) {
+      return false;
+   }
+   return ret.getInputs()[0].getDefiningOp() == onlyOp;
+}
 
 void printTopLevelExecutionStepLayout(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
    os << "\n// ==== execution_step layout (block order == SubOp lowering ordinal) ====\n";
