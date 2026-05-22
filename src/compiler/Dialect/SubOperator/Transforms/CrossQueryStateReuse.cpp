@@ -785,6 +785,10 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       resyncConsumerCachedHivCarrierTypesFromCacheGet(query1, t.cacheKey);
    }
 
+   if (res.query0) syncProbeGatherMappingsInModule(*res.query0);
+   syncProbeGatherMappingsInModule(query0);
+   syncProbeGatherMappingsInModule(query1);
+
    return res;
 }
 

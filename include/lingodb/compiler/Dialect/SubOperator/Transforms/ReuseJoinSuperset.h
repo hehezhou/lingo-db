@@ -60,6 +60,9 @@ void resyncConsumerCachedHivCarrierTypesFromCacheGet(mlir::ModuleOp consumer,
 /// Fix lookup list / nested probe types to match each \c LookupOp's HIV (after union or pred layout passes).
 void syncLookupCarrierAttrsFromState(mlir::ModuleOp module);
 
+/// Align \c gather member keys with embedded \c lookup_entry_ref HIV slots (whole module; for synthetic producer).
+void syncProbeGatherMappingsInModule(mlir::ModuleOp module);
+
 } // namespace lingodb::compiler::dialect::subop
 
 #endif
