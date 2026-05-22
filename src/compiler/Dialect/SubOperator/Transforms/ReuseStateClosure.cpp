@@ -75,6 +75,14 @@ bool opOperandsOrNestedBlockArgsTouchClosure(mlir::Operation* op, const llvm::De
    return false;
 }
 
+/// Block argument type for an execution_step operand when `is_thread_local` is false but the
+/// operand is still `!subop.thread_local<state>` (nested probe steps keep the unwrapped state type).
+static mlir::Type executionStepBodyArgTypeForOperand(mlir::Value operand, mlir::Attribute isThreadLocalAttr) {
+   if (mlir::cast<mlir::BoolAttr>(isThreadLocalAttr).getValue()) return operand.getType();
+   if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(operand.getType())) return tl.getWrapped();
+   return operand.getType();
+}
+
 /// Keep `execution_step` result types and body entry types aligned with `execution_step_return`
 /// and step operands. When \p closureFilter is non-null, only touch steps that reach the join
 /// buffer / HIV closure (derived from `computeJoinBufferHivSsaClosure`).
@@ -97,8 +105,15 @@ void synchronizeExecutionStepPortTypes(mlir::ModuleOp module, const llvm::DenseS
       module.walk([&](subop::ExecutionStepOp step) {
          if (closureFilter && !executionStepTouchesClosure(step, *closureFilter)) return;
          mlir::Block& body = step.getSubOps().front();
+         bool nestedProbeStep = step->getParentOfType<subop::NestedExecutionGroupOp>() != nullptr;
+         auto tlsFlags = step.getIsThreadLocal();
          for (unsigned i = 0; i < step.getNumOperands() && i < body.getNumArguments(); ++i) {
             mlir::Type wt = step.getOperand(i).getType();
+            if (nestedProbeStep) {
+               mlir::Attribute tlsAttr =
+                  i < tlsFlags.size() ? tlsFlags[i] : mlir::BoolAttr::get(step.getContext(), false);
+               wt = executionStepBodyArgTypeForOperand(step.getOperand(i), tlsAttr);
+            }
             if (body.getArgument(i).getType() != wt) {
                body.getArgument(i).setType(wt);
                changed = true;

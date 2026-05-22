@@ -694,7 +694,8 @@ void propagateSubOpColumnAttrsFromSsaStateLayout(mlir::ModuleOp module,
       if (!shouldUpdateOp(op.getOperation())) return;
       auto r = op.getRef();
       if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(op.getState().getType())) {
-         auto expected = subop::LookupEntryRefType::get(ctx, hiv);
+         auto expected =
+            subop::ListType::get(ctx, subop::LookupEntryRefType::get(ctx, hiv));
          if (r.getColumn().type == expected) return;
          r.getColumn().type = expected;
          op.setRefAttr(r);
@@ -825,7 +826,7 @@ void propagateSubOpColumnAttrsFromSsaStateLayout(mlir::ModuleOp module,
       if (!shouldUpdateOp(lookup.getOperation())) return;
       auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(lookup.getState().getType());
       if (!hiv) return;
-      auto expected = subop::LookupEntryRefType::get(ctx, hiv);
+      auto expected = subop::ListType::get(ctx, subop::LookupEntryRefType::get(ctx, hiv));
       auto refDef = lookup.getRef();
       if (refDef.getColumn().type == expected) return;
       refDef.getColumn().type = expected;
@@ -1056,9 +1057,11 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
    }
    if (std::holds_alternative<std::string>(f.value)) {
       auto s = std::get<std::string>(f.value);
-      assert((mlir::isa<lingodb::compiler::dialect::db::DateType>(colV.getType()) ||
-              mlir::isa<lingodb::compiler::dialect::db::CharType>(colV.getType())) &&
-             "runtime filter IR: string literal only supported for db.date/db.char");
+      mlir::Type colTy = getBaseType(colV.getType());
+      assert((mlir::isa<lingodb::compiler::dialect::db::DateType>(colTy) ||
+              mlir::isa<lingodb::compiler::dialect::db::CharType>(colTy) ||
+              mlir::isa<lingodb::compiler::dialect::db::StringType>(colTy)) &&
+             "runtime filter IR: string literal requires db.date, db.char, or db.string column");
       auto rhs = rb.create<lingodb::compiler::dialect::db::ConstantOp>(loc, colV.getType(), rb.getStringAttr(s));
       using P = lingodb::compiler::dialect::db::DBCmpPredicate;
       P p;

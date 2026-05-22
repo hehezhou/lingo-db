@@ -57,6 +57,9 @@ void refreshCachedJoinLayoutsFromSyntheticCachePuts(mlir::ModuleOp synthetic,
 void resyncConsumerCachedHivCarrierTypesFromCacheGet(mlir::ModuleOp consumer,
                                                      std::optional<uint64_t> cacheKey = std::nullopt);
 
+/// Fix lookup list / nested probe types to match each \c LookupOp's HIV (after union or pred layout passes).
+void syncLookupCarrierAttrsFromState(mlir::ModuleOp module);
+
 } // namespace lingodb::compiler::dialect::subop
 
 #endif

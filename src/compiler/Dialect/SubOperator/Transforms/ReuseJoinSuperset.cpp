@@ -107,18 +107,58 @@ static subop::BufferType getInnerBufferTypeForMaterializeState(mlir::Type stateT
    return nullptr;
 }
 
+static subop::BufferType bufferTypeForJoinTarget(mlir::Value mergedBuffer, const ModuleReuseInfo& reuse) {
+   if (auto b = mlir::dyn_cast<subop::BufferType>(mergedBuffer.getType())) return b;
+   if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(mergedBuffer.getType()))
+      return mlir::dyn_cast<subop::BufferType>(tl.getWrapped());
+   mlir::Value canon = canonicalizeStateValueForReuse(mergedBuffer);
+   if (auto it = reuse.mergedFromThreadLocal.find(canon); it != reuse.mergedFromThreadLocal.end())
+      return getInnerBufferTypeForMaterializeState(it->second.getType());
+   return nullptr;
+}
+
 static bool materializeTargetsJoinBuffer(subop::MaterializeOp mat, mlir::Value mergedBuffer,
                                         const ModuleReuseInfo& reuse) {
-   subop::BufferType targetBuf = mlir::dyn_cast<subop::BufferType>(mergedBuffer.getType());
+   subop::BufferType targetBuf = bufferTypeForJoinTarget(mergedBuffer, reuse);
    if (!targetBuf) return false;
    subop::BufferType matBuf = getInnerBufferTypeForMaterializeState(mat.getState().getType());
    if (!matBuf) return false;
    if (matBuf == targetBuf) return true;
+   if (matBuf.getMembers() == targetBuf.getMembers()) return true;
    mlir::Value canonBuf = canonicalizeStateValueForReuse(mergedBuffer);
    if (auto itTL = reuse.mergedFromThreadLocal.find(canonBuf); itTL != reuse.mergedFromThreadLocal.end()) {
       if (mat.getState() == itTL->second) return true;
+      if (subop::BufferType tlBuf = getInnerBufferTypeForMaterializeState(itTL->second.getType());
+          tlBuf && tlBuf.getMembers() == matBuf.getMembers()) {
+         return true;
+      }
    }
    return false;
+}
+
+static subop::MaterializeOp findJoinBufferMaterializeInStep(subop::ExecutionStepOp buildStep) {
+   subop::MaterializeOp matOp;
+   buildStep.walk([&](subop::MaterializeOp m) {
+      if (!getInnerBufferTypeForMaterializeState(m.getState().getType())) return;
+      matOp = m;
+   });
+   return matOp;
+}
+
+static mlir::Value resolveJoinMergedBuffer(mlir::Value hivOrBuf, mlir::ModuleOp module, const ModuleReuseInfo& reuse) {
+   mlir::Value canon = resolveCacheTargetStateForReuse(hivOrBuf, reuse);
+   if (auto it = findReuseMap(reuse.hashIndexedViewFromMergedBuffer, canon);
+       it != reuse.hashIndexedViewFromMergedBuffer.end()) {
+      return it->second;
+   }
+   if (bufferTypeForJoinTarget(canon, reuse)) return canon;
+   mlir::Value fromChiv;
+   module.walk([&](subop::CreateHashIndexedView chiv) {
+      if (fromChiv) return;
+      if (canonicalizeStateValueForReuse(chiv.getResult()) != canon) return;
+      fromChiv = chiv.getSource();
+   });
+   return fromChiv ? fromChiv : canon;
 }
 
 static subop::ExecutionStepOp findBufferBuildStepWithTableMaterialize(mlir::Value mergedBuffer,
@@ -180,6 +220,8 @@ static void collectPayloadFromMaterialize(
 }
 
 static mlir::Type memberTypeForIdentifier(subop::TableType tableTy, subop::MemberManager& mm, llvm::StringRef identifier);
+static subop::Member tableMemberForIdentifier(subop::TableType tableTy, subop::MemberManager& mm,
+                                              llvm::StringRef identifier);
 
 static ExternalDatasourceProperty mergeExternalDatasource(const ExternalDatasourceProperty& a,
                                                         const ExternalDatasourceProperty& b);
@@ -290,50 +332,116 @@ static std::optional<subop::GetExternalOp> resolveGetExternalOpForScannedTable(s
    return std::nullopt;
 }
 
+static subop::ScanRefsOp findTableScanRefsForExternalTable(subop::ExecutionStepOp buildStep, llvm::StringRef tableName,
+                                                         const ModuleReuseInfo& reuse) {
+   mlir::Block& body = buildStep.getSubOps().front();
+   for (mlir::Operation& op : body.without_terminator()) {
+      auto scanOp = mlir::dyn_cast<subop::ScanRefsOp>(&op);
+      if (!scanOp || !mlir::isa<subop::TableType>(scanOp.getState().getType())) continue;
+      llvm::StringRef resolved;
+      ExternalDatasourceProperty ds;
+      bool haveDs = false;
+      subop::TableType tableTy;
+      if (!resolveScannedTableExternal(buildStep, scanOp.getState(), reuse, resolved, ds, haveDs, tableTy) ||
+          !haveDs) {
+         continue;
+      }
+      if (resolved == tableName) return scanOp;
+   }
+   return {};
+}
+
+static unsigned countUnionPayloadLeavesOnTable(llvm::ArrayRef<PayloadColumnSpec> payloadColumns,
+                                               subop::TableType tableTy, subop::MemberManager& mm) {
+   unsigned overlap = 0;
+   for (const PayloadColumnSpec& spec : payloadColumns) {
+      unsigned qIdx = 0;
+      if (parseReuseFilterPredSemanticKey(spec.semanticKey, qIdx)) continue;
+      if (tableMemberForIdentifier(tableTy, mm, spec.leaf)) ++overlap;
+   }
+   return overlap;
+}
+
+static subop::ScanRefsOp findTableScanForPayloadLeaf(subop::ExecutionStepOp buildStep, llvm::StringRef leaf,
+                                                   subop::MemberManager& mm) {
+   subop::ScanRefsOp found;
+   buildStep.walk([&](subop::ScanRefsOp scanOp) {
+      if (found) return;
+      auto tableTy = mlir::dyn_cast<subop::TableType>(scanOp.getState().getType());
+      if (!tableTy) return;
+      if (tableMemberForIdentifier(tableTy, mm, leaf)) found = scanOp;
+   });
+   return found;
+}
+
+static subop::ScanRefsOp findDonorTableScanInUnionPlan(subop::ExecutionStepOp buildStep,
+                                                       const JoinBufferUnionPlan& plan,
+                                                       const ModuleReuseInfo& reuse) {
+   (void)reuse;
+   auto& mm = buildStep.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   subop::ScanRefsOp bestScan;
+   unsigned bestOverlap = 0;
+   buildStep.walk([&](subop::ScanRefsOp scanOp) {
+      auto tableTy = mlir::dyn_cast<subop::TableType>(scanOp.getState().getType());
+      if (!tableTy) return;
+      unsigned overlap = countUnionPayloadLeavesOnTable(plan.payloadColumns, tableTy, mm);
+      if (overlap > bestOverlap) {
+         bestOverlap = overlap;
+         bestScan = scanOp;
+      }
+   });
+   return bestScan;
+}
+
 static void ingestExternalTableColumnsFromBuildStepScan(subop::ExecutionStepOp buildStep,
                                                         const ModuleReuseInfo& reuse,
                                                         llvm::StringMap<PayloadColumnSpec>& unionCols) {
-   subop::ScanRefsOp scanOp = findTableScanRefsInBuildStep(buildStep);
-   assert(scanOp && "join union ingest: build step must contain scan_refs on a table state");
-
-   llvm::StringRef tableName;
-   ExternalDatasourceProperty ds;
-   bool haveDs = false;
-   subop::TableType tableTy;
-   assert(resolveScannedTableExternal(buildStep, scanOp.getState(), reuse, tableName, ds, haveDs, tableTy) && haveDs);
-
-   llvm::StringSet<> scopesInUnion;
-   for (auto& it : unionCols) {
-      if (!it.getValue().scope.empty()) scopesInUnion.insert(it.getValue().scope);
-   }
-   assert(scopesInUnion.contains(tableName) && "union plan must already reference donor external table scope");
+   llvm::SmallVector<PayloadColumnSpec, 16> unionSpecs;
+   unionSpecs.reserve(unionCols.size());
+   for (auto& it : unionCols) unionSpecs.push_back(it.getValue());
 
    auto& mm = buildStep.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   for (const auto& map : ds.mapping) {
-      llvm::StringRef leaf = normalizeColumnIdentifier(map.identifier);
-      PayloadColumnSpec spec;
-      spec.scope = tableName.str();
-      spec.leaf = leaf.str();
-      spec.colType = memberTypeForIdentifier(tableTy, mm, leaf);
-      assert(spec.colType && "external table mapping column must exist on scanned table type");
-      spec.semanticKey = columnSemanticKey(spec.scope, spec.leaf);
-      unionCols.try_emplace(spec.semanticKey, spec);
-   }
+   bool sawTableScan = false;
+   buildStep.walk([&](subop::ScanRefsOp scanOp) {
+      if (!mlir::isa<subop::TableType>(scanOp.getState().getType())) return;
+      sawTableScan = true;
+
+      llvm::StringRef tableName;
+      ExternalDatasourceProperty ds;
+      bool haveDs = false;
+      subop::TableType tableTy;
+      if (!resolveScannedTableExternal(buildStep, scanOp.getState(), reuse, tableName, ds, haveDs, tableTy) ||
+          !haveDs) {
+         return;
+      }
+      if (countUnionPayloadLeavesOnTable(unionSpecs, tableTy, mm) == 0) return;
+
+      for (const auto& map : ds.mapping) {
+         llvm::StringRef leaf = normalizeColumnIdentifier(map.identifier);
+         PayloadColumnSpec spec;
+         spec.scope = tableName.str();
+         spec.leaf = leaf.str();
+         spec.colType = memberTypeForIdentifier(tableTy, mm, leaf);
+         assert(spec.colType && "external table mapping column must exist on scanned table type");
+         spec.semanticKey = columnSemanticKey(spec.scope, spec.leaf);
+         unionCols.try_emplace(spec.semanticKey, spec);
+      }
+   });
+   assert(sawTableScan && "join union ingest: build step must contain scan_refs on a table state");
 }
 
 static void mergePeerExternalFromBuildStepScan(ExternalDatasourceProperty& merged, bool& haveMerged,
                                              subop::ExecutionStepOp peerBuild, const ModuleReuseInfo& reusePeer,
                                              llvm::StringRef donorTableName) {
-   subop::ScanRefsOp scanOp = findTableScanRefsInBuildStep(peerBuild);
-   assert(scanOp && "join union patch: peer build step must contain scan_refs on a table state");
+   subop::ScanRefsOp scanOp = findTableScanRefsForExternalTable(peerBuild, donorTableName, reusePeer);
+   if (!scanOp) return;
    llvm::StringRef peerTableName;
    ExternalDatasourceProperty peerDs;
    bool havePeer = false;
    subop::TableType peerTy;
    assert(resolveScannedTableExternal(peerBuild, scanOp.getState(), reusePeer, peerTableName, peerDs, havePeer,
                                       peerTy) &&
-          havePeer);
-   if (peerTableName != donorTableName) return;
+          havePeer && peerTableName == donorTableName);
    if (!haveMerged) {
       merged = peerDs;
       haveMerged = true;
@@ -345,8 +453,8 @@ static void mergePeerExternalFromBuildStepScan(ExternalDatasourceProperty& merge
 static mlir::Type columnTypeForIdentifierFromPeerBuildScan(subop::ExecutionStepOp peerBuild,
                                                            const ModuleReuseInfo& reusePeer,
                                                            llvm::StringRef donorTableName, llvm::StringRef identifier) {
-   subop::ScanRefsOp scanOp = findTableScanRefsInBuildStep(peerBuild);
-   assert(scanOp && "join union patch: peer build step must contain scan_refs on a table state");
+   subop::ScanRefsOp scanOp = findTableScanRefsForExternalTable(peerBuild, donorTableName, reusePeer);
+   if (!scanOp) return {};
    llvm::StringRef peerTableName;
    ExternalDatasourceProperty peerDs;
    bool havePeer = false;
@@ -399,7 +507,10 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
       }
       if (!buildStep) return;
       buildStep.walk([&](subop::MaterializeOp mat) {
-         if (!getInnerBufferTypeForMaterializeState(mat.getState().getType())) return;
+         if (!getInnerBufferTypeForMaterializeState(mat.getState().getType()) &&
+             !materializeTargetsJoinBuffer(mat, buf, reuse)) {
+            return;
+         }
          collectPayloadFromMaterialize(mat, linkMemberName, hashMemberName, mm, cm, joinKeyMemberName, unionCols,
                                        reuseQueryIndex);
       });
@@ -457,7 +568,21 @@ static subop::Member allocUnusedPayloadMemberSlot(subop::MemberManager& mm, mlir
    }
 }
 
-static mlir::Type cloneTypeToContext(mlir::Type ty, mlir::MLIRContext* ctx);
+static mlir::Type cloneTypeToContext(mlir::Type ty, mlir::MLIRContext* ctx) {
+   if (!ty || ty.getContext() == ctx) return ty;
+   if (auto nullable = mlir::dyn_cast<db::NullableType>(ty))
+      return db::NullableType::get(cloneTypeToContext(nullable.getType(), ctx));
+   if (auto i = mlir::dyn_cast<mlir::IntegerType>(ty)) {
+      return mlir::IntegerType::get(ctx, i.getWidth(), i.getSignedness());
+   }
+   if (mlir::isa<mlir::IndexType>(ty)) return mlir::IndexType::get(ctx);
+   if (auto c = mlir::dyn_cast<db::CharType>(ty)) return db::CharType::get(ctx, c.getLen());
+   if (mlir::isa<db::StringType>(ty)) return db::StringType::get(ctx);
+   if (auto d = mlir::dyn_cast<db::DateType>(ty)) return db::DateType::get(ctx, d.getUnit());
+   if (auto t = mlir::dyn_cast<db::TimestampType>(ty)) return db::TimestampType::get(ctx, t.getUnit());
+   if (auto dec = mlir::dyn_cast<db::DecimalType>(ty)) return db::DecimalType::get(ctx, dec.getP(), dec.getS());
+   llvm_unreachable("cloneTypeToContext: unsupported type for cross-context layout clone");
+}
 
 static void collectSemanticKeyToMemberFromMaterialize(
    subop::MaterializeOp mat, subop::Member linkM, subop::Member hashM, subop::MemberManager& mm,
@@ -524,8 +649,21 @@ static void syncCreateHashIndexedViewFromBuffer(subop::CreateHashIndexedView chi
    mlir::Value src = chiv.getSource();
    auto bufTy = mlir::dyn_cast<subop::BufferType>(src.getType());
    if (!bufTy) return;
-   subop::Member linkM = chiv.getLinkMember().getMember();
-   subop::Member hashM = chiv.getHashMember().getMember();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   subop::Member linkM;
+   subop::Member hashM;
+   for (subop::Member m : bufTy.getMembers().getMembers()) {
+      llvm::StringRef n = mm.getName(m);
+      if (n.starts_with("link$")) linkM = m;
+      if (n.starts_with("hash$")) hashM = m;
+   }
+   if (linkM && hashM) {
+      chiv.setLinkMemberAttr(subop::MemberAttr::get(ctx, linkM));
+      chiv.setHashMemberAttr(subop::MemberAttr::get(ctx, hashM));
+   } else {
+      linkM = chiv.getLinkMember().getMember();
+      hashM = chiv.getHashMember().getMember();
+   }
    llvm::SmallVector<subop::Member> vals;
    for (subop::Member m : bufTy.getMembers().getMembers()) {
       if (m == linkM || m == hashM) continue;
@@ -537,6 +675,9 @@ static void syncCreateHashIndexedViewFromBuffer(subop::CreateHashIndexedView chi
    auto newHiv = subop::HashIndexedViewType::get(ctx, keyMs, valMs, oldHiv.getCompareHashForLookup());
    chiv.getResult().setType(newHiv);
 }
+
+static void syncMaterializeMappingsToBufferMembers(mlir::ModuleOp module, subop::StateMembersAttr targetMembers,
+                                                   const llvm::DenseSet<void*>& closure);
 
 static void applyBufferLayoutToSsaClosure(mlir::ModuleOp module, llvm::ArrayRef<mlir::Value> canonicalBuffers,
                                           subop::StateMembersAttr targetMembers, const ModuleReuseInfo& reuse) {
@@ -595,7 +736,54 @@ static void applyBufferLayoutToSsaClosure(mlir::ModuleOp module, llvm::ArrayRef<
       if (!opaqueClosureContains(closure, chiv.getSource())) return;
       syncCreateHashIndexedViewFromBuffer(chiv);
    });
+   syncMaterializeMappingsToBufferMembers(module, targetMembers, closure);
    synchronizeExecutionStepPortTypes(module, &closure);
+}
+
+/// After buffer layout is applied, canonicalize \c materialize member slots to \p targetMembers (by name / semantic key).
+static void syncMaterializeMappingsToBufferMembers(mlir::ModuleOp module, subop::StateMembersAttr targetMembers,
+                                                   const llvm::DenseSet<void*>& closure) {
+   auto* ctx = module.getContext();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   llvm::StringMap<subop::Member> validByName;
+   for (subop::Member m : targetMembers.getMembers()) validByName[mm.getName(m)] = m;
+
+   module.walk([&](subop::MaterializeOp mat) {
+      if (!opaqueClosureContains(closure, mat.getState())) return;
+      subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(mat.getState().getType());
+      if (!bufTy || bufTy.getMembers() != targetMembers) return;
+
+      llvm::StringMap<subop::Member> bySemanticKey;
+      for (auto& pr : mat.getMapping().getMapping()) {
+         auto itName = validByName.find(mm.getName(pr.first));
+         if (itName == validByName.end()) continue;
+         auto [scope, leaf] = cm.getName(&pr.second.getColumn());
+         bySemanticKey[columnSemanticKey(scope, leaf)] = itName->second;
+      }
+
+      llvm::SmallVector<subop::RefMappingPairT> pairs;
+      for (auto& pr : mat.getMapping().getMapping()) {
+         llvm::StringRef memName = mm.getName(pr.first);
+         subop::Member canon;
+         if (auto it = validByName.find(memName); it != validByName.end()) canon = it->second;
+         if (!canon && (memName.starts_with("link$") || memName.starts_with("hash$"))) continue;
+         if (!canon) {
+            if (auto slot = parseFilterPredMemberSlot(memName)) {
+               std::string predName = "filter_pred$" + std::to_string(*slot);
+               if (auto it = validByName.find(predName); it != validByName.end()) canon = it->second;
+            }
+         }
+         if (!canon) {
+            auto [scope, leaf] = cm.getName(&pr.second.getColumn());
+            if (auto it = bySemanticKey.find(columnSemanticKey(scope, leaf)); it != bySemanticKey.end())
+               canon = it->second;
+         }
+         if (!canon) continue;
+         pairs.push_back({canon, pr.second});
+      }
+      mat.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, pairs));
+   });
 }
 
 static void alignBufferMergeThreadLocalsWithMergeResult(mlir::ModuleOp module,
@@ -797,6 +985,34 @@ static void refreshTableStateTypesInModule(mlir::ModuleOp module, mlir::Value ta
    });
 }
 
+static void syncMapInputColsFromGather(subop::GatherOp gather, tuples::ColumnManager& cm) {
+   auto* ctx = gather.getContext();
+   llvm::StringMap<tuples::ColumnRefAttr> outRefByKey;
+   for (auto& pr : gather.getMapping().getMapping()) {
+      auto [scope, leaf] = cm.getName(&pr.second.getColumn());
+      outRefByKey[columnSemanticKey(scope, leaf)] = cm.createRef(&pr.second.getColumn());
+   }
+   if (outRefByKey.empty()) return;
+   for (mlir::Operation* user : gather.getRes().getUsers()) {
+      auto mapOp = mlir::dyn_cast<subop::MapOp>(user);
+      if (!mapOp || mapOp.getStream() != gather.getRes()) continue;
+      bool changed = false;
+      llvm::SmallVector<mlir::Attribute> newInputs;
+      for (auto attr : mapOp.getInputCols()) {
+         auto cref = mlir::cast<tuples::ColumnRefAttr>(attr);
+         auto [scope, leaf] = cm.getName(&cref.getColumn());
+         auto it = outRefByKey.find(columnSemanticKey(scope, leaf));
+         if (it != outRefByKey.end() && &cref.getColumn() != &it->second.getColumn()) {
+            newInputs.push_back(it->second);
+            changed = true;
+         } else {
+            newInputs.push_back(cref);
+         }
+      }
+      if (changed) mapOp.setInputColsAttr(mlir::ArrayAttr::get(ctx, newInputs));
+   }
+}
+
 static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
                                              const llvm::DenseSet<void*>* closureFilter,
                                              subop::HashIndexedViewType producerHiv, bool syncGatherOps) {
@@ -809,12 +1025,15 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
    };
    auto syncLookupEntryRefToHiv = [&](tuples::ColumnRefAttr cref) -> bool {
       bool changed = false;
-      if (mlir::isa<subop::LookupEntryRefType>(cref.getColumn().type)) {
+      if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(cref.getColumn().type)) {
+         if (ler.getState() != producerHiv) return false;
          if (cref.getColumn().type != expectedLer) {
             cref.getColumn().type = expectedLer;
             changed = true;
          }
-      } else if (mlir::isa<subop::ListType>(cref.getColumn().type)) {
+      } else if (auto list = mlir::dyn_cast<subop::ListType>(cref.getColumn().type)) {
+         auto elemLer = mlir::dyn_cast<subop::LookupEntryRefType>(list.getT());
+         if (!elemLer || elemLer.getState() != producerHiv) return false;
          if (cref.getColumn().type != expectedListTy) {
             cref.getColumn().type = expectedListTy;
             changed = true;
@@ -823,7 +1042,8 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
       return changed;
    };
    auto syncLookupEntryDefToHiv = [&](tuples::ColumnDefAttr def) -> bool {
-      if (!mlir::isa<subop::LookupEntryRefType>(def.getColumn().type)) return false;
+      auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(def.getColumn().type);
+      if (!ler || ler.getState() != producerHiv) return false;
       if (def.getColumn().type == expectedLer) return false;
       def.getColumn().type = expectedLer;
       return true;
@@ -844,6 +1064,8 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
             op.setRefAttr(r);
             op.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, out));
          }
+         auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+         syncMapInputColsFromGather(op, cm);
       });
    }
    module.walk([&](subop::MaterializeOp op) {
@@ -861,10 +1083,22 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
    module.walk([&](subop::LookupOp op) {
       if (!shouldUpdateOp(op.getOperation())) return;
       if (closureFilter && !opaqueClosureContains(*closureFilter, op.getState())) return;
+      auto hivTy = mlir::dyn_cast<subop::HashIndexedViewType>(op.getState().getType());
+      if (!hivTy || hivTy != producerHiv) return;
       auto r = op.getRef();
       if (r.getColumn().type != expectedListTy) {
          r.getColumn().type = expectedListTy;
          op.setRefAttr(r);
+      }
+      for (mlir::Operation* user : op.getResult().getUsers()) {
+         auto nm = mlir::dyn_cast<subop::NestedMapOp>(user);
+         if (!nm) continue;
+         mlir::Region& reg = nm.getRegion();
+         if (reg.empty()) continue;
+         for (mlir::BlockArgument barg : reg.front().getArguments()) {
+            if (!mlir::isa<subop::ListType>(barg.getType())) continue;
+            if (barg.getType() != expectedListTy) barg.setType(expectedListTy);
+         }
       }
    });
    module.walk([&](subop::ScanListOp op) {
@@ -872,6 +1106,72 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
       auto elem = op.getElem();
       if (syncLookupEntryDefToHiv(elem)) op.setElemAttr(elem);
    });
+}
+
+static void syncProbeListCarriersInClosure(mlir::ModuleOp module, const llvm::DenseSet<void*>& closureFilter) {
+   auto* ctx = module.getContext();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   module.walk([&](subop::ExecutionStepOp step) {
+      if (!opOperandsOrNestedBlockArgsTouchClosure(step.getOperation(), closureFilter)) return;
+      llvm::StringMap<const tuples::Column*> entryColByKey;
+      step.walk([&](subop::ScanListOp scan) {
+         auto listTy = mlir::dyn_cast<subop::ListType>(scan.getList().getType());
+         if (!listTy) return;
+         auto elem = scan.getElem();
+         if (elem.getColumn().type != listTy.getT()) elem.getColumn().type = listTy.getT();
+         auto [scope, leaf] = cm.getName(&elem.getColumn());
+         entryColByKey[columnSemanticKey(scope, leaf)] = &elem.getColumn();
+      });
+      step.walk([&](subop::GatherOp gather) {
+         auto ref = gather.getRef();
+         if (!mlir::isa<subop::LookupEntryRefType>(ref.getColumn().type)) return;
+         auto [scope, leaf] = cm.getName(&ref.getColumn());
+         if (auto it = entryColByKey.find(columnSemanticKey(scope, leaf)); it != entryColByKey.end()) {
+            ref.getColumn().type = it->second->type;
+            gather.setRefAttr(ref);
+         }
+         auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(gather.getRef().getColumn().type);
+         if (!ler) return;
+         auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState());
+         if (!hiv) return;
+         llvm::SmallVector<subop::Member, 8> hivMembers;
+         for (subop::Member hm : hiv.getValueMembers().getMembers()) hivMembers.push_back(hm);
+         llvm::DenseSet<subop::Member> hivMemberSet(hivMembers.begin(), hivMembers.end());
+         llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> out;
+         bool mappingChanged = false;
+         for (auto& pr : gather.getMapping().getMapping()) {
+            subop::Member useMem = pr.first;
+            if (!hivMemberSet.contains(useMem)) {
+               auto [defScope, defLeaf] = cm.getName(&pr.second.getColumn());
+               llvm::StringRef wantLeaf = normalizeColumnIdentifier(defLeaf);
+               for (subop::Member hm : hivMembers) {
+                  if (normalizeColumnIdentifier(mm.getName(hm)) == wantLeaf) {
+                     useMem = hm;
+                     mappingChanged = true;
+                     break;
+                  }
+               }
+            }
+            out.push_back({useMem, pr.second});
+         }
+         if (mappingChanged) gather.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, out));
+         syncMapInputColsFromGather(gather, cm);
+      });
+   });
+}
+
+static void propagateJoinSupersetColumnAttrsForClosure(mlir::ModuleOp module,
+                                                       const llvm::DenseSet<void*>& closureFilter) {
+   llvm::DenseSet<const void*> seenHiv;
+   module.walk([&](subop::LookupOp op) {
+      if (!opOperandsOrNestedBlockArgsTouchClosure(op.getOperation(), closureFilter)) return;
+      auto hivTy = mlir::dyn_cast<subop::HashIndexedViewType>(op.getState().getType());
+      if (!hivTy) return;
+      if (!seenHiv.insert(hivTy.getAsOpaquePointer()).second) return;
+      propagateJoinSupersetColumnAttrs(module, &closureFilter, hivTy, true);
+   });
+   syncProbeListCarriersInClosure(module, closureFilter);
 }
 
 static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::ExecutionStepOp buildStep,
@@ -886,8 +1186,16 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    auto& mm = subDialect->getMemberManager();
    auto& cm = tupleDialect->getColumnManager();
 
-   subop::ScanRefsOp scanOp = findTableScanRefsInBuildStep(buildStep);
-   assert(scanOp && "join superset: buffer build step must contain scan_refs on a table state");
+   subop::ScanRefsOp scanOp = findDonorTableScanInUnionPlan(buildStep, plan, reuseSynthetic);
+   if (!scanOp) {
+      for (const PayloadColumnSpec& spec : plan.payloadColumns) {
+         unsigned predIdx = 0;
+         if (parseReuseFilterPredSemanticKey(spec.semanticKey, predIdx)) continue;
+         scanOp = findTableScanForPayloadLeaf(buildStep, spec.leaf, mm);
+         if (scanOp) break;
+      }
+   }
+   if (!scanOp) return;
 
    mlir::Value tableState = scanOp.getState();
    subop::TableType mergedSupplierTableTy;
@@ -895,15 +1203,12 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    bool haveDs = false;
    llvm::StringRef donorTableName;
    subop::TableType donorTableTy;
-   assert(resolveScannedTableExternal(buildStep, tableState, reuseSynthetic, donorTableName, mergedDs, haveDs,
-                                      donorTableTy) &&
-          "join superset: scan_refs must resolve to an external table");
+   const bool haveDonorExternal = resolveScannedTableExternal(buildStep, tableState, reuseSynthetic, donorTableName,
+                                                             mergedDs, haveDs, donorTableTy) &&
+                                  haveDs &&
+                                  countUnionPayloadLeavesOnTable(plan.payloadColumns, donorTableTy, mm) > 0;
 
-   assert(llvm::any_of(plan.payloadColumns, [&](const PayloadColumnSpec& spec) {
-             return spec.scope == donorTableName;
-          }) &&
-          "join superset: union plan must include donor external table scope");
-
+   if (haveDonorExternal) {
    for (size_t pi = 0; pi < peerHivs.size(); ++pi) {
       auto [peerMod, peerHiv] = peerHivs[pi];
       if (!peerMod || !peerHiv) continue;
@@ -958,11 +1263,9 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
 
    refreshTableStateTypesInModule(synthetic, tableState, newTableTy);
    mergedSupplierTableTy = newTableTy;
+   }
 
-   subop::MaterializeOp matOp;
-   buildStep.walk([&](subop::MaterializeOp m) {
-      if (getInnerBufferTypeForMaterializeState(m.getState().getType())) matOp = m;
-   });
+   subop::MaterializeOp matOp = findJoinBufferMaterializeInStep(buildStep);
    assert(matOp && "join superset: buffer build step must materialize into join buffer");
 
    auto collectMaterializedKeys = [&]() {
@@ -1029,11 +1332,15 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
             break;
          }
       }
-      subop::TableType tableTy = mergedSupplierTableTy;
-      if (!tableTy) tableTy = mlir::dyn_cast<subop::TableType>(scanOp.getState().getType());
+      subop::ScanRefsOp specScan = findTableScanForPayloadLeaf(buildStep, spec.leaf, mm);
+      if (!specScan) specScan = scanOp;
+      subop::TableType tableTy = mlir::dyn_cast<subop::TableType>(specScan.getState().getType());
       assert(tableTy && "join superset: table type required for payload column gather");
       subop::Member tableMem = tableMemberForIdentifier(tableTy, mm, spec.leaf);
-      assert(tableMem && "join superset: union payload column must exist in merged table layout");
+      if (!tableMem) {
+         ++payloadSlotInPlan;
+         continue;
+      }
 
       llvm::StringRef scope = spec.scope;
       if (scope.empty() && templateGather && templateCm) {
@@ -1055,7 +1362,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
       auto mapping = subop::ColumnDefMemberMappingAttr::get(
          ctx, llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>>{{tableMem, colDef}});
       auto gatherTy = mapStream.getType();
-      auto refDef = scanOp.getRef();
+      auto refDef = specScan.getRef();
       auto gatherRef = cm.createRef(&refDef.getColumn());
       auto newGather = gb.create<subop::GatherOp>(mlir::UnknownLoc::get(ctx), gatherTy, mapStream,
                                                    gatherRef, mapping);
@@ -1076,19 +1383,19 @@ static void applyUnionPlanToSyntheticHiv(mlir::ModuleOp synthetic, mlir::Value s
    auto* subDialect = ctx->getLoadedDialect<subop::SubOperatorDialect>();
    auto& mm = subDialect->getMemberManager();
 
-   mlir::Value mergedBuf = syntheticHiv;
-   if (auto it = reuseSynthetic.hashIndexedViewFromMergedBuffer.find(syntheticHiv);
-       it != reuseSynthetic.hashIndexedViewFromMergedBuffer.end()) {
-      mergedBuf = it->second;
-   }
+   mlir::Value mergedBuf = resolveJoinMergedBuffer(syntheticHiv, synthetic, reuseSynthetic);
 
    subop::ExecutionStepOp buildStep = findBufferBuildStepWithTableMaterialize(mergedBuf, reuseSynthetic);
+   if (!buildStep) buildStep = findBufferBuildStepWithTableScan(synthetic);
    subop::MaterializeOp matOp;
    if (buildStep) {
       buildStep.walk([&](subop::MaterializeOp m) {
-         if (getInnerBufferTypeForMaterializeState(m.getState().getType())) matOp = m;
+         if (!materializeTargetsJoinBuffer(m, mergedBuf, reuseSynthetic)) return;
+         matOp = m;
       });
+      if (!matOp) matOp = findJoinBufferMaterializeInStep(buildStep);
    }
+   assert(matOp && "join superset: synthetic build step must materialize into merged join buffer");
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    assignPayloadMembersForPlan(mm, cm, matOp, plan);
    auto targetMembers = bufferMembersForPlan(ctx, plan);
@@ -1110,14 +1417,14 @@ static void applyUnionPlanToSyntheticHiv(mlir::ModuleOp synthetic, mlir::Value s
    JoinBufferHivSsaClosure joinClosure = computeJoinBufferHivSsaClosure(roots, reuseSynthetic);
    alignBufferMergeThreadLocalsWithMergeResult(synthetic, &joinClosure.opaque);
    subop::HashIndexedViewType prodHiv;
-   for (mlir::Value v : joinClosure.values) {
-      if (auto h = mlir::dyn_cast<subop::HashIndexedViewType>(v.getType())) {
-         prodHiv = h;
-         break;
-      }
-   }
-   if (prodHiv) propagateJoinSupersetColumnAttrs(synthetic, &joinClosure.opaque, prodHiv, true);
-   synchronizeExecutionStepPortTypes(synthetic, &joinClosure.opaque);
+   mlir::Value canonMergedBuf = canonicalizeStateValueForReuse(mergedBuf);
+   synthetic.walk([&](subop::CreateHashIndexedView chiv) {
+      if (prodHiv) return;
+      if (canonicalizeStateValueForReuse(chiv.getSource()) != canonMergedBuf) return;
+      prodHiv = mlir::dyn_cast<subop::HashIndexedViewType>(chiv.getResult().getType());
+   });
+   propagateJoinSupersetColumnAttrsForClosure(synthetic, joinClosure.opaque);
+   synchronizeExecutionStepPortTypes(synthetic, nullptr);
 }
 
 static bool typeEmbedsHashIndexedView(mlir::Type t) {
@@ -1193,17 +1500,6 @@ static unsigned operandIndexOf(mlir::Operation* op, mlir::Value v) {
       if (op->getOperand(i) == v) return i;
    }
    llvm_unreachable("operand not found");
-}
-
-static mlir::Type cloneTypeToContext(mlir::Type ty, mlir::MLIRContext* ctx) {
-   if (!ty || ty.getContext() == ctx) return ty;
-   if (auto i = mlir::dyn_cast<mlir::IntegerType>(ty)) {
-      return mlir::IntegerType::get(ctx, i.getWidth(), i.getSignedness());
-   }
-   if (mlir::isa<mlir::IndexType>(ty)) return mlir::IndexType::get(ctx);
-   if (auto c = mlir::dyn_cast<db::CharType>(ty)) return db::CharType::get(ctx, c.getLen());
-   if (mlir::isa<db::StringType>(ty)) return db::StringType::get(ctx);
-   llvm_unreachable("cloneTypeToContext: unsupported type for cross-context layout clone");
 }
 
 static subop::Member cloneMemberToContext(subop::Member srcMember, mlir::MLIRContext* srcCtx, mlir::MLIRContext* dstCtx,
@@ -1647,7 +1943,14 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
       if (fpA != reuse0.joinBuildStoredValueMembersByState.end() &&
           fpB != reuse1.joinBuildStoredValueMembersByState.end() && fpA->second == fpB->second &&
           reuseFilterPredSlots < 2) {
-         continue;
+         llvm::StringSet<> nonPredSemanticKeys;
+         for (const PayloadColumnSpec& spec : plan.payloadColumns) {
+            unsigned qIdx = 0;
+            if (parseReuseFilterPredSemanticKey(spec.semanticKey, qIdx)) continue;
+            nonPredSemanticKeys.insert(spec.semanticKey);
+         }
+         // Same stored-value fingerprint can still hide cross-query payload (e.g. s_phone vs s_comment).
+         if (nonPredSemanticKeys.size() <= 2) continue;
       }
 
       mlir::Value synthHiv = t.state;
@@ -1685,6 +1988,17 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
          (*outLayouts)[t.cacheKey] = std::move(layout);
       }
    }
+
+}
+
+void syncLookupCarrierAttrsFromState(mlir::ModuleOp module) {
+   ModuleReuseInfo reuse = collectModuleReuseInfo(module);
+   llvm::SmallVector<mlir::Value, 4> roots;
+   module.walk([&](subop::CacheGetOp get) { roots.push_back(get.getResult()); });
+   if (!roots.empty()) {
+      JoinBufferHivSsaClosure joinClosure = computeJoinBufferHivSsaClosure(roots, reuse);
+      propagateJoinSupersetColumnAttrsForClosure(module, joinClosure.opaque);
+   }
 }
 
 void resyncConsumerCachedHivCarrierTypesFromCacheGet(mlir::ModuleOp consumer,
@@ -1700,6 +2014,8 @@ void resyncConsumerCachedHivCarrierTypesFromCacheGet(mlir::ModuleOp consumer,
       syncExecutionStepPortsForModule(consumer, &sites.ssaClosure);
       // `filter_pred` insertion can touch carriers outside the cache_get use closure.
       refreshAllEmbeddedHivCarrierTypes(consumer, canonicalHiv);
+      syncExecutionStepPortsForModule(consumer, &sites.ssaClosure);
+      propagateJoinSupersetColumnAttrsForClosure(consumer, sites.ssaClosure);
       syncExecutionStepPortsForModule(consumer, nullptr);
    });
 }
