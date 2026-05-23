@@ -48,6 +48,22 @@ void expandClosureThroughExecutionStepPorts(mlir::ModuleOp module, llvm::DenseSe
    }
 }
 
+void expandClosureThroughNestedExecutionGroupPorts(mlir::ModuleOp module, llvm::DenseSet<void*>& closure) {
+   for (;;) {
+      size_t before = closure.size();
+      module.walk([&](subop::NestedExecutionGroupOp neg) {
+         mlir::Block& body = neg.getSubOps().front();
+         for (unsigned i = 0; i < neg.getNumOperands() && i < body.getNumArguments(); ++i) {
+            mlir::Value opnd = neg.getOperand(i);
+            mlir::Value barg = body.getArgument(i);
+            if (opaqueClosureContains(closure, opnd)) closure.insert(barg.getAsOpaquePointer());
+            if (opaqueClosureContains(closure, barg)) closure.insert(opnd.getAsOpaquePointer());
+         }
+      });
+      if (closure.size() == before) break;
+   }
+}
+
 bool executionStepTouchesClosure(subop::ExecutionStepOp step, const llvm::DenseSet<void*>& closure) {
    for (mlir::Value v : step.getOperands()) {
       if (opaqueClosureContains(closure, v)) return true;

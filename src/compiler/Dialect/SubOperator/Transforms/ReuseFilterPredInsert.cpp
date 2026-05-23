@@ -1932,15 +1932,32 @@ void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member 
 
 /// Point probe-side `gather` entry refs at the cached HIV layout. When \p closure is null, update all
 /// HIV entry gathers in the module.
+static bool hashIndexedViewSameMemberLayout(subop::HashIndexedViewType a, subop::HashIndexedViewType b) {
+   if (!a || !b) return false;
+   if (a == b) return true;
+   return a.getKeyMembers().getMembers() == b.getKeyMembers().getMembers() &&
+          a.getValueMembers().getMembers() == b.getValueMembers().getMembers() &&
+          a.getCompareHashForLookup() == b.getCompareHashForLookup();
+}
+
 static void syncProbeGatherRefsToCachedHivInClosure(mlir::ModuleOp module, subop::HashIndexedViewType cachedHiv,
                                                     const llvm::DenseSet<void*>* closure) {
    auto* ctx = module.getContext();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    auto expected = subop::LookupEntryRefType::get(ctx, cachedHiv);
    module.walk([&](subop::GatherOp gather) {
       if (closure && !opOperandsOrNestedBlockArgsTouchClosure(gather.getOperation(), *closure)) return;
-      auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(gather.getRef().getColumn().type);
-      if (!ler || !mlir::isa<subop::HashIndexedViewType>(ler.getState())) return;
-      if (gather.getRef().getColumn().type != expected) gather.getRef().getColumn().type = expected;
+      auto gatherRef = gather.getRef();
+      auto [refScope, refLeaf] = cm.getName(&gatherRef.getColumn());
+      (void)refLeaf;
+      if (!refScope.starts_with("lookup_u_")) return;
+      auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(gatherRef.getColumn().type);
+      auto st = ler ? mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState()) : nullptr;
+      if (!st || !hashIndexedViewSameMemberLayout(st, cachedHiv)) return;
+      if (gatherRef.getColumn().type != expected) {
+         gatherRef.getColumn().type = expected;
+         gather.setRefAttr(gatherRef);
+      }
    });
 }
 

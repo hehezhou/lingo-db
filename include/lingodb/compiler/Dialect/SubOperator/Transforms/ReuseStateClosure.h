@@ -19,6 +19,9 @@ bool opaqueClosureContains(const llvm::DenseSet<void*>& closure, mlir::Value v);
 
 void expandClosureThroughExecutionStepPorts(mlir::ModuleOp module, llvm::DenseSet<void*>& closure);
 
+/// Link \c nested_execution_group operands with body block arguments (probe pipeline ports).
+void expandClosureThroughNestedExecutionGroupPorts(mlir::ModuleOp module, llvm::DenseSet<void*>& closure);
+
 bool executionStepTouchesClosure(ExecutionStepOp step, const llvm::DenseSet<void*>& closure);
 
 bool opOperandsOrNestedBlockArgsTouchClosure(mlir::Operation* op, const llvm::DenseSet<void*>& closure);

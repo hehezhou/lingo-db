@@ -14,9 +14,16 @@ namespace lingodb::compiler::dialect::subop {
 /// Producer HIV layout after \c extendSyntheticJoinBuffersToColumnUnion (union slot order + semantics).
 struct CachedJoinBufferLayout {
    subop::HashIndexedViewType producerHiv;
+   /// Union-ordered payload columns (matches \c cache_put / synthetic producer layout).
    llvm::SmallVector<std::string> payloadSemanticKeys;
    llvm::SmallVector<subop::Member> payloadMembers;
    llvm::SmallVector<mlir::Type> payloadColumnTypes;
+   /// Per matched query: semantic keys present in that query's join-buffer build (pre-union).
+   llvm::SmallVector<std::string> query0SemanticKeys;
+   llvm::SmallVector<std::string> query1SemanticKeys;
+   /// For each entry in \c query0SemanticKeys / \c query1SemanticKeys, index into the union-ordered arrays above.
+   llvm::SmallVector<unsigned> query0SlotInUnion;
+   llvm::SmallVector<unsigned> query1SlotInUnion;
 };
 
 using CachedJoinBufferLayoutsByKey = llvm::DenseMap<uint64_t, CachedJoinBufferLayout>;
@@ -57,6 +64,12 @@ void refreshCachedJoinLayoutsFromSyntheticCachePuts(mlir::ModuleOp synthetic,
 /// SSA closure so nested \c lookup_entry_ref carriers match the aligned consumer member layout.
 void resyncConsumerCachedHivCarrierTypesFromCacheGet(mlir::ModuleOp consumer,
                                                      std::optional<uint64_t> cacheKey = std::nullopt);
+
+/// Reconcile probe \c scan_list / \c gather column metadata with the aligned \c cache_get HIV, only within the
+/// SSA closure rooted at that \c cache_get (run after pred reapply / resync).
+void finalizeConsumerCachedJoinProbeColumnAttrs(mlir::ModuleOp consumer, const CachedJoinBufferLayout& layout,
+                                                std::optional<uint64_t> cacheKey = std::nullopt,
+                                                std::optional<unsigned> consumerReuseQueryIndex = std::nullopt);
 
 /// Fix lookup list / nested probe types to match each \c LookupOp's HIV (after union or pred layout passes).
 void syncLookupCarrierAttrsFromState(mlir::ModuleOp module);
