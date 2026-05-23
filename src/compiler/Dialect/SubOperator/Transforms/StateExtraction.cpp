@@ -41,18 +41,15 @@ namespace lingodb::compiler::dialect::subop {
 
 namespace {
 
-static std::string normalizeExternalDataSourceDescrHex(llvm::StringRef hexDescr) {
+static std::string renderExternalDataSourceDescrMatchString(
+   const lingodb::runtime::ExternalDatasourceProperty& ds,
+   llvm::ArrayRef<lingodb::runtime::ExternalDatasourceProperty::Mapping> mapping) {
    using lingodb::runtime::ExternalDatasourceProperty;
    using lingodb::runtime::FilterDescription;
    using lingodb::runtime::FilterOp;
 
-   ExternalDatasourceProperty ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(hexDescr);
-
-   // Normalize mapping order.
-   llvm::SmallVector<ExternalDatasourceProperty::Mapping, 8> mapping(ds.mapping.begin(), ds.mapping.end());
-   llvm::sort(mapping, [](const auto& a, const auto& b) {
-      return a.memberName < b.memberName;
-   });
+   llvm::SmallVector<ExternalDatasourceProperty::Mapping, 8> mappingSorted(mapping.begin(), mapping.end());
+   llvm::sort(mappingSorted, [](const auto& a, const auto& b) { return a.memberName < b.memberName; });
 
    // Normalize filters: de-duplicate then sort by a stable key.
    std::unordered_set<FilterDescription> uniq;
@@ -109,9 +106,9 @@ static std::string normalizeExternalDataSourceDescrHex(llvm::StringRef hexDescr)
    ss << ";index=" << ds.index;
    ss << ";indexType=" << ds.indexType;
    ss << ";mapping=[";
-   for (size_t i = 0; i < mapping.size(); i++) {
+   for (size_t i = 0; i < mappingSorted.size(); i++) {
       if (i) ss << ",";
-      ss << mapping[i].memberName << "->" << mapping[i].identifier;
+      ss << mappingSorted[i].memberName << "->" << mappingSorted[i].identifier;
    }
    ss << "]";
    ss << ";filters=[";
@@ -123,6 +120,12 @@ static std::string normalizeExternalDataSourceDescrHex(llvm::StringRef hexDescr)
    ss << "]";
    ss.flush();
    return s;
+}
+
+static std::string normalizeExternalDataSourceDescrHex(llvm::StringRef hexDescr) {
+   using lingodb::runtime::ExternalDatasourceProperty;
+   ExternalDatasourceProperty ds = lingodb::utility::deserializeFromHexString<ExternalDatasourceProperty>(hexDescr);
+   return renderExternalDataSourceDescrMatchString(ds, ds.mapping);
 }
 
 bool isCreateLike(mlir::Operation& op) {
@@ -859,6 +862,20 @@ static std::string sanitizeScopeName(llvm::StringRef scope) {
    return scope.substr(0, pos).str();
 }
 
+static llvm::SmallVector<lingodb::runtime::ExternalDatasourceProperty::Mapping, 8>
+filterExternalDatasourceMappingForJoinMatch(
+   llvm::ArrayRef<lingodb::runtime::ExternalDatasourceProperty::Mapping> mapping,
+   const llvm::SmallSet<std::string, 8>& joinKeyColumnIdentifiersSanitized) {
+   llvm::SmallVector<lingodb::runtime::ExternalDatasourceProperty::Mapping, 8> kept;
+   for (const auto& m : mapping) {
+      if (joinKeyColumnIdentifiersSanitized.contains(sanitizeBaseName(m.identifier)) ||
+          joinKeyColumnIdentifiersSanitized.contains(sanitizeBaseName(m.memberName))) {
+         kept.push_back(m);
+      }
+   }
+   return kept;
+}
+
 static uint64_t hashCombineU64(uint64_t a, uint64_t b) {
    return static_cast<uint64_t>(llvm::hash_combine(a, b));
 }
@@ -884,6 +901,7 @@ static std::string fingerprintSortedMemberPairs(subop::MemberManager& mm, llvm::
 struct JoinHivMatchDetails {
    llvm::SmallSet<std::string, 8> indexMemberNamesSanitized;
    llvm::SmallSet<uint64_t, 8> joinKeyColumnAttrHashes;
+   llvm::SmallSet<std::string, 8> joinKeyColumnIdentifiersSanitized;
    std::string storedValueMembersFingerprint;
 };
 
@@ -902,7 +920,9 @@ static subop::CreateHashIndexedView findCreateHashIndexedViewForState(
 static JoinHivMatchDetails computeJoinHivMatchDetails(
    mlir::Value hiv, subop::HashIndexedViewType hivTy, subop::MemberManager& mm,
    lingodb::compiler::dialect::tuples::ColumnManager& columnManager,
-   const llvm::DenseMap<mlir::Value, llvm::SmallVector<subop::ExecutionStepOp, 8>>& writerStepsByState) {
+   const llvm::DenseMap<mlir::Value, llvm::SmallVector<subop::ExecutionStepOp, 8>>& writerStepsByState,
+   llvm::ArrayRef<int> constructionStepIndices,
+   const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex) {
    subop::CreateHashIndexedView chiv = findCreateHashIndexedViewForState(hiv, writerStepsByState);
 
    JoinHivMatchDetails details;
@@ -921,6 +941,7 @@ static JoinHivMatchDetails computeJoinHivMatchDetails(
    auto recordJoinKeyColumnHash = [&](llvm::StringRef scope, llvm::StringRef name, mlir::Type colTy) {
       std::string nameSan = sanitizeBaseName(name);
       std::string scopeSan = sanitizeScopeName(scope);
+      details.joinKeyColumnIdentifiersSanitized.insert(nameSan);
       uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(scopeSan)));
       h = hashCombineU64(h, static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(nameSan))));
       h = hashCombineU64(h, hashType(colTy));
@@ -929,29 +950,60 @@ static JoinHivMatchDetails computeJoinHivMatchDetails(
 
    if (joinValueMember) {
       auto joinValueSanitized = sanitizeMemberSlotName(mm.getName(joinValueMember));
-      auto itW = writerStepsByState.find(hiv);
-      assert(itW != writerStepsByState.end());
-      for (subop::ExecutionStepOp ws : itW->second) {
-            ws.walk([&](subop::MaterializeOp mat) {
-               if (!mlir::isa<subop::BufferType>(mat.getState().getType())) return;
-               for (auto& [member, colRef] : mat.getMapping().getMapping()) {
-                  if (sanitizeMemberSlotName(mm.getName(member)) != joinValueSanitized) continue;
-                  auto [scope, name] = columnManager.getName(&colRef.getColumn());
-                  recordJoinKeyColumnHash(scope, name, colRef.getColumn().type);
-               }
-            });
-            ws.walk([&](subop::GatherOp gather) {
-               for (auto& [member, colDef] : gather.getMapping().getMapping()) {
-                  (void)member;
-                  auto [scope, name] = columnManager.getName(&colDef.getColumn());
-                  if (sanitizeBaseName(name) != sanitizeBaseName(mm.getName(joinValueMember))) continue;
-                  recordJoinKeyColumnHash(scope, name, colDef.getColumn().type);
-               }
-            });
+      llvm::SmallSet<subop::ExecutionStepOp, 8> stepsVisited;
+      auto recordJoinKeysFromStep = [&](subop::ExecutionStepOp ws) {
+         if (!ws || !stepsVisited.insert(ws).second) return;
+         ws.walk([&](subop::MaterializeOp mat) {
+            if (!mlir::isa<subop::BufferType>(mat.getState().getType())) return;
+            for (auto& [member, colRef] : mat.getMapping().getMapping()) {
+               if (sanitizeMemberSlotName(mm.getName(member)) != joinValueSanitized) continue;
+               auto [scope, name] = columnManager.getName(&colRef.getColumn());
+               recordJoinKeyColumnHash(scope, name, colRef.getColumn().type);
+            }
+         });
+         ws.walk([&](subop::GatherOp gather) {
+            for (auto& [member, colDef] : gather.getMapping().getMapping()) {
+               (void)member;
+               auto [scope, name] = columnManager.getName(&colDef.getColumn());
+               if (sanitizeBaseName(name) != sanitizeBaseName(mm.getName(joinValueMember))) continue;
+               recordJoinKeyColumnHash(scope, name, colDef.getColumn().type);
+            }
+         });
+      };
+      if (auto itW = writerStepsByState.find(hiv); itW != writerStepsByState.end()) {
+         for (subop::ExecutionStepOp ws : itW->second) recordJoinKeysFromStep(ws);
+      }
+      for (int si : constructionStepIndices) {
+         auto itS = stepByIndex.find(si);
+         if (itS != stepByIndex.end()) recordJoinKeysFromStep(itS->second);
       }
    }
 
    return details;
+}
+
+static void relaxJoinHivDepTokensInProfile(
+   llvm::SmallVector<std::string, 8>& depTokensSorted, const JoinHivMatchDetails& joinDetails,
+   const llvm::DenseMap<mlir::Value, lingodb::runtime::ExternalDatasourceProperty>& externalDatasourceByTableState,
+   const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState) {
+   if (joinDetails.joinKeyColumnIdentifiersSanitized.empty()) return;
+   for (std::string& tok : depTokensSorted) {
+      llvm::StringRef tokRef(tok);
+      if (!tokRef.consume_front("table:")) continue;
+      llvm::StringRef descr = tokRef;
+      for (const auto& [tableVal, ds] : externalDatasourceByTableState) {
+         mlir::Value tableCanon = canonicalizeStateValueDeep(tableVal);
+         auto itFull = tableDescrByTableState.find(tableCanon);
+         if (itFull == tableDescrByTableState.end()) itFull = tableDescrByTableState.find(tableVal);
+         if (itFull == tableDescrByTableState.end() || itFull->second != descr) continue;
+         auto kept = filterExternalDatasourceMappingForJoinMatch(ds.mapping,
+                                                                 joinDetails.joinKeyColumnIdentifiersSanitized);
+         tok = std::string("table:") + renderExternalDataSourceDescrMatchString(ds, kept);
+         break;
+      }
+   }
+   llvm::sort(depTokensSorted);
+   depTokensSorted.erase(std::unique(depTokensSorted.begin(), depTokensSorted.end()), depTokensSorted.end());
 }
 
 static std::string normalizedHashIndexedViewTypeFingerprintForJoinMatch(subop::MemberManager& mm,
@@ -1328,7 +1380,7 @@ llvm::DenseMap<mlir::Value, std::string> buildTableDescrByTableState(mlir::Modul
       }
       assert(found && "table_ref step must contain get_external");
       assert(step.getNumResults() == 1 && "table_ref step must return one value");
-      mlir::Value t = step.getResult(0);
+      mlir::Value t = canonicalizeStateValueDeep(step.getResult(0));
       tableDescr[t] = normalizeExternalDataSourceDescrHex(geOp.getDescr());
    });
    return tableDescr;
@@ -1579,7 +1631,7 @@ static StateConstructionMatchHashes computeEligibleStateMatchHashes(
    if (isHiv) {
       joinHivDetails.emplace(computeJoinHivMatchDetails(
          state, mlir::cast<subop::HashIndexedViewType>(state.getType()), memberManager, columnManager,
-         module.reuse.writerStepsByState));
+         module.reuse.writerStepsByState, constructionStepIndices, module.stepByIndex));
    }
 
    llvm::SmallVector<uint64_t, 16> stepHashes;
@@ -1655,6 +1707,14 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
       prof.depTokensSorted.assign(depElig.depTokensSorted.begin(), depElig.depTokensSorted.end());
 
       if (prof.eligible) {
+         if (mlir::isa<subop::HashIndexedViewType>(state.getType())) {
+            JoinHivMatchDetails joinHivDetails = computeJoinHivMatchDetails(
+               state, mlir::cast<subop::HashIndexedViewType>(state.getType()), memberManager,
+               tupDialect->getColumnManager(), module.reuse.writerStepsByState, constructionStepIndices,
+               module.stepByIndex);
+            relaxJoinHivDepTokensInProfile(prof.depTokensSorted, joinHivDetails,
+                                           module.reuse.externalDatasourceByTableState, tableDescrByTableState);
+         }
          StateConstructionMatchHashes hashes = computeEligibleStateMatchHashes(
             state, constructionStepIndices, module, tableDescrByTableState, memberManager,
             tupDialect->getColumnManager());
