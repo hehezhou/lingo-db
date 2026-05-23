@@ -1568,7 +1568,7 @@ llvm::SmallVector<subop::Member> subop::CreateFrom::getReadMembers() {
    return {};
 }
 llvm::SmallVector<subop::Member> subop::CreateFrom::getWrittenMembers() {
-   if (auto stateType = mlir::cast<subop::State>(getState().getType())) {
+   if (auto stateType = mlir::cast<subop::State>(getResult().getType())) {
       return stateType.getMembers().getMembers();
    }
    return {};

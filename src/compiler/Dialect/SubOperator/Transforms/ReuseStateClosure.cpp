@@ -242,8 +242,8 @@ void collectJoinBufferReachabilitySeeds(mlir::Value canonicalMergedBuffer, const
    };
 
    push(canonicalMergedBuffer);
-   if (auto it = findReuseMap(reuse.mergedFromThreadLocal, canonicalMergedBuffer);
-       it != reuse.mergedFromThreadLocal.end()) {
+   if (auto it = findReuseMap(reuse.mergedFromShadowState, canonicalMergedBuffer);
+       it != reuse.mergedFromShadowState.end()) {
       push(it->second);
    }
 
@@ -264,8 +264,8 @@ void collectJoinBufferReachabilitySeeds(mlir::Value canonicalMergedBuffer, const
       }
    };
    pushWriterBuffers(canonicalMergedBuffer);
-   if (auto it = findReuseMap(reuse.mergedFromThreadLocal, canonicalMergedBuffer);
-       it != reuse.mergedFromThreadLocal.end()) {
+   if (auto it = findReuseMap(reuse.mergedFromShadowState, canonicalMergedBuffer);
+       it != reuse.mergedFromShadowState.end()) {
       pushWriterBuffers(it->second);
    }
 }
@@ -283,8 +283,8 @@ llvm::DenseSet<mlir::Value> expandNeededStatesFromTargets(llvm::ArrayRef<CacheTa
 
    for (auto& t : targets0) {
       enqueue(t.state);
-      auto it = findReuseMap(reuse.mergedFromThreadLocal, t.state);
-      if (it != reuse.mergedFromThreadLocal.end()) {
+      auto it = findReuseMap(reuse.mergedFromShadowState, t.state);
+      if (it != reuse.mergedFromShadowState.end()) {
          enqueue(it->second);
       }
    }
@@ -292,16 +292,12 @@ llvm::DenseSet<mlir::Value> expandNeededStatesFromTargets(llvm::ArrayRef<CacheTa
    for (size_t qi = 0; qi < queue.size(); ++qi) {
       mlir::Value s = queue[qi];
 
-      if (auto itM = findReuseMap(reuse.mergedFromThreadLocal, s); itM != reuse.mergedFromThreadLocal.end()) {
-         enqueue(itM->second);
+      if (auto itShadow = findReuseMap(reuse.mergedFromShadowState, s);
+          itShadow != reuse.mergedFromShadowState.end()) {
+         enqueue(itShadow->second);
       }
-      if (auto itH = findReuseMap(reuse.mergedBufferToHashIndexedView, s);
-          itH != reuse.mergedBufferToHashIndexedView.end()) {
-         enqueue(itH->second);
-      }
-      if (auto itG = findReuseMap(reuse.hashIndexedViewFromMergedBuffer, s);
-          itG != reuse.hashIndexedViewFromMergedBuffer.end()) {
-         enqueue(itG->second);
+      if (mlir::Value hiv = hashIndexedViewShadowingBuffer(s, reuse)) {
+         enqueue(hiv);
       }
 
       auto itW = findReuseMap(reuse.writerStepsByState, s);

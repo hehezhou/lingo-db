@@ -19,7 +19,7 @@ class Value;
 namespace lingodb::compiler::dialect::subop {
 
 /// Canonicalize a state SSA value to the same form used as keys in `ModuleReuseInfo` maps
-/// (`writerStepsByState`, `mergedFromThreadLocal`, `createOnlyStepForState`).
+/// (`writerStepsByState`, `mergedFromShadowState`, `createOnlyStepForState`).
 mlir::Value canonicalizeStateValueForReuse(mlir::Value v);
 
 /// Step body is a single \c get_external feeding the step return (external table construction).
@@ -52,14 +52,10 @@ struct ModuleReuseInfo {
    };
    llvm::SmallVector<StepRW, 128> steps;
 
-   // Merge pairing: global_state -> thread_local_state (both canonicalized to step inputs/results).
-   llvm::DenseMap<mlir::Value, mlir::Value> mergedFromThreadLocal;
-
-   /// Join build chain: `thread_local` buffer -> merged global `!subop.buffer` -> `create_hash_indexed_view`.
-   /// Maps hash_indexed_view SSA -> merged global buffer (cache/match representative stays the buffer).
-   llvm::DenseMap<mlir::Value, mlir::Value> hashIndexedViewFromMergedBuffer;
-   /// Inverse of the above (merged global buffer -> its paired hash_indexed_view), when present.
-   llvm::DenseMap<mlir::Value, mlir::Value> mergedBufferToHashIndexedView;
+   /// Build-chain shadow link: `derived` state was produced from / merged from `shadow` predecessor.
+   /// Includes `subop.merge` (global <- thread_local) and `create_hash_indexed_view` (hiv <- buffer).
+   /// Walk `derived -> shadow -> shadow -> ...` to collect the full merge chain for construction/deps.
+   llvm::DenseMap<mlir::Value, mlir::Value> mergedFromShadowState;
 
    // Convenience: state -> steps that write it (subset of steps[]).
    llvm::DenseMap<mlir::Value, llvm::SmallVector<subop::ExecutionStepOp, 8>> writerStepsByState;
@@ -80,8 +76,15 @@ struct ModuleReuseInfo {
 
 ModuleReuseInfo collectModuleReuseInfo(mlir::ModuleOp moduleOp);
 
-/// Canonical cache/match target for a join buffer chain: the `hash_indexed_view` when a serial
-/// `buffer -> create_hash_indexed_view` link exists; otherwise `canonicalizeStateValueForReuse(v)`.
+/// Walk `mergedFromShadowState` from \p v toward predecessors; invoke \p fn on each shadow (not \p v).
+void forEachShadowChainPredecessor(mlir::Value v, const ModuleReuseInfo& reuse,
+                                   llvm::function_ref<void(mlir::Value)> fn);
+
+/// If \p mergedGlobalBuffer is the buffer shadow of a join HIV, returns that view; else null.
+mlir::Value hashIndexedViewShadowingBuffer(mlir::Value mergedGlobalBuffer, const ModuleReuseInfo& reuse);
+
+/// Canonical cache/match target for a join buffer chain: the `hash_indexed_view` when reachable via
+/// shadow links; otherwise `canonicalizeStateValueForReuse(v)`.
 mlir::Value bufferJoinChainRootForReuse(mlir::Value v, const ModuleReuseInfo& reuse);
 
 /// Map a matched state SSA to the value that should receive `cache_put` / `cache_get` (HIV root).

@@ -326,10 +326,144 @@ bool isCreateOnlyExecutionStep(subop::ExecutionStepOp step) {
    return true;
 }
 
+/// Buffer / thread_local carriers: never cross-query reuse targets; deps walk through them to tables.
+static bool isTransparentDepCarrierType(mlir::Type t) {
+   if (mlir::isa<subop::BufferType>(t)) return true;
+   if (isThreadLocalOfStateType(t)) return true;
+   return false;
+}
+
+static bool isTableStateValue(mlir::Value v);
+
 struct RWFlags {
    bool read = false;
    bool write = false;
 };
+
+/// Same-step RW edges: predecessor `r` must be available before writer `w` is constructed in that step.
+struct StateDependencyGraph {
+   llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 8>> predecessors;
+};
+
+static StateDependencyGraph buildStateDependencyGraphFromStepRw(
+   const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep) {
+   StateDependencyGraph dag;
+   for (auto& stepIt : rwByStep) {
+      llvm::SmallVector<mlir::Value, 16> reads;
+      llvm::SmallVector<mlir::Value, 16> writes;
+      reads.reserve(stepIt.second.size());
+      writes.reserve(stepIt.second.size());
+      for (auto& kv : stepIt.second) {
+         dag.predecessors.try_emplace(kv.first);
+         if (kv.second.read) reads.push_back(kv.first);
+         if (kv.second.write) writes.push_back(kv.first);
+      }
+      for (mlir::Value w : writes) {
+         for (mlir::Value r : reads) {
+            if (r == w) continue;
+            dag.predecessors[w].push_back(r);
+         }
+      }
+   }
+   for (auto& kv : dag.predecessors) {
+      llvm::sort(kv.second, [](mlir::Value a, mlir::Value b) {
+         return a.getAsOpaquePointer() < b.getAsOpaquePointer();
+      });
+      kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+   }
+   return dag;
+}
+
+static llvm::ArrayRef<mlir::Value> directPredecessorsInDepGraph(mlir::Value state,
+                                                                const StateDependencyGraph& dag) {
+   mlir::Value canon = canonicalizeStateValueDeep(state);
+   auto it = dag.predecessors.find(canon);
+   if (it == dag.predecessors.end()) return {};
+   return it->second;
+}
+
+struct StateDepEligibility {
+   bool eligible = false;
+   llvm::SmallVector<std::string, 8> depTokensSorted;
+};
+
+static StateDepEligibility resolveDepEligibilityRec(
+   mlir::Value state, const StateDependencyGraph& dag,
+   const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState, llvm::DenseSet<mlir::Value>& visiting) {
+   mlir::Value stateCanon = canonicalizeStateValueDeep(state);
+   assert(visiting.insert(stateCanon).second && "state dependency graph must be acyclic");
+
+   llvm::ArrayRef<mlir::Value> preds = directPredecessorsInDepGraph(stateCanon, dag);
+
+   if (preds.empty()) {
+      visiting.erase(stateCanon);
+      if (isTransparentDepCarrierType(stateCanon.getType())) {
+         return {false, {}};
+      }
+      return {true, {}};
+   }
+
+   unsigned nTransparent = 0;
+   unsigned nTable = 0;
+   unsigned nOther = 0;
+   mlir::Value soleTransparent;
+   for (mlir::Value p : preds) {
+      if (isTransparentDepCarrierType(p.getType())) {
+         nTransparent++;
+         soleTransparent = p;
+         continue;
+      }
+      if (isTableStateValue(p)) {
+         nTable++;
+         continue;
+      }
+      nOther++;
+   }
+
+   if (nTransparent > 0 && preds.size() > 1) {
+      assert(false && "state with a transparent dep must not have multiple direct predecessors");
+   }
+
+   if (nOther > 0) {
+      visiting.erase(stateCanon);
+      return {false, {}};
+   }
+
+   if (nTransparent == 1 && preds.size() == 1) {
+      StateDepEligibility inner =
+         resolveDepEligibilityRec(soleTransparent, dag, tableDescrByTableState, visiting);
+      visiting.erase(stateCanon);
+      return inner;
+   }
+
+   assert(nTransparent == 0 && "unexpected transparent predecessor");
+   assert(nTable == preds.size() && "only table predecessors expected");
+
+   StateDepEligibility out;
+   out.eligible = true;
+   out.depTokensSorted.reserve(nTable);
+   for (mlir::Value p : preds) {
+      auto itD = tableDescrByTableState.find(p);
+      assert(itD != tableDescrByTableState.end() && "table predecessor must have GetExternal descr");
+      out.depTokensSorted.push_back(std::string("table:") + itD->second);
+   }
+   llvm::sort(out.depTokensSorted);
+   out.depTokensSorted.erase(std::unique(out.depTokensSorted.begin(), out.depTokensSorted.end()),
+                             out.depTokensSorted.end());
+   visiting.erase(stateCanon);
+   return out;
+}
+
+static StateDepEligibility evaluateStateDepEligibility(
+   mlir::Value reuseTarget, const StateDependencyGraph& dag,
+   const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState) {
+   mlir::Value canon = canonicalizeStateValueDeep(reuseTarget);
+   assert(!isTransparentDepCarrierType(canon.getType()) && "transparent states are not reuse targets");
+   llvm::DenseSet<mlir::Value> visiting;
+   return resolveDepEligibilityRec(canon, dag, tableDescrByTableState, visiting);
+}
+
+static std::optional<mlir::Value> findUpstreamLookupHashIndexedView(mlir::Value v);
 
 llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRW(subop::ExecutionStepOp step) {
    llvm::DenseMap<mlir::Value, RWFlags> res;
@@ -337,7 +471,7 @@ llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRW(subop::ExecutionStepOp s
 
    if (isExternalTableRefStep(step)) {
       assert(step.getNumResults() == 1 && "external table ref step should have exactly one result");
-      res[step.getResult(0)].write = true;
+      res[canonicalizeStateValueDeep(step.getResult(0))].write = true;
       return res;
    }
 
@@ -365,6 +499,35 @@ llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRW(subop::ExecutionStepOp s
          if (isStateType(out.getType()) || isThreadLocalOfStateType(out.getType())) {
             res[canonicalizeStateValueDeep(out)].write = true;
          }
+         continue;
+      }
+      if (auto lookup = mlir::dyn_cast<subop::LookupOp>(&op)) {
+         mlir::Value st = lookup.getState();
+         if (isStateType(st.getType()) || isThreadLocalOfStateType(st.getType())) {
+            res[canonicalizeStateValueDeep(st)].read = true;
+         }
+         continue;
+      }
+      if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(&op)) {
+         if (auto hiv = findUpstreamLookupHashIndexedView(scanList.getList())) {
+            res[*hiv].read = true;
+         }
+         continue;
+      }
+      if (auto from = mlir::dyn_cast<subop::CreateFrom>(&op)) {
+         mlir::Value src = from.getState();
+         if (isStateType(src.getType()) || isThreadLocalOfStateType(src.getType())) {
+            res[canonicalizeStateValueDeep(src)].read = true;
+         }
+         mlir::Value dst = from.getResult();
+         if (isStateType(dst.getType()) || isThreadLocalOfStateType(dst.getType())) {
+            res[canonicalizeStateValueDeep(dst)].write = true;
+         }
+         continue;
+      }
+      if (auto merge = mlir::dyn_cast<subop::MergeOp>(&op)) {
+         res[canonicalizeStateValueDeep(merge.getThreadLocal())].read = true;
+         res[canonicalizeStateValueDeep(merge.getResult())].write = true;
          continue;
       }
 
@@ -419,22 +582,43 @@ mlir::Value getReturnedInternalValueForStepResult(subop::ExecutionStepOp step, u
    return inputs[resultIdx];
 }
 
-void addConstructionStepsForSingleState(mlir::Value state,
-                                               const llvm::DenseMap<mlir::Value, int>& createdAtByState,
-                                               const llvm::DenseMap<mlir::Value, llvm::SmallSet<int, 16>>& writesByState,
-                                               llvm::SmallVectorImpl<int>& outSteps) {
-   auto itC = createdAtByState.find(state);
+static void addConstructionStepsForSingleState(
+   mlir::Value state, const llvm::DenseMap<mlir::Value, int>& createdAtByState,
+   const llvm::DenseMap<mlir::Value, llvm::SmallSet<int, 16>>& writesByState,
+   const llvm::DenseMap<int, int>* nestedStepParentIdx, llvm::SmallVectorImpl<int>& outSteps) {
+   mlir::Value stateCanon = canonicalizeStateValueDeep(state);
+   auto itC = createdAtByState.find(stateCanon);
    assert(itC != createdAtByState.end() && "state must have a recorded createdAt");
    int createdAt = itC->second;
    assert(createdAt >= 0 && "createdAt must be non-negative when present");
    outSteps.push_back(createdAt);
 
-   auto itW = writesByState.find(state);
+   auto itW = writesByState.find(stateCanon);
    assert(itW != writesByState.end() && "state must have a recorded writes set");
-   // Include ALL write steps as part of construction (rare, but requested).
    for (int w : itW->second) {
       assert(w >= createdAt && "write steps must not occur before creation");
       outSteps.push_back(w);
+      if (nestedStepParentIdx) {
+         if (auto itP = nestedStepParentIdx->find(w); itP != nestedStepParentIdx->end()) {
+            outSteps.push_back(itP->second);
+         }
+      }
+   }
+}
+
+static void forEachShadowChainPredecessorValue(
+   mlir::Value state, const llvm::DenseMap<mlir::Value, mlir::Value>& mergedFromShadowState,
+   llvm::function_ref<void(mlir::Value)> fn) {
+   mlir::Value cur = canonicalizeStateValueDeep(state);
+   llvm::DenseSet<void*> visited;
+   for (;;) {
+      auto itShadow = mergedFromShadowState.find(cur);
+      if (itShadow == mergedFromShadowState.end()) break;
+      mlir::Value shadow = itShadow->second;
+      void* key = shadow.getAsOpaquePointer();
+      if (!visited.insert(key).second) break;
+      fn(shadow);
+      cur = canonicalizeStateValueDeep(shadow);
    }
 }
 
@@ -442,55 +626,100 @@ llvm::SmallVector<int, 8> getConstructionStepIndicesForState(
    mlir::Value state,
    const llvm::DenseMap<mlir::Value, int>& createdAtByState,
    const llvm::DenseMap<mlir::Value, llvm::SmallSet<int, 16>>& writesByState,
-   const llvm::DenseMap<mlir::Value, mlir::Value>& mergedFromThreadLocal,
-   const llvm::DenseMap<mlir::Value, mlir::Value>* hashIndexedViewFromMergedBuffer) {
+   const llvm::DenseMap<mlir::Value, mlir::Value>& mergedFromShadowState,
+   const llvm::DenseMap<int, int>* nestedStepParentIdx) {
    llvm::SmallVector<int, 8> steps;
+   mlir::Value stateCanon = canonicalizeStateValueDeep(state);
 
-   // Normal state: createdAt (+ all write steps).
-   addConstructionStepsForSingleState(state, createdAtByState, writesByState, steps);
-
-   // Merge-produced global state: include thread_local side construction steps as well,
-   // but do NOT treat the thread_local as shareable output by itself.
-   if (auto it = mergedFromThreadLocal.find(state); it != mergedFromThreadLocal.end()) {
-      mlir::Value tl = it->second;
-      addConstructionStepsForSingleState(tl, createdAtByState, writesByState, steps);
-   }
-
-   // TL buffer -> merged global buffer -> hash_indexed_view: profile/match on HIV, include buffer+TL steps.
-   if (hashIndexedViewFromMergedBuffer) {
-      if (auto itG = hashIndexedViewFromMergedBuffer->find(state); itG != hashIndexedViewFromMergedBuffer->end()) {
-         mlir::Value globalBuf = itG->second;
-         addConstructionStepsForSingleState(globalBuf, createdAtByState, writesByState, steps);
-         if (auto itTL = mergedFromThreadLocal.find(globalBuf); itTL != mergedFromThreadLocal.end()) {
-            addConstructionStepsForSingleState(itTL->second, createdAtByState, writesByState, steps);
-         }
-      }
-   }
+   addConstructionStepsForSingleState(stateCanon, createdAtByState, writesByState, nestedStepParentIdx, steps);
+   forEachShadowChainPredecessorValue(stateCanon, mergedFromShadowState, [&](mlir::Value shadow) {
+      addConstructionStepsForSingleState(canonicalizeStateValueDeep(shadow), createdAtByState, writesByState,
+                                         nestedStepParentIdx, steps);
+   });
 
    llvm::sort(steps);
    steps.erase(std::unique(steps.begin(), steps.end()), steps.end());
    return steps;
 }
 
-llvm::SmallVector<mlir::Value, 8> getPrereqStatesForConstructionSteps(
-   llvm::ArrayRef<int> stepIndices,
-   mlir::Value constructedState,
-   const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep) {
-   llvm::SmallVector<mlir::Value, 8> prereqs;
-   llvm::DenseSet<mlir::Value> seen;
-   for (int s : stepIndices) {
-      auto it = rwByStep.find(s);
-      assert(it != rwByStep.end() && "construction step must exist in rwByStep");
-      for (auto kv : it->second) {
-         mlir::Value v = kv.first;
-         if (v == constructedState) continue;
+/// Same `execution_step` index used for nested steps: use parent step RW (nested body merged in).
+static int effectiveRwStepIndex(int stepIdx, const llvm::DenseMap<int, int>& nestedStepParentIdx) {
+   if (auto it = nestedStepParentIdx.find(stepIdx); it != nestedStepParentIdx.end()) return it->second;
+   return stepIdx;
+}
+
+/// Direct state deps from step RW: within one step, every read `r` and write `w` implies `w` depends on `r`.
+static void appendSameStepRwDirectPrereqs(
+   mlir::Value constructedState, llvm::ArrayRef<int> stepIndices,
+   const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep,
+   const llvm::DenseMap<int, int>& nestedStepParentIdx, llvm::DenseSet<mlir::Value>& seen,
+   llvm::SmallVectorImpl<mlir::Value>& out) {
+   mlir::Value selfCanon = canonicalizeStateValueDeep(constructedState);
+   for (int si : stepIndices) {
+      int rwStep = effectiveRwStepIndex(si, nestedStepParentIdx);
+      auto itRw = rwByStep.find(rwStep);
+      assert(itRw != rwByStep.end());
+      bool writesSelf = false;
+      for (auto& kv : itRw->second) {
+         if (kv.first == selfCanon && kv.second.write) writesSelf = true;
+      }
+      if (!writesSelf) continue;
+      for (auto& kv : itRw->second) {
          if (!kv.second.read) continue;
-         if (seen.insert(v).second) {
-            prereqs.push_back(v);
-         }
+         if (kv.first == selfCanon) continue;
+         if (seen.insert(kv.first).second) out.push_back(kv.first);
       }
    }
+}
+
+llvm::SmallVector<mlir::Value, 8> getPrereqStatesForConstructionSteps(
+   llvm::ArrayRef<int> stepIndices, mlir::Value constructedState,
+   const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep,
+   const llvm::DenseMap<int, int>& nestedStepParentIdx) {
+   llvm::SmallVector<mlir::Value, 8> prereqs;
+   llvm::DenseSet<mlir::Value> seen;
+   appendSameStepRwDirectPrereqs(constructedState, stepIndices, rwByStep, nestedStepParentIdx, seen, prereqs);
    return prereqs;
+}
+
+static void mergeRwInto(llvm::DenseMap<mlir::Value, RWFlags>& dst,
+                        const llvm::DenseMap<mlir::Value, RWFlags>& src) {
+   for (auto& kv : src) {
+      auto& f = dst[kv.first];
+      f.read = f.read || kv.second.read;
+      f.write = f.write || kv.second.write;
+   }
+}
+
+static void augmentStepRwWithNestedScanListHivReads(subop::ExecutionStepOp step,
+                                                    llvm::DenseMap<mlir::Value, RWFlags>& rw) {
+   step.walk([&](subop::ScanListOp scan) {
+      if (auto hiv = findUpstreamLookupHashIndexedView(scan.getList())) {
+         rw[canonicalizeStateValueDeep(*hiv)].read = true;
+      }
+   });
+}
+
+static void buildNestedStepParentMapAndMergeRw(
+   const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex,
+   llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep,
+   llvm::DenseMap<int, int>& nestedStepParentIdx) {
+   for (auto& it : stepByIndex) {
+      int parentIdx = it.first;
+      subop::ExecutionStepOp parent = it.second;
+      parent.walk([&](subop::ExecutionStepOp nested) {
+         if (nested == parent) return;
+         for (auto& itChild : stepByIndex) {
+            if (itChild.second != nested) continue;
+            nestedStepParentIdx[itChild.first] = parentIdx;
+            auto itRwChild = rwByStep.find(itChild.first);
+            assert(itRwChild != rwByStep.end());
+            mergeRwInto(rwByStep[parentIdx], itRwChild->second);
+            augmentStepRwWithNestedScanListHivReads(parent, rwByStep[parentIdx]);
+            return;
+         }
+      });
+   }
 }
 
 /// Map an entry-region block argument produced by `execution_step` / `nested_execution_group` /
@@ -535,7 +764,7 @@ static mlir::Value resolveStateOperandThroughNestedRegions(mlir::Value v) {
 /// top-level block — nested join steps often read `hash_indexed_view` only inside nested regions.
 static void appendNestedStateOperandsAsPrereqs(subop::ExecutionStepOp step, mlir::Value constructedState,
                                                llvm::DenseSet<mlir::Value>& seen,
-                                               llvm::SmallVector<mlir::Value, 8>& out) {
+                                               llvm::SmallVectorImpl<mlir::Value>& out) {
    step.walk([&](mlir::Operation* op) {
       for (mlir::Value v : op->getOperands()) {
          mlir::Value outer = resolveStateOperandThroughNestedRegions(v);
@@ -547,7 +776,92 @@ static void appendNestedStateOperandsAsPrereqs(subop::ExecutionStepOp step, mlir
    });
 }
 
-bool isTableStateValue(mlir::Value v) {
+/// Trace SSA backward through nested regions / producers to a hash_indexed_view used by subop.lookup.
+static std::optional<mlir::Value> findUpstreamLookupHashIndexedView(mlir::Value v) {
+   llvm::DenseSet<void*> visited;
+   llvm::SmallVector<mlir::Value, 8> stack;
+   stack.push_back(v);
+   while (!stack.empty()) {
+      mlir::Value cur = stack.pop_back_val();
+      void* key = cur.getAsOpaquePointer();
+      if (!visited.insert(key).second) continue;
+      if (mlir::isa<subop::HashIndexedViewType>(cur.getType())) {
+         return canonicalizeStateValueDeep(cur);
+      }
+      if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(cur)) {
+         stack.push_back(resolveStateOperandThroughNestedRegions(ba));
+         continue;
+      }
+      if (auto* def = cur.getDefiningOp()) {
+         if (auto lookup = mlir::dyn_cast<subop::LookupOp>(def)) {
+            return canonicalizeStateValueDeep(lookup.getState());
+         }
+         for (mlir::Value op : def->getOperands()) stack.push_back(op);
+      }
+   }
+   return std::nullopt;
+}
+
+static void appendLookupHashIndexedViewSourcePrereqs(mlir::Value v, mlir::Value constructedState,
+                                                   const llvm::DenseMap<mlir::Value, int>& createdAtByState,
+                                                   llvm::DenseSet<mlir::Value>& seen,
+                                                   llvm::SmallVectorImpl<mlir::Value>& out) {
+   if (auto hiv = findUpstreamLookupHashIndexedView(v)) {
+      if (*hiv != constructedState && seen.insert(*hiv).second) out.push_back(*hiv);
+   }
+   auto listTy = mlir::dyn_cast<subop::ListType>(v.getType());
+   if (!listTy) return;
+   auto entryRefTy = mlir::dyn_cast<subop::LookupEntryRefType>(listTy.getT());
+   if (!entryRefTy) return;
+   mlir::Type embeddedStateTy = entryRefTy.getState();
+   for (const auto& it : createdAtByState) {
+      if (it.first == constructedState) continue;
+      if (it.first.getType() != embeddedStateTy) continue;
+      if (seen.insert(it.first).second) out.push_back(it.first);
+      return;
+   }
+}
+
+static bool stepWritesConstructedState(
+   int stepIdx, mlir::Value constructedState,
+   const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep,
+   const llvm::DenseMap<int, int>& nestedStepParentIdx) {
+   int rwStep = effectiveRwStepIndex(stepIdx, nestedStepParentIdx);
+   auto itRw = rwByStep.find(rwStep);
+   if (itRw == rwByStep.end()) return false;
+   mlir::Value selfCanon = canonicalizeStateValueDeep(constructedState);
+   auto itF = itRw->second.find(selfCanon);
+   return itF != itRw->second.end() && itF->second.write;
+}
+
+static void appendConstructionStepPrereqStates(llvm::ArrayRef<int> stepIndices, mlir::Value constructedState,
+                                               const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep,
+                                               const llvm::DenseMap<int, int>& nestedStepParentIdx,
+                                               const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex,
+                                               const llvm::DenseMap<mlir::Value, int>& createdAtByState,
+                                               llvm::DenseSet<mlir::Value>& seen,
+                                               llvm::SmallVectorImpl<mlir::Value>& out) {
+   for (mlir::Value v :
+        getPrereqStatesForConstructionSteps(stepIndices, constructedState, rwByStep, nestedStepParentIdx)) {
+      if (seen.insert(v).second) out.push_back(v);
+   }
+   for (int si : stepIndices) {
+      if (!stepWritesConstructedState(si, constructedState, rwByStep, nestedStepParentIdx)) continue;
+      auto itSt = stepByIndex.find(si);
+      assert(itSt != stepByIndex.end());
+      subop::ExecutionStepOp step = itSt->second;
+      appendNestedStateOperandsAsPrereqs(step, constructedState, seen, out);
+      for (mlir::Value op : step.getOperands()) {
+         appendLookupHashIndexedViewSourcePrereqs(op, constructedState, createdAtByState, seen, out);
+         if (!isStateType(op.getType()) && !isThreadLocalOfStateType(op.getType())) continue;
+         mlir::Value c = canonicalizeStateValueDeep(op);
+         if (c == constructedState) continue;
+         if (seen.insert(c).second) out.push_back(c);
+      }
+   }
+}
+
+static bool isTableStateValue(mlir::Value v) {
    return mlir::isa<subop::TableType>(v.getType());
 }
 
@@ -638,15 +952,6 @@ struct JoinHivMatchDetails {
    std::string storedValueMembersFingerprint;
 };
 
-static std::string tableNameDepToken(mlir::Value tableState,
-                                    const llvm::DenseMap<mlir::Value, lingodb::runtime::ExternalDatasourceProperty>&
-                                       externalDatasourceByTableState) {
-   if (auto it = externalDatasourceByTableState.find(tableState); it != externalDatasourceByTableState.end()) {
-      return std::string("table_name:") + it->second.tableName;
-   }
-   return {};
-}
-
 static subop::CreateHashIndexedView findCreateHashIndexedViewForState(
    mlir::Value hiv, const llvm::DenseMap<mlir::Value, llvm::SmallVector<subop::ExecutionStepOp, 8>>& writerStepsByState) {
    auto itW = writerStepsByState.find(hiv);
@@ -729,14 +1034,6 @@ static std::string normalizedHashIndexedViewTypeFingerprintForJoinMatch(subop::M
           fingerprintSortedMemberPairs(mm, hivTy.getKeyMembers().getMembers()) +
           ",index_value_members=" + fingerprintSortedMemberPairs(mm, indexValueMembers) +
           ",compare=" + (hivTy.getCompareHashForLookup() ? "1" : "0") + "}";
-}
-
-static bool executionStepBuildsJoinBuffer(subop::ExecutionStepOp step) {
-   bool found = false;
-   step.walk([&](subop::MaterializeOp mat) {
-      if (mlir::isa<subop::BufferType>(mat.getState().getType())) found = true;
-   });
-   return found;
 }
 
 struct StepDagHasher {
@@ -1135,6 +1432,31 @@ struct StateMatchProfile {
    std::string storedValueMembersFingerprint;
 };
 
+/// Phase 1 output: per-step state read/write (nested child RW merged into parents).
+struct ModuleStepRwAnalysis {
+   llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>> rwByStep;
+   llvm::DenseMap<int, int> nestedStepParentIdx;
+};
+
+/// Phase 3 output for one reuse candidate.
+struct StateReuseEligibility {
+   StateDepEligibility depGraph;
+   bool multiWriteInConstruction = false;
+   bool hasWriterOrIsMergeResult = false;
+
+   bool isEligibleForReuse() const {
+      return depGraph.eligible && !multiWriteInConstruction && hasWriterOrIsMergeResult;
+   }
+};
+
+/// Phase 4 output: construction / type fingerprints (only computed for eligible states).
+struct StateConstructionMatchHashes {
+   llvm::SmallVector<uint64_t, 8> constructionStepHashes;
+   uint64_t constructionHash = 0;
+   std::string typeFingerprintStr;
+   std::string storedValueMembersFingerprint;
+};
+
 struct ModuleMatchAndReuseAnalysis {
    struct StateInfo {
       int createdAt = -1;
@@ -1146,14 +1468,15 @@ struct ModuleMatchAndReuseAnalysis {
    llvm::DenseMap<int, subop::ExecutionStepOp> stepByIndex;
    llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>> rwByStep;
    llvm::DenseMap<mlir::Value, int> createdAtByState;
-   llvm::DenseMap<mlir::Value, mlir::Value> mergedFromThreadLocal;
+   llvm::DenseMap<mlir::Value, mlir::Value> mergedFromShadowState;
+   llvm::DenseMap<int, int> nestedStepParentIdx;
    llvm::DenseMap<mlir::Value, llvm::SmallSet<int, 16>> writesByState;
    llvm::SmallVector<mlir::Value, 64> statesSorted;
    ModuleReuseInfo reuse;
 };
 
-static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp moduleOp) {
-   ModuleMatchAndReuseAnalysis a;
+/// Register execution steps and state metadata (creation site, merge shadow, create-only) before RW analysis.
+static void registerModuleExecutionSteps(mlir::ModuleOp moduleOp, ModuleMatchAndReuseAnalysis& a) {
    auto recordState = [&](mlir::Value v) -> ModuleMatchAndReuseAnalysis::StateInfo& { return a.stateInfo[v]; };
 
    size_t idx = 0;
@@ -1164,7 +1487,6 @@ static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp 
       bool tableRef = isExternalTableRefStep(step);
       bool createOnly = isCreateOnlyExecutionStep(step);
 
-      // 0) Record decoded external datasource property for table_ref steps.
       if (tableRef) {
          auto& block = step.getSubOps().front();
          subop::GetExternalOp geOp;
@@ -1177,12 +1499,10 @@ static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp 
          assert(geOp && "table_ref step must contain get_external");
          assert(step.getNumResults() == 1 && "table_ref step must return one value");
          mlir::Value t = canonicalizeStateValueDeep(step.getResult(0));
-         // Decode once and keep it for downstream rewrites (filter delaying etc.).
          a.reuse.externalDatasourceByTableState[t] =
             lingodb::utility::deserializeFromHexString<lingodb::runtime::ExternalDatasourceProperty>(geOp.getDescr());
       }
 
-      // 1) Record creation/writes for step results (state values).
       for (auto r : step.getResults()) {
          if (!isStateType(r.getType()) && !isThreadLocalOfStateType(r.getType())) continue;
          auto& info = recordState(r);
@@ -1191,42 +1511,16 @@ static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp 
          if (!createOnly && !tableRef) info.writes.insert(stepIdx);
       }
 
-      // 2) Analyze read/write usage inside the step body.
-      auto rw = analyzeStepStateRW(step);
-      a.rwByStep[stepIdx] = rw;
-
-      ModuleReuseInfo::StepRW re;
-      re.step = step;
-
-      for (auto it : rw) {
-         auto& info = recordState(it.first);
-         if (info.createdAt < 0 && isFuncBlockArgument(it.first)) {
-            info.createdAt = -2; // external (func argument)
-            a.createdAtByState[it.first] = info.createdAt;
-         }
-         if (it.second.read) {
-            info.reads.insert(stepIdx);
-            re.reads.push_back(it.first);
-         }
-         if (it.second.write) {
-            info.writes.insert(stepIdx);
-            re.writes.push_back(it.first);
-            a.reuse.writerStepsByState[it.first].push_back(step);
-         }
-      }
-
-      // 3) Collect merge pairing in the same pass.
       auto& block = step.getSubOps().front();
       for (auto& op : block.without_terminator()) {
          auto merge = mlir::dyn_cast<subop::MergeOp>(op);
          if (!merge) continue;
          mlir::Value in = canonicalizeStateValueDeep(merge.getThreadLocal());
          mlir::Value out = canonicalizeStateValueDeep(merge.getResult());
-         a.mergedFromThreadLocal[out] = in;
-         a.reuse.mergedFromThreadLocal[out] = in;
+         a.mergedFromShadowState[out] = in;
+         a.reuse.mergedFromShadowState[out] = in;
       }
 
-      // 4) Register create-only steps for any canonical state key they return.
       if (isCreateOnlyExecutionStep(step)) {
          llvm::SmallVector<mlir::Value, 4> keys;
          for (mlir::Value r : step.getResults()) if (r) keys.push_back(r);
@@ -1239,11 +1533,53 @@ static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp 
             if (key != r && !a.reuse.createOnlyStepForState.contains(r)) a.reuse.createOnlyStepForState.insert({r, step});
          }
       }
-
-      a.reuse.steps.push_back(std::move(re));
    });
+}
 
-   // Materialize writesByState and a stable sorted state list for matching.
+/// Phase 1: analyze each execution_step body RW; record per-state reads/writes and `reuse.steps`.
+static ModuleStepRwAnalysis analyzeModuleExecutionStepRw(ModuleMatchAndReuseAnalysis& a) {
+   ModuleStepRwAnalysis rw;
+   auto recordState = [&](mlir::Value v) -> ModuleMatchAndReuseAnalysis::StateInfo& { return a.stateInfo[v]; };
+
+   llvm::SmallVector<int, 128> stepOrder;
+   stepOrder.reserve(a.stepByIndex.size());
+   for (auto& it : a.stepByIndex) stepOrder.push_back(it.first);
+   llvm::sort(stepOrder);
+
+   for (int stepIdx : stepOrder) {
+      subop::ExecutionStepOp step = a.stepByIndex[stepIdx];
+      llvm::DenseMap<mlir::Value, RWFlags> stepRw = analyzeStepStateRW(step);
+      rw.rwByStep[stepIdx] = stepRw;
+      a.rwByStep[stepIdx] = stepRw;
+
+      ModuleReuseInfo::StepRW re;
+      re.step = step;
+      for (auto& it : stepRw) {
+         auto& info = recordState(it.first);
+         if (info.createdAt < 0 && isFuncBlockArgument(it.first)) {
+            info.createdAt = -2;
+            a.createdAtByState[it.first] = info.createdAt;
+         }
+         if (it.second.read) {
+            info.reads.insert(stepIdx);
+            re.reads.push_back(it.first);
+         }
+         if (it.second.write) {
+            info.writes.insert(stepIdx);
+            re.writes.push_back(it.first);
+            a.reuse.writerStepsByState[it.first].push_back(step);
+         }
+      }
+      a.reuse.steps.push_back(std::move(re));
+   }
+
+   buildNestedStepParentMapAndMergeRw(a.stepByIndex, rw.rwByStep, rw.nestedStepParentIdx);
+   a.nestedStepParentIdx = rw.nestedStepParentIdx;
+   a.rwByStep = rw.rwByStep;
+   return rw;
+}
+
+static void finalizeModuleMatchAnalysis(mlir::ModuleOp moduleOp, ModuleMatchAndReuseAnalysis& a) {
    for (auto& it : a.stateInfo) {
       a.writesByState[it.first] = it.second.writes;
       a.statesSorted.push_back(it.first);
@@ -1255,19 +1591,144 @@ static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp 
       return x.getAsOpaquePointer() < y.getAsOpaquePointer();
    });
 
-   // Global buffer -> create_hash_indexed_view (at most one HIV per buffer). Optional TL merge on buffer.
    moduleOp.walk([&](subop::CreateHashIndexedView chiv) {
       mlir::Value globalBuf = canonicalizeStateValueDeep(chiv.getSource());
       mlir::Value hiv = canonicalizeStateValueDeep(chiv.getResult());
       if (!mlir::isa<subop::BufferType>(globalBuf.getType())) return;
       if (!mlir::isa<subop::HashIndexedViewType>(hiv.getType())) return;
-      assert(!a.reuse.mergedBufferToHashIndexedView.contains(globalBuf) &&
-             "each join buffer must feed at most one hash_indexed_view in a serial chain");
-      a.reuse.hashIndexedViewFromMergedBuffer[hiv] = globalBuf;
-      a.reuse.mergedBufferToHashIndexedView[globalBuf] = hiv;
+      if (mlir::Value existing = hashIndexedViewShadowingBuffer(globalBuf, a.reuse)) {
+         assert(existing == hiv && "each join buffer must feed at most one hash_indexed_view in a serial chain");
+      }
+      a.mergedFromShadowState[hiv] = globalBuf;
+      a.reuse.mergedFromShadowState[hiv] = globalBuf;
    });
+}
 
+static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp moduleOp) {
+   ModuleMatchAndReuseAnalysis a;
+   registerModuleExecutionSteps(moduleOp, a);
+   analyzeModuleExecutionStepRw(a);
+   finalizeModuleMatchAnalysis(moduleOp, a);
    return a;
+}
+
+static llvm::DenseSet<mlir::Value> shadowChainPartnerStates(const ModuleMatchAndReuseAnalysis& a) {
+   llvm::DenseSet<mlir::Value> partners;
+   for (auto& kv : a.mergedFromShadowState) partners.insert(kv.second);
+   return partners;
+}
+
+static llvm::DenseSet<mlir::Value> bufferJoinChainBufferPartnerStates(const ModuleMatchAndReuseAnalysis& a) {
+   llvm::DenseSet<mlir::Value> partners;
+   for (auto& kv : a.reuse.mergedFromShadowState) {
+      if (mlir::isa<subop::HashIndexedViewType>(kv.first.getType())) partners.insert(kv.second);
+   }
+   return partners;
+}
+
+static llvm::SmallVector<mlir::Value, 64> collectReuseCandidateStates(mlir::ModuleOp moduleOp,
+                                                                    const ModuleMatchAndReuseAnalysis& a) {
+   llvm::DenseSet<mlir::Value> shadowPartners = shadowChainPartnerStates(a);
+   llvm::SmallVector<mlir::Value, 64> candidates;
+   moduleOp.walk([&](subop::ExecutionStepOp step) {
+      for (mlir::Value r : step.getResults()) {
+         if (!isStateType(r.getType()) && !isThreadLocalOfStateType(r.getType())) continue;
+         auto itCreated = a.createdAtByState.find(r);
+         assert(itCreated != a.createdAtByState.end() && "execution_step state result must be tracked");
+         if (itCreated->second < 0) continue;
+         if (shadowPartners.contains(r)) continue;
+         if (isTransparentDepCarrierType(r.getType())) continue;
+         candidates.push_back(r);
+      }
+   });
+   llvm::sort(candidates, [&](mlir::Value x, mlir::Value y) {
+      int cx = a.createdAtByState.lookup(x);
+      int cy = a.createdAtByState.lookup(y);
+      if (cx != cy) return cx < cy;
+      return x.getAsOpaquePointer() < y.getAsOpaquePointer();
+   });
+   return candidates;
+}
+
+static bool constructionStepHasMultipleWrites(int stepIdx, const ModuleStepRwAnalysis& rw) {
+   auto itRW = rw.rwByStep.find(stepIdx);
+   assert(itRW != rw.rwByStep.end());
+   unsigned writeCount = 0;
+   for (auto& kv : itRW->second) {
+      if (kv.second.write) writeCount++;
+      if (writeCount > 1) return true;
+   }
+   return false;
+}
+
+/// Phase 3: dependency-graph eligibility plus structural reuse constraints.
+static StateReuseEligibility determineStateReuseEligibility(
+   mlir::Value state, const StateDependencyGraph& depGraph,
+   llvm::ArrayRef<int> constructionStepIndices, const ModuleStepRwAnalysis& stepRw,
+   const ModuleMatchAndReuseAnalysis& module,
+   const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState) {
+   mlir::Value stateCanon = canonicalizeStateValueDeep(state);
+   assert(!isTransparentDepCarrierType(stateCanon.getType()) && "transparent states are never reuse targets");
+
+   StateReuseEligibility out;
+   out.depGraph = evaluateStateDepEligibility(stateCanon, depGraph, tableDescrByTableState);
+
+   for (int si : constructionStepIndices) {
+      if (constructionStepHasMultipleWrites(si, stepRw)) {
+         out.multiWriteInConstruction = true;
+         break;
+      }
+   }
+
+   bool hasWriter = module.reuse.writerStepsByState.contains(state);
+   bool isMergeResult = module.mergedFromShadowState.contains(state);
+   out.hasWriterOrIsMergeResult = hasWriter || isMergeResult;
+   return out;
+}
+
+/// Phase 4: construction hash and type fingerprint (call only when `StateReuseEligibility::isEligibleForReuse()`).
+static StateConstructionMatchHashes computeEligibleStateMatchHashes(
+   mlir::Value state, llvm::ArrayRef<int> constructionStepIndices, const ModuleMatchAndReuseAnalysis& module,
+   const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState, subop::MemberManager& memberManager,
+   lingodb::compiler::dialect::tuples::ColumnManager& columnManager) {
+   std::optional<JoinHivMatchDetails> joinHivDetails;
+   if (auto hivTy = mlir::dyn_cast<subop::HashIndexedViewType>(state.getType())) {
+      joinHivDetails =
+         computeJoinHivMatchDetails(state, hivTy, memberManager, columnManager, module.reuse.writerStepsByState);
+   }
+
+   llvm::SmallVector<uint64_t, 16> stepHashes;
+   stepHashes.reserve(constructionStepIndices.size());
+   for (int si : constructionStepIndices) {
+      auto itS = module.stepByIndex.find(si);
+      assert(itS != module.stepByIndex.end());
+      StepDagHasher hasher;
+      hasher.step = itS->second;
+      hasher.tableDescrByTableState = &tableDescrByTableState;
+      hasher.memberManager = &memberManager;
+      hasher.columnManager = &columnManager;
+      if (joinHivDetails) {
+         hasher.relaxJoinPayloadColumns = true;
+         hasher.joinIndexMemberNamesSanitized = &joinHivDetails->indexMemberNamesSanitized;
+         hasher.joinKeyColumnAttrHashes = &joinHivDetails->joinKeyColumnAttrHashes;
+         hasher.externalDatasourceByTableState = &module.reuse.externalDatasourceByTableState;
+      }
+      stepHashes.push_back(hasher.hashStepReturnGraph());
+   }
+   llvm::sort(stepHashes);
+
+   StateConstructionMatchHashes hashes;
+   hashes.constructionStepHashes.assign(stepHashes.begin(), stepHashes.end());
+   for (auto h : stepHashes) hashes.constructionHash = hashCombineU64(hashes.constructionHash, h);
+
+   if (joinHivDetails) {
+      hashes.typeFingerprintStr = normalizedHashIndexedViewTypeFingerprintForJoinMatch(
+         memberManager, mlir::cast<subop::HashIndexedViewType>(state.getType()), *joinHivDetails);
+      hashes.storedValueMembersFingerprint = joinHivDetails->storedValueMembersFingerprint;
+   } else {
+      hashes.typeFingerprintStr = normalizedSubopStateTypeFingerprint(memberManager, state.getType());
+   }
+   return hashes;
 }
 
 llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
@@ -1280,232 +1741,54 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
    auto* tupDialect = moduleOp.getContext()->getLoadedDialect<lingodb::compiler::dialect::tuples::TupleStreamDialect>();
    assert(tupDialect && "tuples dialect must be loaded");
 
-   auto a = analyzeModuleForMatchAndReuse(moduleOp);
+   ModuleMatchAndReuseAnalysis module = analyzeModuleForMatchAndReuse(moduleOp);
 
-   llvm::DenseSet<mlir::Value> threadLocalMergePartners;
-   for (auto& kv : a.mergedFromThreadLocal) threadLocalMergePartners.insert(kv.second);
+   ModuleStepRwAnalysis stepRw{module.rwByStep, module.nestedStepParentIdx};
 
-   llvm::DenseSet<mlir::Value> bufferJoinChainBufferPartners;
-   for (auto& kv : a.reuse.mergedBufferToHashIndexedView) bufferJoinChainBufferPartners.insert(kv.first);
+   // Phase 2: same-step RW → state dependency DAG.
+   StateDependencyGraph depGraph = buildStateDependencyGraphFromStepRw(stepRw.rwByStep);
+
+   llvm::DenseSet<mlir::Value> shadowPartners = shadowChainPartnerStates(module);
+   llvm::DenseSet<mlir::Value> bufferJoinPartners = bufferJoinChainBufferPartnerStates(module);
+   llvm::SmallVector<mlir::Value, 64> candidates = collectReuseCandidateStates(moduleOp, module);
 
    llvm::SmallVector<StateMatchProfile, 128> profiles;
+   profiles.reserve(candidates.size());
 
-   for (auto s : a.statesSorted) {
-      // Only consider states that are constructed within this module (i.e., appear as execution_step results).
-      // External states (func arguments) and any other untracked values must never be treated as "constructed".
-      auto itCreated = a.createdAtByState.find(s);
-      if (itCreated == a.createdAtByState.end() || itCreated->second < 0) {
-         continue;
-      }
+   for (mlir::Value state : candidates) {
+      if (shadowPartners.contains(state)) continue;
+      if (bufferJoinPartners.contains(state)) continue;
 
-      if (threadLocalMergePartners.contains(s)) continue;
-      // Join chain is represented by the HIV; the merged global buffer is not a separate reuse target.
-      if (bufferJoinChainBufferPartners.contains(s)) continue;
+      mlir::Value stateCanon = canonicalizeStateValueDeep(state);
+      auto constructionStepIndices = getConstructionStepIndicesForState(
+         stateCanon, module.createdAtByState, module.writesByState, module.mergedFromShadowState,
+         &stepRw.nestedStepParentIdx);
 
-      auto stepIdxs = getConstructionStepIndicesForState(s, a.createdAtByState, a.writesByState, a.mergedFromThreadLocal,
-                                                         &a.reuse.hashIndexedViewFromMergedBuffer);
-      auto prereqStepIdxs = sortedUniqueStepIndices(stepIdxs);
-
-      const bool isJoinHivRoot = a.reuse.hashIndexedViewFromMergedBuffer.contains(s);
-      std::optional<JoinHivMatchDetails> joinHivDetails;
-      if (auto hivTy = mlir::dyn_cast<subop::HashIndexedViewType>(s.getType())) {
-         joinHivDetails =
-            computeJoinHivMatchDetails(s, hivTy, memberManager, tupDialect->getColumnManager(), a.reuse.writerStepsByState);
-         if (joinHivDetails) {
-            a.reuse.joinBuildStoredValueMembersByState[s] = joinHivDetails->storedValueMembersFingerprint;
-         }
-      }
-
-      llvm::SmallVector<uint64_t, 16> stepHashes;
-      stepHashes.reserve(stepIdxs.size());
-      for (int si : stepIdxs) {
-         auto itS = a.stepByIndex.find(si);
-         assert(itS != a.stepByIndex.end());
-         StepDagHasher hasher;
-         hasher.step = itS->second;
-         hasher.tableDescrByTableState = &tableDescrByTableState;
-         hasher.memberManager = &memberManager;
-         hasher.columnManager = &tupDialect->getColumnManager();
-         if (joinHivDetails) {
-            hasher.relaxJoinPayloadColumns = true;
-            hasher.joinIndexMemberNamesSanitized = &joinHivDetails->indexMemberNamesSanitized;
-            hasher.joinKeyColumnAttrHashes = &joinHivDetails->joinKeyColumnAttrHashes;
-            hasher.externalDatasourceByTableState = &a.reuse.externalDatasourceByTableState;
-         }
-         stepHashes.push_back(hasher.hashStepReturnGraph());
-      }
-      llvm::sort(stepHashes);
-      uint64_t constructionHash = 0;
-      for (auto h : stepHashes) constructionHash = hashCombineU64(constructionHash, h);
-
-      auto prereqs = getPrereqStatesForConstructionSteps(prereqStepIdxs, s, a.rwByStep);
-      llvm::DenseSet<mlir::Value> prereqSeen;
-      for (auto pv : prereqs) prereqSeen.insert(pv);
-      for (int si : prereqStepIdxs) {
-         auto itSt = a.stepByIndex.find(si);
-         assert(itSt != a.stepByIndex.end());
-         appendNestedStateOperandsAsPrereqs(itSt->second, s, prereqSeen, prereqs);
-      }
-
-      llvm::SmallVector<std::string, 8> depTokens;
-      llvm::DenseMap<mlir::Value, llvm::SmallVector<std::string, 8>> depMemo;
-      llvm::DenseSet<mlir::Value> visiting;
-      std::function<bool(mlir::Value, llvm::SmallVector<std::string, 8>&)> collectDeps =
-         [&](mlir::Value st, llvm::SmallVector<std::string, 8>& out) -> bool {
-            if (auto itM = depMemo.find(st); itM != depMemo.end()) {
-               out.append(itM->second.begin(), itM->second.end());
-               return true;
-            }
-            assert(visiting.insert(st).second && "state dep graph must be acyclic");
-
-            llvm::SmallVector<std::string, 8> local;
-            auto itC = a.createdAtByState.find(st);
-            if (itC == a.createdAtByState.end()) return false;
-            auto stHashSteps = getConstructionStepIndicesForState(st, a.createdAtByState, a.writesByState, a.mergedFromThreadLocal,
-                                                                &a.reuse.hashIndexedViewFromMergedBuffer);
-            auto stRwSteps = sortedUniqueStepIndices(stHashSteps);
-            llvm::SmallVector<mlir::Value, 8> stPrereqs =
-               getPrereqStatesForConstructionSteps(stRwSteps, st, a.rwByStep);
-            llvm::DenseSet<mlir::Value> nestedSeen;
-            for (auto pv : stPrereqs) nestedSeen.insert(pv);
-            for (int si : stRwSteps) {
-               auto itSt = a.stepByIndex.find(si);
-               assert(itSt != a.stepByIndex.end());
-               appendNestedStateOperandsAsPrereqs(itSt->second, st, nestedSeen, stPrereqs);
-            }
-            for (auto p : stPrereqs) {
-               // Ignore pure create-only prerequisite states.
-               if (auto itPC = a.createdAtByState.find(p); itPC != a.createdAtByState.end()) {
-                  auto itPS = a.stepByIndex.find(itPC->second);
-                  if (itPS != a.stepByIndex.end() && isCreateOnlyExecutionStep(itPS->second)) {
-                     continue;
-                  }
-               }
-               if (isTableStateValue(p)) {
-                  if (isJoinHivRoot) {
-                     std::string tableNameToken = tableNameDepToken(p, a.reuse.externalDatasourceByTableState);
-                     if (!tableNameToken.empty()) {
-                        local.push_back(std::move(tableNameToken));
-                        continue;
-                     }
-                  }
-                  auto itD = tableDescrByTableState.find(p);
-                  if (itD != tableDescrByTableState.end()) {
-                     local.push_back(std::string("table:") + itD->second);
-                  } else {
-                     // Some pipelines may introduce table-typed values that are not direct get_external results.
-                     // Fall back to a stable, type-based token so identical shapes can still match cross-query.
-                     local.push_back(std::string("table_type:") + normalizedSubopStateTypeFingerprint(memberManager, p.getType()));
-                  }
-                  continue;
-               }
-               if (mlir::isa<subop::ResultTableType>(p.getType())) {
-                  // Always record the RT shape token for cross-query matching, but also expand
-                  // transitive construction deps: a `result_table` may be created empty and later
-                  // filled from a heap/buffer/etc.; ignoring that edge lets consumers (e.g. another
-                  // RT or `create_from`) look "table-only eligible" while still depending on heap.
-                  local.push_back(std::string("rt:") + normalizedSubopStateTypeFingerprint(memberManager, p.getType()));
-                  if (!collectDeps(p, local)) return false;
-                  continue;
-               }
-               if (threadLocalMergePartners.contains(p)) continue;
-               // Merge **result** (global side): same logical construction unit as the TL operand. Downstream
-               // states (e.g. `hash_indexed_view` built only from the merged buffer) must not treat this
-               // global `State` as an opaque internal edge — fold to that value's own construction deps.
-               if (a.mergedFromThreadLocal.contains(p)) {
-                  if (!collectDeps(p, local)) return false;
-                  continue;
-               }
-               // `hash_indexed_view` from a merged join buffer is the same construction unit as that buffer.
-               if (auto itHiv = a.reuse.hashIndexedViewFromMergedBuffer.find(p);
-                   itHiv != a.reuse.hashIndexedViewFromMergedBuffer.end()) {
-                  mlir::Value mergedBuf = itHiv->second;
-                  // When profiling the merged buffer itself, HIV is downstream — do not recurse back.
-                  if (mergedBuf == st) continue;
-                  if (visiting.contains(mergedBuf)) continue;
-                  if (!collectDeps(mergedBuf, local)) return false;
-                  continue;
-               }
-               // Cross-query reuse may only *match* on states whose construction deps are external tables
-               // (descr / type token) and/or `result_table` fingerprints. Any other `!subop.*` state edge
-               // (heap/buffer/hashmap/hash_indexed_view, …) is pipeline-internal and disqualifies reuse.
-               if (isThreadLocalOfStateType(p.getType())) {
-                  if (!collectDeps(p, local)) return false;
-                  continue;
-               }
-               // Profiling `hash_indexed_view`: merged global buffer (+ TL) are the same reuse unit.
-               if (auto itChain = a.reuse.hashIndexedViewFromMergedBuffer.find(st);
-                   itChain != a.reuse.hashIndexedViewFromMergedBuffer.end()) {
-                  if (p == itChain->second) continue;
-                  if (auto itTL = a.mergedFromThreadLocal.find(itChain->second);
-                      itTL != a.mergedFromThreadLocal.end() && p == itTL->second) {
-                     continue;
-                  }
-               }
-               if (mlir::isa<subop::State>(p.getType())) return false;
-               llvm_unreachable("collectDeps: unexpected prereq value type");
-            }
-
-            visiting.erase(st);
-            llvm::sort(local);
-            local.erase(std::unique(local.begin(), local.end()), local.end());
-            depMemo[st] = local;
-            out.append(local.begin(), local.end());
-            return true;
-         };
-
-      bool ok = true;
-      for (auto p : prereqs) {
-         if (!collectDeps(p, depTokens)) {
-            ok = false;
-            break;
-         }
-      }
-      llvm::sort(depTokens);
-      depTokens.erase(std::unique(depTokens.begin(), depTokens.end()), depTokens.end());
-
-      // Hard constraint: if any construction step writes multiple states, this state must not participate in matching.
-      // (We cannot safely delete only the "write side" without affecting other written states.)
-      bool multiWrite = false;
-      for (int si : stepIdxs) {
-         auto itRW = a.rwByStep.find(si);
-         assert(itRW != a.rwByStep.end());
-         unsigned writeCount = 0;
-         for (auto kv : itRW->second) {
-            if (kv.second.write) writeCount++;
-            if (writeCount > 1) break;
-         }
-         if (writeCount > 1) {
-            multiWrite = true;
-            break;
-         }
-      }
-
-      // New constraint: if a state has no writer steps and is not a merge result (global <- thread_local),
-      // do not reuse it. (These are typically pure create-only or view-like values that would require
-      // special handling; this experimental project prefers to skip them.)
-      bool hasWriter = a.reuse.writerStepsByState.contains(s);
-      bool isMergeResult = a.mergedFromThreadLocal.contains(s);
-      bool isJoinBufferHashViewRoot = a.reuse.hashIndexedViewFromMergedBuffer.contains(s);
-      bool hasWriterOrIsMergeResult = hasWriter || isMergeResult || isJoinBufferHashViewRoot;
+      // Phase 3
+      StateReuseEligibility eligibility = determineStateReuseEligibility(
+         state, depGraph, constructionStepIndices, stepRw, module, tableDescrByTableState);
 
       StateMatchProfile prof;
       prof.queryId = queryId;
-      prof.value = s;
-      // If a state truly depends only on external tables, it may have an empty dep token set
-      // when all intermediate prereqs are internal create-only states.
-      // We still want to match it.
-      prof.eligible = ok && !multiWrite && hasWriterOrIsMergeResult;
-      prof.depTokensSorted.assign(depTokens.begin(), depTokens.end());
-      prof.constructionStepHashes.assign(stepHashes.begin(), stepHashes.end());
-      prof.constructionHash = constructionHash;
-      if (joinHivDetails) {
-         prof.typeFingerprintStr = normalizedHashIndexedViewTypeFingerprintForJoinMatch(
-            memberManager, mlir::cast<subop::HashIndexedViewType>(s.getType()), *joinHivDetails);
-         prof.storedValueMembersFingerprint = joinHivDetails->storedValueMembersFingerprint;
-      } else {
-         prof.typeFingerprintStr = normalizedSubopStateTypeFingerprint(memberManager, s.getType());
+      prof.value = state;
+      prof.eligible = eligibility.isEligibleForReuse();
+      prof.depTokensSorted.assign(eligibility.depGraph.depTokensSorted.begin(),
+                                  eligibility.depGraph.depTokensSorted.end());
+
+      // Phase 4 (eligible states only)
+      if (prof.eligible) {
+         StateConstructionMatchHashes hashes = computeEligibleStateMatchHashes(
+            state, constructionStepIndices, module, tableDescrByTableState, memberManager,
+            tupDialect->getColumnManager());
+         prof.constructionStepHashes.assign(hashes.constructionStepHashes.begin(), hashes.constructionStepHashes.end());
+         prof.constructionHash = hashes.constructionHash;
+         prof.typeFingerprintStr = std::move(hashes.typeFingerprintStr);
+         prof.storedValueMembersFingerprint = std::move(hashes.storedValueMembersFingerprint);
+         if (!prof.storedValueMembersFingerprint.empty()) {
+            module.reuse.joinBuildStoredValueMembersByState[state] = prof.storedValueMembersFingerprint;
+         }
       }
+
       profiles.push_back(std::move(prof));
    }
 
@@ -1529,7 +1812,7 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
    llvm::DenseMap<int, subop::ExecutionStepOp> stepByIndex;
    llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>> rwByStep;
    llvm::DenseMap<mlir::Value, int> createdAtByState; // convenience (state value -> createdAt)
-   llvm::DenseMap<mlir::Value, mlir::Value> mergedFromThreadLocal; // global -> thread_local
+   llvm::DenseMap<mlir::Value, mlir::Value> mergedFromShadowState;
 
    auto recordState = [&](mlir::Value v) -> StateInfo& {
       return stateInfo[v];
@@ -1628,7 +1911,19 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
       os << "\n";
    }
 
-   os << "\n// ==== thread_local -> merge -> global pairs ====\n";
+   os << "\n// ==== merged_from_shadow_state (global <- thread_local / hiv <- buffer) ====\n";
+   moduleOp.walk([&](subop::CreateHashIndexedView chiv) {
+      mlir::Value globalBuf = canonicalizeStateValueDeep(chiv.getSource());
+      mlir::Value hiv = canonicalizeStateValueDeep(chiv.getResult());
+      if (!mlir::isa<subop::BufferType>(globalBuf.getType())) return;
+      if (!mlir::isa<subop::HashIndexedViewType>(hiv.getType())) return;
+      mergedFromShadowState[hiv] = globalBuf;
+      os << "// ";
+      globalBuf.printAsOperand(os, flags);
+      os << " <- ";
+      hiv.printAsOperand(os, flags);
+      os << " (hiv<-buf)\n";
+   });
    moduleOp.walk([&](subop::ExecutionStepOp step) {
       auto& block = step.getSubOps().front();
       for (auto& op : block.without_terminator()) {
@@ -1637,12 +1932,12 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
          assert(merge.getThreadLocal());
          mlir::Value in = canonicalizeStateValueDeep(merge.getThreadLocal());
          mlir::Value out = canonicalizeStateValueDeep(merge.getResult());
-         mergedFromThreadLocal[out] = in;
+         mergedFromShadowState[out] = in;
          os << "// ";
          in.printAsOperand(os, flags);
-         os << " -> ";
+         os << " <- ";
          out.printAsOperand(os, flags);
-         os << "\n";
+         os << " (merge)\n";
       }
    });
 
@@ -1666,13 +1961,17 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
       return a.getAsOpaquePointer() < b.getAsOpaquePointer();
    });
 
-   llvm::DenseSet<mlir::Value> threadLocalMergePartners;
-   for (auto& kv : mergedFromThreadLocal) threadLocalMergePartners.insert(kv.second);
+   llvm::DenseMap<int, int> nestedStepParentIdx;
+   buildNestedStepParentMapAndMergeRw(stepByIndex, rwByStep, nestedStepParentIdx);
+
+   llvm::DenseSet<mlir::Value> shadowChainPartners;
+   for (auto& kv : mergedFromShadowState) shadowChainPartners.insert(kv.second);
 
    for (auto s : states) {
-      if (threadLocalMergePartners.contains(s)) continue;
+      if (shadowChainPartners.contains(s)) continue;
 
-      auto stepIdxs = getConstructionStepIndicesForState(s, createdAtByState, writesByState, mergedFromThreadLocal, nullptr);
+      auto stepIdxs =
+         getConstructionStepIndicesForState(s, createdAtByState, writesByState, mergedFromShadowState, &nestedStepParentIdx);
       auto prereqStepIdxs = sortedUniqueStepIndices(stepIdxs);
       os << "\n// -- state ";
       s.printAsOperand(os, flags);
@@ -1682,14 +1981,14 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
       os << "//   construction_steps: ";
       for (int si : stepIdxs) os << si << " ";
       os << "\n";
-      if (auto it = mergedFromThreadLocal.find(s); it != mergedFromThreadLocal.end()) {
-         os << "//   merged_from_thread_local: ";
+      if (auto it = mergedFromShadowState.find(s); it != mergedFromShadowState.end()) {
+         os << "//   merged_from_shadow_state: ";
          it->second.printAsOperand(os, flags);
          os << "\n";
       }
 
       llvm::SmallVector<mlir::Value, 8> prereqs =
-         getPrereqStatesForConstructionSteps(prereqStepIdxs, s, rwByStep);
+         getPrereqStatesForConstructionSteps(prereqStepIdxs, s, rwByStep, nestedStepParentIdx);
       llvm::DenseSet<mlir::Value> prereqSeen;
       for (auto pv : prereqs) prereqSeen.insert(pv);
       for (int si : prereqStepIdxs) {
@@ -1921,9 +2220,9 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       }
    }
 
-   // Debug helper: print eligible optimistic_ht_fragment-like profiles per query (capped).
+   // Debug helper: print eligible optimistic_ht-related profiles per query (capped).
    {
-      os << "\n// ==== debug: eligible optimistic_ht_fragment profiles (capped) ====\n";
+      os << "\n// ==== debug: eligible optimistic_ht profiles (capped) ====\n";
       size_t cap = 20;
       for (auto& m : models) {
          size_t printedDbg = 0;
@@ -1932,7 +2231,7 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
             llvm::raw_string_ostream tss(ty);
             p.value.getType().print(tss);
             tss.flush();
-            if (ty.find("optimistic_ht_fragment") == std::string::npos) continue;
+            if (ty.find("optimistic_ht") == std::string::npos) continue;
 
             std::string deps = joinSortedStrings(p.depTokensSorted);
             os << "//   query[" << m.id << "] ";
@@ -2059,11 +2358,24 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
    return out;
 }
 
+void forEachShadowChainPredecessor(mlir::Value v, const ModuleReuseInfo& reuse,
+                                   llvm::function_ref<void(mlir::Value)> fn) {
+   forEachShadowChainPredecessorValue(canonicalizeStateValueForReuse(v), reuse.mergedFromShadowState, fn);
+}
+
+mlir::Value hashIndexedViewShadowingBuffer(mlir::Value mergedGlobalBuffer, const ModuleReuseInfo& reuse) {
+   mergedGlobalBuffer = canonicalizeStateValueForReuse(mergedGlobalBuffer);
+   for (auto& kv : reuse.mergedFromShadowState) {
+      if (kv.second != mergedGlobalBuffer) continue;
+      if (mlir::isa<subop::HashIndexedViewType>(kv.first.getType())) return kv.first;
+   }
+   return {};
+}
+
 mlir::Value bufferJoinChainRootForReuse(mlir::Value v, const ModuleReuseInfo& reuse) {
    v = canonicalizeStateValueForReuse(v);
-   if (auto it = reuse.mergedBufferToHashIndexedView.find(v); it != reuse.mergedBufferToHashIndexedView.end()) {
-      return it->second;
-   }
+   if (mlir::isa<subop::HashIndexedViewType>(v.getType())) return v;
+   if (mlir::Value hiv = hashIndexedViewShadowingBuffer(v, reuse)) return hiv;
    return v;
 }
 
@@ -2073,11 +2385,8 @@ mlir::Value resolveCacheTargetStateForReuse(mlir::Value v, const ModuleReuseInfo
 
 bool isBufferJoinChainNonRootPartner(mlir::Value v, const ModuleReuseInfo& reuse) {
    v = canonicalizeStateValueForReuse(v);
-   if (reuse.mergedBufferToHashIndexedView.contains(v)) return true;
-   if (auto itG = reuse.hashIndexedViewFromMergedBuffer.find(v); itG != reuse.hashIndexedViewFromMergedBuffer.end()) {
-      if (auto itTL = reuse.mergedFromThreadLocal.find(itG->second); itTL != reuse.mergedFromThreadLocal.end()) {
-         if (itTL->second == v) return true;
-      }
+   for (auto& kv : reuse.mergedFromShadowState) {
+      if (kv.second == v) return true;
    }
    return false;
 }
@@ -2085,27 +2394,8 @@ bool isBufferJoinChainNonRootPartner(mlir::Value v, const ModuleReuseInfo& reuse
 void forEachBufferJoinChainPartner(mlir::Value chainRootBuffer, const ModuleReuseInfo& reuse,
                                    llvm::function_ref<void(mlir::Value)> fn) {
    mlir::Value root = bufferJoinChainRootForReuse(chainRootBuffer, reuse);
-   if (!mlir::isa<subop::BufferType>(root.getType())) return;
-   if (mlir::isa<subop::HashIndexedViewType>(root.getType())) {
-      fn(root);
-      if (auto itG = reuse.hashIndexedViewFromMergedBuffer.find(root); itG != reuse.hashIndexedViewFromMergedBuffer.end()) {
-         fn(itG->second);
-         if (auto itTL = reuse.mergedFromThreadLocal.find(itG->second); itTL != reuse.mergedFromThreadLocal.end()) {
-            fn(itTL->second);
-         }
-      }
-      return;
-   }
-   if (!mlir::isa<subop::BufferType>(root.getType())) return;
-   if (auto itH = reuse.mergedBufferToHashIndexedView.find(root); itH != reuse.mergedBufferToHashIndexedView.end()) {
-      fn(itH->second);
-      fn(root);
-      if (auto itTL = reuse.mergedFromThreadLocal.find(root); itTL != reuse.mergedFromThreadLocal.end()) {
-         fn(itTL->second);
-      }
-      return;
-   }
    fn(root);
+   forEachShadowChainPredecessor(root, reuse, fn);
 }
 
 } // namespace lingodb::compiler::dialect::subop

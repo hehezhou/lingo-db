@@ -237,8 +237,8 @@ void maybeApplyWriteSideFilterPredOnProducerHashmap(
    if (!kEnableReuseStateFilterPredReapply) return;
    if (!mlir::isa<subop::HashMapType>(st.getType())) return;
 
-   auto itTL = reuse.mergedFromThreadLocal.find(st);
-   assert(itTL != reuse.mergedFromThreadLocal.end() && "hashmap merge result must have paired thread_local");
+   auto itTL = reuse.mergedFromShadowState.find(st);
+   assert(itTL != reuse.mergedFromShadowState.end() && "hashmap merge result must have paired thread_local");
    mlir::Value tl = itTL->second;
 
    auto decoded = decodeFiltersForStateFromWriterSteps(tl, reuse, &rwByStepOp);
@@ -273,8 +273,8 @@ void maybePatchJoinBufferWritersWithFilterPred(
       if (!mlir::isa<subop::BufferType>(t.state.getType())) continue;
       auto itF = decodedFiltersByTarget.find(t.state);
       if (itF == decodedFiltersByTarget.end() || itF->second.empty()) continue;
-      auto itTL = findReuseMap(reuse.mergedFromThreadLocal, t.state);
-      if (itTL == reuse.mergedFromThreadLocal.end()) continue;
+      auto itTL = findReuseMap(reuse.mergedFromShadowState, t.state);
+      if (itTL == reuse.mergedFromShadowState.end()) continue;
       auto itW = findReuseMap(reuse.writerStepsByState, itTL->second);
       if (itW == reuse.writerStepsByState.end()) continue;
       for (ExecutionStepOp ws : itW->second) {
@@ -349,16 +349,16 @@ DonorJoinBufferFilterPredPrep maybePrepareDonorJoinBufferFilterPredBeforeClone(
       mlir::Value bufState;
       if (mlir::isa<subop::BufferType>(t.state.getType())) {
          bufState = t.state;
-      } else if (auto itG = reuse0.hashIndexedViewFromMergedBuffer.find(t.state);
-                 itG != reuse0.hashIndexedViewFromMergedBuffer.end()) {
+      } else if (auto itG = reuse0.mergedFromShadowState.find(t.state);
+                 itG != reuse0.mergedFromShadowState.end()) {
          bufState = itG->second;
       } else {
          continue;
       }
       auto itF = decodedFiltersForQ0.find(t.state);
       if (itF == decodedFiltersForQ0.end() || itF->second.empty()) continue;
-      auto itTL = reuse0.mergedFromThreadLocal.find(bufState);
-      if (itTL == reuse0.mergedFromThreadLocal.end()) continue;
+      auto itTL = reuse0.mergedFromShadowState.find(bufState);
+      if (itTL == reuse0.mergedFromShadowState.end()) continue;
       auto itW = reuse0.writerStepsByState.find(itTL->second);
       if (itW == reuse0.writerStepsByState.end()) continue;
       for (ExecutionStepOp ws : itW->second) {
@@ -535,15 +535,15 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
 
       llvm::SmallVector<mlir::Value, 8> statesToDelete;
       statesToDelete.push_back(state);
-      if (auto itG = findReuseMap(reuse.hashIndexedViewFromMergedBuffer, state);
-          itG != reuse.hashIndexedViewFromMergedBuffer.end()) {
+      if (auto itG = findReuseMap(reuse.mergedFromShadowState, state);
+          itG != reuse.mergedFromShadowState.end()) {
          statesToDelete.push_back(itG->second);
-         if (auto itTL = findReuseMap(reuse.mergedFromThreadLocal, itG->second);
-             itTL != reuse.mergedFromThreadLocal.end()) {
+         if (auto itTL = findReuseMap(reuse.mergedFromShadowState, itG->second);
+             itTL != reuse.mergedFromShadowState.end()) {
             statesToDelete.push_back(itTL->second);
          }
-      } else if (auto itTL = findReuseMap(reuse.mergedFromThreadLocal, state);
-                 itTL != reuse.mergedFromThreadLocal.end()) {
+      } else if (auto itTL = findReuseMap(reuse.mergedFromShadowState, state);
+                 itTL != reuse.mergedFromShadowState.end()) {
          statesToDelete.push_back(itTL->second);
       }
 
@@ -784,10 +784,6 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    for (auto& t : targets1) {
       resyncConsumerCachedHivCarrierTypesFromCacheGet(query1, t.cacheKey);
    }
-
-   if (res.query0) syncProbeGatherMappingsInModule(*res.query0);
-   syncProbeGatherMappingsInModule(query0);
-   syncProbeGatherMappingsInModule(query1);
 
    return res;
 }

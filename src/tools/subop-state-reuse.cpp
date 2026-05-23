@@ -497,6 +497,18 @@ int main(int argc, char** argv) {
          }
       }
    }
+   const char* dumpSubOpDir = std::getenv("LINGODB_DUMP_SUBOP_DIR");
+   if (dumpSubOpDir) {
+      const std::string base(dumpSubOpDir);
+      auto dumpPlan = [&](mlir::ModuleOp mod, llvm::StringRef scenarioDir) {
+         const std::string dir = (base + "/" + scenarioDir).str();
+         llvm::sys::fs::create_directories(dir);
+         dumpModuleToFile(mod, dir + "/consumer-subop.mlir");
+      };
+      dumpPlan(runs[0].module, "plan-query0-test.sql");
+      dumpPlan(runs[1].module, "plan-query1-test2.sql");
+   }
+
    auto tRewrite = std::chrono::high_resolution_clock::now();
    auto rewriteRes = lingodb::compiler::dialect::subop::rewritePlansWithSyntheticQuery0(
       runs[0].module, runs[1].module, firstPair);
@@ -506,7 +518,6 @@ int main(int argc, char** argv) {
                   << " query[1]=" << rewriteRes.numTargetsQuery1 << "\n";
    llvm::outs() << "\n// reuse_targets_q0_mapped: " << rewriteRes.numTargetsQuery0Mapped << "\n";
 
-   const char* dumpSubOpDir = std::getenv("LINGODB_DUMP_SUBOP_DIR");
    // With `LINGODB_DUMP_SUBOP_DIR`, replay lowering into `snapshots/` by default.
    // Set `LINGODB_DUMP_LOWERING=0` to write only `consumer-subop.mlir`.
    const char* dumpLoweringEnv = std::getenv("LINGODB_DUMP_LOWERING");

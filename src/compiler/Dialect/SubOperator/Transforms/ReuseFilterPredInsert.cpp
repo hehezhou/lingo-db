@@ -1177,8 +1177,8 @@ void collectJoinBufferStatesFromTargets(llvm::ArrayRef<CacheTarget> targets,
       if (mlir::isa<subop::BufferType>(t.state.getType())) {
          buf = t.state;
       } else if (reuse) {
-         if (auto itG = findReuseMap(reuse->hashIndexedViewFromMergedBuffer, t.state);
-             itG != reuse->hashIndexedViewFromMergedBuffer.end()) {
+         if (auto itG = findReuseMap(reuse->mergedFromShadowState, t.state);
+             itG != reuse->mergedFromShadowState.end()) {
             buf = itG->second;
          }
       }
@@ -2028,14 +2028,14 @@ decodeFiltersByCacheTargets(llvm::ArrayRef<CacheTarget> targets, const ModuleReu
    for (auto& t : targets) {
       if (!t.state) continue;
       mlir::Value filterSeed = t.state;
-      if (auto itG = findReuseMap(reuse.hashIndexedViewFromMergedBuffer, t.state);
-          itG != reuse.hashIndexedViewFromMergedBuffer.end()) {
+      if (auto itG = findReuseMap(reuse.mergedFromShadowState, t.state);
+          itG != reuse.mergedFromShadowState.end()) {
          filterSeed = itG->second;
       }
       llvm::SmallVector<runtime::FilterDescription, 8> decoded =
          decodeFiltersForStateFromWriterSteps(filterSeed, reuse, &rwByStepOp);
-      if (auto itTL = findReuseMap(reuse.mergedFromThreadLocal, filterSeed);
-          itTL != reuse.mergedFromThreadLocal.end()) {
+      if (auto itTL = findReuseMap(reuse.mergedFromShadowState, filterSeed);
+          itTL != reuse.mergedFromShadowState.end()) {
          auto fromTl = decodeFiltersForStateFromWriterSteps(itTL->second, reuse, &rwByStepOp);
          decoded.append(fromTl.begin(), fromTl.end());
       }
