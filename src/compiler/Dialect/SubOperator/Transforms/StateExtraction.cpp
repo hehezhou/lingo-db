@@ -326,9 +326,10 @@ bool isCreateOnlyExecutionStep(subop::ExecutionStepOp step) {
    return true;
 }
 
-/// Buffer / thread_local carriers: never cross-query reuse targets; deps walk through them to tables.
+/// Buffer / thread_local / sorted_view carriers: never cross-query reuse targets.
 static bool isTransparentDepCarrierType(mlir::Type t) {
    if (mlir::isa<subop::BufferType>(t)) return true;
+   if (mlir::isa<subop::SortedViewType>(t)) return true;
    if (isThreadLocalOfStateType(t)) return true;
    return false;
 }
@@ -484,45 +485,38 @@ llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRW(subop::ExecutionStepOp s
       // `materialize`: always mark state written; skip generic member-intersection (sink vs stream).
       if (auto mat = mlir::dyn_cast<subop::MaterializeOp>(&op)) {
          mlir::Value stv = mat.getState();
-         if (isStateType(stv.getType()) || isThreadLocalOfStateType(stv.getType())) {
-            res[canonicalizeStateValueDeep(stv)].write = true;
-         }
+         assert(isStateType(stv.getType()) || isThreadLocalOfStateType(stv.getType()));
+         res[canonicalizeStateValueDeep(stv)].write = true;
          continue;
       }
-      // `create_hash_indexed_view`: reads source buffer; produces a new hash_indexed_view state.
       if (auto hiv = mlir::dyn_cast<subop::CreateHashIndexedView>(&op)) {
          mlir::Value src = hiv.getSource();
-         if (isStateType(src.getType()) || isThreadLocalOfStateType(src.getType())) {
-            res[canonicalizeStateValueDeep(src)].read = true;
-         }
+         assert(isStateType(src.getType()) || isThreadLocalOfStateType(src.getType()));
+         res[canonicalizeStateValueDeep(src)].read = true;
          mlir::Value out = hiv.getResult();
-         if (isStateType(out.getType()) || isThreadLocalOfStateType(out.getType())) {
-            res[canonicalizeStateValueDeep(out)].write = true;
-         }
+         assert(isStateType(out.getType()) || isThreadLocalOfStateType(out.getType()));
+         res[canonicalizeStateValueDeep(out)].write = true;
          continue;
       }
       if (auto lookup = mlir::dyn_cast<subop::LookupOp>(&op)) {
          mlir::Value st = lookup.getState();
-         if (isStateType(st.getType()) || isThreadLocalOfStateType(st.getType())) {
-            res[canonicalizeStateValueDeep(st)].read = true;
-         }
+         assert(isStateType(st.getType()) || isThreadLocalOfStateType(st.getType()));
+         res[canonicalizeStateValueDeep(st)].read = true;
          continue;
       }
       if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(&op)) {
-         if (auto hiv = findUpstreamLookupHashIndexedView(scanList.getList())) {
-            res[*hiv].read = true;
+         if (std::optional<mlir::Value> hiv = findUpstreamLookupHashIndexedView(scanList.getList())) {
+            res[canonicalizeStateValueDeep(*hiv)].read = true;
          }
          continue;
       }
       if (auto from = mlir::dyn_cast<subop::CreateFrom>(&op)) {
          mlir::Value src = from.getState();
-         if (isStateType(src.getType()) || isThreadLocalOfStateType(src.getType())) {
-            res[canonicalizeStateValueDeep(src)].read = true;
-         }
+         assert(isStateType(src.getType()) || isThreadLocalOfStateType(src.getType()));
+         res[canonicalizeStateValueDeep(src)].read = true;
          mlir::Value dst = from.getResult();
-         if (isStateType(dst.getType()) || isThreadLocalOfStateType(dst.getType())) {
-            res[canonicalizeStateValueDeep(dst)].write = true;
-         }
+         assert(isStateType(dst.getType()) || isThreadLocalOfStateType(dst.getType()));
+         res[canonicalizeStateValueDeep(dst)].write = true;
          continue;
       }
       if (auto merge = mlir::dyn_cast<subop::MergeOp>(&op)) {
@@ -802,65 +796,6 @@ static std::optional<mlir::Value> findUpstreamLookupHashIndexedView(mlir::Value 
    return std::nullopt;
 }
 
-static void appendLookupHashIndexedViewSourcePrereqs(mlir::Value v, mlir::Value constructedState,
-                                                   const llvm::DenseMap<mlir::Value, int>& createdAtByState,
-                                                   llvm::DenseSet<mlir::Value>& seen,
-                                                   llvm::SmallVectorImpl<mlir::Value>& out) {
-   if (auto hiv = findUpstreamLookupHashIndexedView(v)) {
-      if (*hiv != constructedState && seen.insert(*hiv).second) out.push_back(*hiv);
-   }
-   auto listTy = mlir::dyn_cast<subop::ListType>(v.getType());
-   if (!listTy) return;
-   auto entryRefTy = mlir::dyn_cast<subop::LookupEntryRefType>(listTy.getT());
-   if (!entryRefTy) return;
-   mlir::Type embeddedStateTy = entryRefTy.getState();
-   for (const auto& it : createdAtByState) {
-      if (it.first == constructedState) continue;
-      if (it.first.getType() != embeddedStateTy) continue;
-      if (seen.insert(it.first).second) out.push_back(it.first);
-      return;
-   }
-}
-
-static bool stepWritesConstructedState(
-   int stepIdx, mlir::Value constructedState,
-   const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep,
-   const llvm::DenseMap<int, int>& nestedStepParentIdx) {
-   int rwStep = effectiveRwStepIndex(stepIdx, nestedStepParentIdx);
-   auto itRw = rwByStep.find(rwStep);
-   if (itRw == rwByStep.end()) return false;
-   mlir::Value selfCanon = canonicalizeStateValueDeep(constructedState);
-   auto itF = itRw->second.find(selfCanon);
-   return itF != itRw->second.end() && itF->second.write;
-}
-
-static void appendConstructionStepPrereqStates(llvm::ArrayRef<int> stepIndices, mlir::Value constructedState,
-                                               const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep,
-                                               const llvm::DenseMap<int, int>& nestedStepParentIdx,
-                                               const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex,
-                                               const llvm::DenseMap<mlir::Value, int>& createdAtByState,
-                                               llvm::DenseSet<mlir::Value>& seen,
-                                               llvm::SmallVectorImpl<mlir::Value>& out) {
-   for (mlir::Value v :
-        getPrereqStatesForConstructionSteps(stepIndices, constructedState, rwByStep, nestedStepParentIdx)) {
-      if (seen.insert(v).second) out.push_back(v);
-   }
-   for (int si : stepIndices) {
-      if (!stepWritesConstructedState(si, constructedState, rwByStep, nestedStepParentIdx)) continue;
-      auto itSt = stepByIndex.find(si);
-      assert(itSt != stepByIndex.end());
-      subop::ExecutionStepOp step = itSt->second;
-      appendNestedStateOperandsAsPrereqs(step, constructedState, seen, out);
-      for (mlir::Value op : step.getOperands()) {
-         appendLookupHashIndexedViewSourcePrereqs(op, constructedState, createdAtByState, seen, out);
-         if (!isStateType(op.getType()) && !isThreadLocalOfStateType(op.getType())) continue;
-         mlir::Value c = canonicalizeStateValueDeep(op);
-         if (c == constructedState) continue;
-         if (seen.insert(c).second) out.push_back(c);
-      }
-   }
-}
-
 static bool isTableStateValue(mlir::Value v) {
    return mlir::isa<subop::TableType>(v.getType());
 }
@@ -955,21 +890,20 @@ struct JoinHivMatchDetails {
 static subop::CreateHashIndexedView findCreateHashIndexedViewForState(
    mlir::Value hiv, const llvm::DenseMap<mlir::Value, llvm::SmallVector<subop::ExecutionStepOp, 8>>& writerStepsByState) {
    auto itW = writerStepsByState.find(hiv);
-   if (itW == writerStepsByState.end()) return {};
+   assert(itW != writerStepsByState.end() && "hash_indexed_view reuse target must have a writer step");
    for (subop::ExecutionStepOp ws : itW->second) {
       subop::CreateHashIndexedView found;
       ws.walk([&](subop::CreateHashIndexedView op) { found = op; });
       if (found) return found;
    }
-   return {};
+   assert(false && "hash_indexed_view must be produced by create_hash_indexed_view");
 }
 
-static std::optional<JoinHivMatchDetails> computeJoinHivMatchDetails(
+static JoinHivMatchDetails computeJoinHivMatchDetails(
    mlir::Value hiv, subop::HashIndexedViewType hivTy, subop::MemberManager& mm,
    lingodb::compiler::dialect::tuples::ColumnManager& columnManager,
    const llvm::DenseMap<mlir::Value, llvm::SmallVector<subop::ExecutionStepOp, 8>>& writerStepsByState) {
    subop::CreateHashIndexedView chiv = findCreateHashIndexedViewForState(hiv, writerStepsByState);
-   if (!chiv) return std::nullopt;
 
    JoinHivMatchDetails details;
    details.storedValueMembersFingerprint =
@@ -996,8 +930,8 @@ static std::optional<JoinHivMatchDetails> computeJoinHivMatchDetails(
    if (joinValueMember) {
       auto joinValueSanitized = sanitizeMemberSlotName(mm.getName(joinValueMember));
       auto itW = writerStepsByState.find(hiv);
-      if (itW != writerStepsByState.end()) {
-         for (subop::ExecutionStepOp ws : itW->second) {
+      assert(itW != writerStepsByState.end());
+      for (subop::ExecutionStepOp ws : itW->second) {
             ws.walk([&](subop::MaterializeOp mat) {
                if (!mlir::isa<subop::BufferType>(mat.getState().getType())) return;
                for (auto& [member, colRef] : mat.getMapping().getMapping()) {
@@ -1014,7 +948,6 @@ static std::optional<JoinHivMatchDetails> computeJoinHivMatchDetails(
                   recordJoinKeyColumnHash(scope, name, colDef.getColumn().type);
                }
             });
-         }
       }
    }
 
@@ -1089,20 +1022,18 @@ struct StepDagHasher {
    }
 
    uint64_t hashExternalLeaf(mlir::Value v) {
+      assert(tableDescrByTableState);
+      if (auto it = tableDescrByTableState->find(v); it != tableDescrByTableState->end()) {
+         uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(it->second)));
+         h = hashCombineU64(h, hashMlirType(v.getType()));
+         return h;
+      }
       if (relaxJoinPayloadColumns && externalDatasourceByTableState) {
-         if (auto it = externalDatasourceByTableState->find(v); it != externalDatasourceByTableState->end()) {
-            return static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(it->second.tableName)));
+         if (auto itDs = externalDatasourceByTableState->find(v); itDs != externalDatasourceByTableState->end()) {
+            return static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(itDs->second.tableName)));
          }
       }
-      // Treat external tables as stable leaves keyed by GetExternal descr + type.
-      if (tableDescrByTableState) {
-         if (auto it = tableDescrByTableState->find(v); it != tableDescrByTableState->end()) {
-            uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(it->second)));
-            h = hashCombineU64(h, hashMlirType(v.getType()));
-            return h;
-         }
-      }
-      // Fallback: type-only leaf.
+      assert(!isTableStateValue(v) && "module table state must have GetExternal descr");
       return hashMlirType(v.getType());
    }
 
@@ -1322,6 +1253,9 @@ std::string fingerprintMemberTypesMultiset(subop::MemberManager& mm, llvm::Array
 // Fingerprint SubOp "state-like" types in a way that is stable across separate compilations of the same SQL.
 // (MemberManager assigns unique `$<id>` suffixes that differ per MLIRContext/module.)
 std::string normalizedSubopStateTypeFingerprint(subop::MemberManager& mm, mlir::Type t) {
+   assert(!mlir::isa<subop::HashIndexedViewType>(t) &&
+          "hash_indexed_view must use normalizedHashIndexedViewTypeFingerprintForJoinMatch");
+   assert(!isTransparentDepCarrierType(t) && "transparent states are not reuse match targets");
    if (auto rt = mlir::dyn_cast<subop::ResultTableType>(t)) {
       // Ignore compiler-chosen member names: only the multiset of member types matters for cross-module matching.
       return std::string("result_table{types=") + fingerprintMemberTypesMultiset(mm, rt.getMembers().getMembers()) + "}";
@@ -1370,32 +1304,12 @@ std::string normalizedSubopStateTypeFingerprint(subop::MemberManager& mm, mlir::
       return std::string("table{members=") + fingerprintSortedMemberPairs(mm, tbl.getMembers().getMembers()) +
              ",filtered=" + (tbl.getFiltered() ? "1" : "0") + "}";
    }
-   if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(t)) {
-      return std::string("thread_local{") + normalizedSubopStateTypeFingerprint(mm, tl.getWrapped()) + "}";
+   if (auto heap = mlir::dyn_cast<subop::HeapType>(t)) {
+      return std::string("heap{members=") + fingerprintSortedMemberPairs(mm, heap.getMembers().getMembers()) +
+             ",max=" + std::to_string(heap.getMaxElements()) + "}";
    }
-   // Generic fallback for other subop state types: use the printed type form but normalize
-   // compiler-generated suffixes (e.g. "$<id>" and "_u_<id>") so that identical SQL compiled
-   // in different MLIRContexts can still match.
-   std::string s = typeFingerprint(t);
-   std::string out;
-   out.reserve(s.size());
-   for (size_t i = 0; i < s.size();) {
-      if (s[i] == '$') {
-         out.push_back('$');
-         i++;
-         while (i < s.size() && s[i] >= '0' && s[i] <= '9') i++;
-         continue;
-      }
-      if (i + 3 < s.size() && s[i] == '_' && s[i + 1] == 'u' && s[i + 2] == '_') {
-         out.append("_u_");
-         i += 3;
-         while (i < s.size() && s[i] >= '0' && s[i] <= '9') i++;
-         continue;
-      }
-      out.push_back(s[i]);
-      i++;
-   }
-   return out;
+   std::string ty = typeFingerprint(t);
+   llvm_unreachable((std::string("unsupported state type for cross-query reuse matching: ") + ty).c_str());
 }
 
 llvm::DenseMap<mlir::Value, std::string> buildTableDescrByTableState(mlir::ModuleOp moduleOp) {
@@ -1436,17 +1350,6 @@ struct StateMatchProfile {
 struct ModuleStepRwAnalysis {
    llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>> rwByStep;
    llvm::DenseMap<int, int> nestedStepParentIdx;
-};
-
-/// Phase 3 output for one reuse candidate.
-struct StateReuseEligibility {
-   StateDepEligibility depGraph;
-   bool multiWriteInConstruction = false;
-   bool hasWriterOrIsMergeResult = false;
-
-   bool isEligibleForReuse() const {
-      return depGraph.eligible && !multiWriteInConstruction && hasWriterOrIsMergeResult;
-   }
 };
 
 /// Phase 4 output: construction / type fingerprints (only computed for eligible states).
@@ -1529,8 +1432,8 @@ static void registerModuleExecutionSteps(mlir::ModuleOp moduleOp, ModuleMatchAnd
          }
          for (mlir::Value r : keys) {
             mlir::Value key = canonicalizeStateValueDeep(r);
-            if (!a.reuse.createOnlyStepForState.contains(key)) a.reuse.createOnlyStepForState.insert({key, step});
-            if (key != r && !a.reuse.createOnlyStepForState.contains(r)) a.reuse.createOnlyStepForState.insert({r, step});
+            auto [it, inserted] = a.reuse.createOnlyStepForState.try_emplace(key, step);
+            assert(inserted || it->second == step);
          }
       }
    });
@@ -1594,8 +1497,8 @@ static void finalizeModuleMatchAnalysis(mlir::ModuleOp moduleOp, ModuleMatchAndR
    moduleOp.walk([&](subop::CreateHashIndexedView chiv) {
       mlir::Value globalBuf = canonicalizeStateValueDeep(chiv.getSource());
       mlir::Value hiv = canonicalizeStateValueDeep(chiv.getResult());
-      if (!mlir::isa<subop::BufferType>(globalBuf.getType())) return;
-      if (!mlir::isa<subop::HashIndexedViewType>(hiv.getType())) return;
+      assert(mlir::isa<subop::BufferType>(globalBuf.getType()));
+      assert(mlir::isa<subop::HashIndexedViewType>(hiv.getType()));
       if (mlir::Value existing = hashIndexedViewShadowingBuffer(globalBuf, a.reuse)) {
          assert(existing == hiv && "each join buffer must feed at most one hash_indexed_view in a serial chain");
       }
@@ -1612,23 +1515,8 @@ static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp 
    return a;
 }
 
-static llvm::DenseSet<mlir::Value> shadowChainPartnerStates(const ModuleMatchAndReuseAnalysis& a) {
-   llvm::DenseSet<mlir::Value> partners;
-   for (auto& kv : a.mergedFromShadowState) partners.insert(kv.second);
-   return partners;
-}
-
-static llvm::DenseSet<mlir::Value> bufferJoinChainBufferPartnerStates(const ModuleMatchAndReuseAnalysis& a) {
-   llvm::DenseSet<mlir::Value> partners;
-   for (auto& kv : a.reuse.mergedFromShadowState) {
-      if (mlir::isa<subop::HashIndexedViewType>(kv.first.getType())) partners.insert(kv.second);
-   }
-   return partners;
-}
-
 static llvm::SmallVector<mlir::Value, 64> collectReuseCandidateStates(mlir::ModuleOp moduleOp,
                                                                     const ModuleMatchAndReuseAnalysis& a) {
-   llvm::DenseSet<mlir::Value> shadowPartners = shadowChainPartnerStates(a);
    llvm::SmallVector<mlir::Value, 64> candidates;
    moduleOp.walk([&](subop::ExecutionStepOp step) {
       for (mlir::Value r : step.getResults()) {
@@ -1636,7 +1524,6 @@ static llvm::SmallVector<mlir::Value, 64> collectReuseCandidateStates(mlir::Modu
          auto itCreated = a.createdAtByState.find(r);
          assert(itCreated != a.createdAtByState.end() && "execution_step state result must be tracked");
          if (itCreated->second < 0) continue;
-         if (shadowPartners.contains(r)) continue;
          if (isTransparentDepCarrierType(r.getType())) continue;
          candidates.push_back(r);
       }
@@ -1661,40 +1548,38 @@ static bool constructionStepHasMultipleWrites(int stepIdx, const ModuleStepRwAna
    return false;
 }
 
-/// Phase 3: dependency-graph eligibility plus structural reuse constraints.
-static StateReuseEligibility determineStateReuseEligibility(
+/// Phase 3: dependency-graph eligibility plus single-write construction constraint.
+static bool determineStateReuseEligibility(
    mlir::Value state, const StateDependencyGraph& depGraph,
    llvm::ArrayRef<int> constructionStepIndices, const ModuleStepRwAnalysis& stepRw,
    const ModuleMatchAndReuseAnalysis& module,
-   const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState) {
+   const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState,
+   StateDepEligibility& outDep) {
    mlir::Value stateCanon = canonicalizeStateValueDeep(state);
    assert(!isTransparentDepCarrierType(stateCanon.getType()) && "transparent states are never reuse targets");
+   assert(!module.writesByState.lookup(stateCanon).empty() &&
+          "reuse candidate must be constructed in at least one execution_step");
 
-   StateReuseEligibility out;
-   out.depGraph = evaluateStateDepEligibility(stateCanon, depGraph, tableDescrByTableState);
+   outDep = evaluateStateDepEligibility(stateCanon, depGraph, tableDescrByTableState);
+   if (!outDep.eligible) return false;
 
    for (int si : constructionStepIndices) {
-      if (constructionStepHasMultipleWrites(si, stepRw)) {
-         out.multiWriteInConstruction = true;
-         break;
-      }
+      if (constructionStepHasMultipleWrites(si, stepRw)) return false;
    }
-
-   bool hasWriter = module.reuse.writerStepsByState.contains(state);
-   bool isMergeResult = module.mergedFromShadowState.contains(state);
-   out.hasWriterOrIsMergeResult = hasWriter || isMergeResult;
-   return out;
+   return true;
 }
 
-/// Phase 4: construction hash and type fingerprint (call only when `StateReuseEligibility::isEligibleForReuse()`).
+/// Phase 4: construction hash and type fingerprint (eligible states only).
 static StateConstructionMatchHashes computeEligibleStateMatchHashes(
    mlir::Value state, llvm::ArrayRef<int> constructionStepIndices, const ModuleMatchAndReuseAnalysis& module,
    const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState, subop::MemberManager& memberManager,
    lingodb::compiler::dialect::tuples::ColumnManager& columnManager) {
+   const bool isHiv = mlir::isa<subop::HashIndexedViewType>(state.getType());
    std::optional<JoinHivMatchDetails> joinHivDetails;
-   if (auto hivTy = mlir::dyn_cast<subop::HashIndexedViewType>(state.getType())) {
-      joinHivDetails =
-         computeJoinHivMatchDetails(state, hivTy, memberManager, columnManager, module.reuse.writerStepsByState);
+   if (isHiv) {
+      joinHivDetails.emplace(computeJoinHivMatchDetails(
+         state, mlir::cast<subop::HashIndexedViewType>(state.getType()), memberManager, columnManager,
+         module.reuse.writerStepsByState));
    }
 
    llvm::SmallVector<uint64_t, 16> stepHashes;
@@ -1726,6 +1611,7 @@ static StateConstructionMatchHashes computeEligibleStateMatchHashes(
          memberManager, mlir::cast<subop::HashIndexedViewType>(state.getType()), *joinHivDetails);
       hashes.storedValueMembersFingerprint = joinHivDetails->storedValueMembersFingerprint;
    } else {
+      assert(!isHiv);
       hashes.typeFingerprintStr = normalizedSubopStateTypeFingerprint(memberManager, state.getType());
    }
    return hashes;
@@ -1748,34 +1634,26 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
    // Phase 2: same-step RW → state dependency DAG.
    StateDependencyGraph depGraph = buildStateDependencyGraphFromStepRw(stepRw.rwByStep);
 
-   llvm::DenseSet<mlir::Value> shadowPartners = shadowChainPartnerStates(module);
-   llvm::DenseSet<mlir::Value> bufferJoinPartners = bufferJoinChainBufferPartnerStates(module);
    llvm::SmallVector<mlir::Value, 64> candidates = collectReuseCandidateStates(moduleOp, module);
 
    llvm::SmallVector<StateMatchProfile, 128> profiles;
    profiles.reserve(candidates.size());
 
    for (mlir::Value state : candidates) {
-      if (shadowPartners.contains(state)) continue;
-      if (bufferJoinPartners.contains(state)) continue;
-
-      mlir::Value stateCanon = canonicalizeStateValueDeep(state);
       auto constructionStepIndices = getConstructionStepIndicesForState(
-         stateCanon, module.createdAtByState, module.writesByState, module.mergedFromShadowState,
-         &stepRw.nestedStepParentIdx);
+         canonicalizeStateValueDeep(state), module.createdAtByState, module.writesByState,
+         module.mergedFromShadowState, &stepRw.nestedStepParentIdx);
 
-      // Phase 3
-      StateReuseEligibility eligibility = determineStateReuseEligibility(
-         state, depGraph, constructionStepIndices, stepRw, module, tableDescrByTableState);
+      StateDepEligibility depElig;
+      bool eligible = determineStateReuseEligibility(
+         state, depGraph, constructionStepIndices, stepRw, module, tableDescrByTableState, depElig);
 
       StateMatchProfile prof;
       prof.queryId = queryId;
       prof.value = state;
-      prof.eligible = eligibility.isEligibleForReuse();
-      prof.depTokensSorted.assign(eligibility.depGraph.depTokensSorted.begin(),
-                                  eligibility.depGraph.depTokensSorted.end());
+      prof.eligible = eligible;
+      prof.depTokensSorted.assign(depElig.depTokensSorted.begin(), depElig.depTokensSorted.end());
 
-      // Phase 4 (eligible states only)
       if (prof.eligible) {
          StateConstructionMatchHashes hashes = computeEligibleStateMatchHashes(
             state, constructionStepIndices, module, tableDescrByTableState, memberManager,
@@ -1784,7 +1662,8 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
          prof.constructionHash = hashes.constructionHash;
          prof.typeFingerprintStr = std::move(hashes.typeFingerprintStr);
          prof.storedValueMembersFingerprint = std::move(hashes.storedValueMembersFingerprint);
-         if (!prof.storedValueMembersFingerprint.empty()) {
+         if (mlir::isa<subop::HashIndexedViewType>(state.getType())) {
+            assert(!prof.storedValueMembersFingerprint.empty());
             module.reuse.joinBuildStoredValueMembersByState[state] = prof.storedValueMembersFingerprint;
          }
       }
@@ -2189,11 +2068,8 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
    }
 
    os << "\n// ==== cross-query state matches (experimental) ====\n";
-   os << "// rules: construction-step read deps may only be external tables (matched by GetExternal descr)\n";
-   os << "// and/or result_table values (matched by a member/type shape fingerprint that ignores `$id` suffixes).\n";
-   os << "// States with any other prereq state are skipped.\n";
-   os << "// Match key: sorted dep tokens + construction fingerprints + result type fingerprint.\n";
-   os << "// Match key: sorted dep tokens + constructionHash + result type fingerprint.\n";
+   os << "// Eligible states: deps resolve to external tables only (via transparent carriers), constructionHash + type_fp match.\n";
+   os << "// Special cases: transparent buffer/thread_local (dep carriers); hash_indexed_view (join match details).\n";
 
    // Debug helper: print eligible join hash_indexed_view profiles per query (capped).
    {
