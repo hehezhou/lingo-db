@@ -312,85 +312,12 @@ void applyFilterPredReapplyAfterCacheGetReplacement(
       }
    }
 
-   // HIV probe `filter_pred` filters are inserted after layout propagation via
-   // `applyJoinBufferProbePredFiltersAfterLayout` (see `injectCacheGetsAndDeleteConstructionSteps`
-   // and `rewritePlansWithSyntheticQuery0`).
+   // HIV probe `filter_pred` filters are inserted after consumer layout align via
+   // `applyProbePredFiltersForConsumerClosures` (see `rewritePlansWithSyntheticQuery0`).
    (void)isJoinBuf;
    (void)isJoinHiv;
    (void)joinBufPredProbeInjectedGroups;
    (void)predMember;
-}
-
-struct DonorJoinBufferFilterPredPrep {
-   bool layoutApplied = false;
-   bool writePredApplied = false;
-   llvm::SmallVector<mlir::Value, 8> extendBufStates;
-};
-
-/// Mutate donor query0 before cloning so synthetic steps carry write-side `filter_pred$0`.
-DonorJoinBufferFilterPredPrep maybePrepareDonorJoinBufferFilterPredBeforeClone(
-   mlir::ModuleOp query0, llvm::ArrayRef<CacheTarget> targets0, const ModuleReuseInfo& reuse0,
-   llvm::ArrayRef<ExecutionStepOp> stepsToClone,
-   const llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>>& decodedFiltersForQ0) {
-   DonorJoinBufferFilterPredPrep prep;
-   if (!kEnableReuseStateFilterPredReapply) return prep;
-
-   llvm::SmallVector<mlir::Value, 8> bufferCandidates;
-   collectJoinBufferStatesFromTargets(targets0, bufferCandidates, &reuse0);
-   prep.extendBufStates = collectJoinBuffersFeedingHashIndexedView(bufferCandidates, reuse0);
-   if (prep.extendBufStates.empty()) return prep;
-
-   rewriteHashmapTypesInModule(query0, prep.extendBufStates, &reuse0);
-   prep.layoutApplied = true;
-
-   llvm::DenseSet<mlir::Operation*> stepSet;
-   for (ExecutionStepOp s : stepsToClone) stepSet.insert(s.getOperation());
-   for (auto& t : targets0) {
-      mlir::Value bufState;
-      if (mlir::isa<subop::BufferType>(t.state.getType())) {
-         bufState = t.state;
-      } else if (auto itG = reuse0.mergedFromShadowState.find(t.state);
-                 itG != reuse0.mergedFromShadowState.end()) {
-         bufState = itG->second;
-      } else {
-         continue;
-      }
-      auto itF = decodedFiltersForQ0.find(t.state);
-      if (itF == decodedFiltersForQ0.end() || itF->second.empty()) continue;
-      auto itTL = reuse0.mergedFromShadowState.find(bufState);
-      if (itTL == reuse0.mergedFromShadowState.end()) continue;
-      auto itW = reuse0.writerStepsByState.find(itTL->second);
-      if (itW == reuse0.writerStepsByState.end()) continue;
-      for (ExecutionStepOp ws : itW->second) {
-         if (!stepSet.contains(ws.getOperation())) continue;
-         bool hasBufMat = false;
-         ws.getOperation()->walk([&](subop::MaterializeOp m) {
-            if (mlir::isa<subop::BufferType>(m.getState().getType())) hasBufMat = true;
-         });
-         if (!hasBufMat) continue;
-         insertWriteSidePredIntoBufferConstructionStep(ws, itF->second);
-      }
-   }
-   prep.writePredApplied = true;
-   return prep;
-}
-
-void maybeApplySyntheticProducerFilterPredGatherSteps(mlir::ModuleOp synthetic,
-                                                      llvm::ArrayRef<mlir::Value> extendBufStates) {
-   if (!kEnableReuseStateFilterPredReapply || extendBufStates.empty()) return;
-   ensureJoinBufferFilterPredMaterializeMappings(synthetic);
-   subop::Member predMember = makeOrGetPredMember(synthetic.getContext());
-   ExecutionGroupOp eg = getSingleExecutionGroup(synthetic);
-   for (mlir::Operation& op : eg.getSubOps().front()) {
-      if (auto step = mlir::dyn_cast<ExecutionStepOp>(&op)) {
-         insertHashIndexedViewGatherPredFilters(step, predMember);
-      }
-   }
-}
-
-void maybeEnsureJoinBufferFilterPredMaterializeMappings(mlir::ModuleOp module) {
-   if (!kEnableReuseStateFilterPredReapply) return;
-   ensureJoinBufferFilterPredMaterializeMappings(module);
 }
 
 } // namespace
@@ -692,19 +619,7 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       collectCreateAndWriteStepsForStates(donorGroup, reuse0, neededStates);
    stepsToClone = augmentStepsWithOperandProducerClosure(donorGroup, stepsToClone);
 
-   auto decodedFiltersForQ0 = maybeDecodeFiltersByCacheTargets(targets0, reuse0);
-   DonorJoinBufferFilterPredPrep donorFilterPredPrep = maybePrepareDonorJoinBufferFilterPredBeforeClone(
-      query0, targets0, reuse0, stepsToClone, decodedFiltersForQ0);
-
    auto mapping = cloneExecutionStepsToQuery0(q0Group, stepsToClone);
-
-   // Cloned synthetic IR still needs join-buffer / HIV `filter_pred$0` layout (applied on donor only
-   // before clone).
-   if (donorFilterPredPrep.layoutApplied && !donorFilterPredPrep.extendBufStates.empty()) {
-      auto reuseSynthetic = collectModuleReuseInfo(*res.query0);
-      rewriteHashmapTypesInModule(*res.query0, donorFilterPredPrep.extendBufStates, &reuseSynthetic);
-      maybeFinalizeModuleAfterJoinBufferFilterPredLayout(*res.query0);
-   }
 
    // Map targets into query0.
    llvm::SmallVector<CacheTarget, 64> targetsQ0;
@@ -730,20 +645,15 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       return res;
    }
 
-   // Write-side predicate materialization on the synthetic producer (scan → map filter_pred → buffer).
-   {
-      auto reuseSynthetic = collectModuleReuseInfo(*res.query0);
-      auto decodedSynthFilters = maybeDecodeFiltersByCacheTargets(targetsQ0, reuseSynthetic);
-      maybePatchJoinBufferWritersWithFilterPred(targetsQ0, decodedSynthFilters, reuseSynthetic);
-      maybeEnsureJoinBufferFilterPredMaterializeMappings(*res.query0);
-   }
+   auto reuseSynthetic = collectModuleReuseInfo(*res.query0);
+   ClonedJoinBufferBuildSitesByKey joinBuildSites =
+      recordClonedJoinBufferBuildSites(*res.query0, targetsQ0, reuseSynthetic);
 
    CachedJoinBufferLayoutsByKey producerLayoutsByKey;
    extendSyntheticJoinBuffersToColumnUnion(*res.query0, query0, query1, matches, targetsQ0, mapping,
                                            &producerLayoutsByKey);
-   patchSyntheticJoinBufferFilterPredsFromMatchedQueries(*res.query0, query0, query1, matches, targetsQ0,
-                                                         producerLayoutsByKey);
-   maybeEnsureJoinBufferFilterPredMaterializeMappings(*res.query0);
+   insertSyntheticFilterPredsAfterColumnUnion(*res.query0, query0, query1, matches, targetsQ0, producerLayoutsByKey,
+                                              joinBuildSites);
 
    // Producer: cache_puts (cloned synthetic IR — needs its own reuse snapshot).
    {
@@ -752,31 +662,28 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       refreshCachedJoinLayoutsFromSyntheticCachePuts(*res.query0, targetsQ0, producerLayoutsByKey);
    }
 
-   injectCacheGetsAndDeleteConstructionSteps(query0, targets0, &reuse0, donorFilterPredPrep.layoutApplied,
-                                           donorFilterPredPrep.writePredApplied);
-   injectCacheGetsAndDeleteConstructionSteps(query1, targets1, &reuse1);
+   injectCacheGetsAndDeleteConstructionSteps(query0, targets0, &reuse0, /*joinBufferHashmapLayoutAlreadyApplied=*/true,
+                                           /*joinBufferWritePredAlreadyApplied=*/true);
+   injectCacheGetsAndDeleteConstructionSteps(query1, targets1, &reuse1, /*joinBufferHashmapLayoutAlreadyApplied=*/true,
+                                           /*joinBufferWritePredAlreadyApplied=*/true);
 
-   maybeEnsureJoinBufferFilterPredMaterializeMappings(query0);
-   maybeEnsureJoinBufferFilterPredMaterializeMappings(query1);
-   propagateSubOpColumnAttrsFromSsaStateLayout(query0, nullptr);
-   propagateSubOpColumnAttrsFromSsaStateLayout(query1, nullptr);
-   propagateSubOpColumnAttrsFromSsaStateLayout(*res.query0, nullptr);
+   llvm::SmallVector<ConsumerCacheGetProbeClosure, 4> probeClosuresQ0;
+   llvm::SmallVector<ConsumerCacheGetProbeClosure, 4> probeClosuresQ1;
 
    for (auto& t : targets0) {
       if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
-         alignConsumerModulesToCachedJoinLayout(query0, it->second, t.cacheKey, 0);
+         alignConsumerModulesToCachedJoinLayout(query0, it->second, t.cacheKey, 0, &probeClosuresQ0);
       }
    }
    for (auto& t : targets1) {
       if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
-         alignConsumerModulesToCachedJoinLayout(query1, it->second, t.cacheKey, 1);
+         alignConsumerModulesToCachedJoinLayout(query1, it->second, t.cacheKey, 1, &probeClosuresQ1);
       }
    }
 
    if (kEnableReuseStateFilterPredReapply) {
-      applyJoinBufferProbePredFiltersAfterLayout(query0);
-      applyJoinBufferProbePredFiltersAfterLayout(query1);
-      if (res.query0) applyJoinBufferProbePredFiltersAfterLayout(*res.query0);
+      applyProbePredFiltersForConsumerClosures(query0, probeClosuresQ0);
+      applyProbePredFiltersForConsumerClosures(query1, probeClosuresQ1);
    }
    for (auto& t : targets0) {
       resyncConsumerCachedHivCarrierTypesFromCacheGet(query0, t.cacheKey);

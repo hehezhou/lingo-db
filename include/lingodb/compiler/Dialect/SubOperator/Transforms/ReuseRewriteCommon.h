@@ -16,6 +16,17 @@ struct CacheTarget {
    uint64_t cacheKey;
 };
 
+/// Cloned synthetic join-buffer build site (table \c scan_refs → \c materialize into buffer), recorded after
+/// \c cloneExecutionStepsToQuery0 for post–column-union \c filter_pred insertion.
+struct ClonedJoinBufferBuildSite {
+   uint64_t cacheKey = 0;
+   mlir::Value syntheticHiv;
+   mlir::Value syntheticMergedBuffer;
+   subop::ExecutionStepOp syntheticBuildStep;
+};
+
+using ClonedJoinBufferBuildSitesByKey = llvm::DenseMap<uint64_t, ClonedJoinBufferBuildSite>;
+
 bool isPipelineStateValue(mlir::Value v);
 
 mlir::Value peelBlockArgsToEnclosingOperands(mlir::Value v);

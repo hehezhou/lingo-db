@@ -1392,7 +1392,8 @@ static subop::GatherOp insertFilterColumnGatherRightAfterScan(
          }
       }
       assert(mem && "write_pred: could not find table member for filter column");
-      tuples::ColumnDefAttr def = cm.createDef("reuse_write_pred", f.columnName);
+      std::string scope = cm.getUniqueScope("reuse_write_pred_col");
+      tuples::ColumnDefAttr def = cm.createDef(scope, f.columnName);
       def.getColumn().type = mm.getType(mem);
       mappingPairs.push_back({mem, def});
    }
@@ -1849,9 +1850,8 @@ static bool probeScanStreamAlreadyPredFiltered(mlir::Value scanStream) {
    return false;
 }
 
-/// Insert `gather filter_pred` + `filter(all_true)` immediately after a scan producer (`scan_refs` / `scan_list`).
-static void insertProbePredGatherFilterAfterScanProducer(mlir::Operation* anchorOp, mlir::Value scanStream,
-                                                         tuples::ColumnRefAttr entryRef, subop::Member predMember) {
+void insertProbePredFilterImmediatelyAfterScanProducer(mlir::Operation* anchorOp, mlir::Value scanStream,
+                                                       tuples::ColumnRefAttr entryRef, subop::Member predMember) {
    if (probeScanStreamAlreadyPredFiltered(scanStream)) return;
 
    auto* ctx = anchorOp->getContext();
@@ -1899,7 +1899,7 @@ void insertScanRefsPredFilter(ExecutionStepOp step, subop::Member predMember) {
    auto* ctx = step.getContext();
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    tuples::ColumnRefAttr entryRef = cm.createRef(&scanOp.getRef().getColumn());
-   insertProbePredGatherFilterAfterScanProducer(scanOp.getOperation(), scanOp.getRes(), entryRef, predMember);
+   insertProbePredFilterImmediatelyAfterScanProducer(scanOp.getOperation(), scanOp.getRes(), entryRef, predMember);
 }
 
 static std::optional<subop::ScanListOp> findHivScanListInStep(subop::ExecutionStepOp step, subop::Member predMember) {
@@ -1926,68 +1926,8 @@ void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member 
    auto* ctx = step.getContext();
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    tuples::ColumnRefAttr entryRef = cm.createRef(&scanListOp->getElem().getColumn());
-   insertProbePredGatherFilterAfterScanProducer(scanListOp->getOperation(), scanListOp->getRes(), entryRef,
-                                                predMember);
-}
-
-/// Point probe-side `gather` entry refs at the cached HIV layout. When \p closure is null, update all
-/// HIV entry gathers in the module.
-static bool hashIndexedViewSameMemberLayout(subop::HashIndexedViewType a, subop::HashIndexedViewType b) {
-   if (!a || !b) return false;
-   if (a == b) return true;
-   return a.getKeyMembers().getMembers() == b.getKeyMembers().getMembers() &&
-          a.getValueMembers().getMembers() == b.getValueMembers().getMembers() &&
-          a.getCompareHashForLookup() == b.getCompareHashForLookup();
-}
-
-static void syncProbeGatherRefsToCachedHivInClosure(mlir::ModuleOp module, subop::HashIndexedViewType cachedHiv,
-                                                    const llvm::DenseSet<void*>* closure) {
-   auto* ctx = module.getContext();
-   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
-   auto expected = subop::LookupEntryRefType::get(ctx, cachedHiv);
-   module.walk([&](subop::GatherOp gather) {
-      if (closure && !opOperandsOrNestedBlockArgsTouchClosure(gather.getOperation(), *closure)) return;
-      auto gatherRef = gather.getRef();
-      auto [refScope, refLeaf] = cm.getName(&gatherRef.getColumn());
-      (void)refLeaf;
-      if (!refScope.starts_with("lookup_u_")) return;
-      auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(gatherRef.getColumn().type);
-      auto st = ler ? mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState()) : nullptr;
-      if (!st || !hashIndexedViewSameMemberLayout(st, cachedHiv)) return;
-      if (gatherRef.getColumn().type != expected) {
-         gatherRef.getColumn().type = expected;
-         gather.setRefAttr(gatherRef);
-      }
-   });
-}
-
-void applyJoinBufferProbePredFiltersAfterLayout(mlir::ModuleOp module) {
-   if (!kEnableReuseStateFilterPredReapply) return;
-   bool needsProbePred = false;
-   module.walk([&](subop::MaterializeOp mat) {
-      if (getInnerBufferTypeForMaterializeState(mat.getState().getType())) needsProbePred = true;
-   });
-   if (!needsProbePred) {
-      module.walk([&](subop::CacheGetOp get) {
-         if (needsProbePred) return;
-         auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
-         if (findFilterPredMemberOnHashIndexedView(hiv)) needsProbePred = true;
-      });
-   }
-   if (!needsProbePred) return;
-
-   module.walk([&](subop::CacheGetOp get) {
-      auto cachedHiv = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
-      if (!cachedHiv) return;
-      std::optional<subop::Member> predMember = findFilterPredMemberOnHashIndexedView(cachedHiv);
-      if (!predMember) return;
-
-      syncProbeGatherRefsToCachedHivInClosure(module, cachedHiv, /*closure=*/nullptr);
-
-      module.walk([&](subop::ExecutionStepOp step) {
-         insertHashIndexedViewGatherPredFilters(step, *predMember);
-      });
-   });
+   insertProbePredFilterImmediatelyAfterScanProducer(scanListOp->getOperation(), scanListOp->getRes(), entryRef,
+                                                     predMember);
 }
 
 /// Forward walk (uses + `merge` + `execution_step` region args) until we see `subop.create_hash_indexed_view`

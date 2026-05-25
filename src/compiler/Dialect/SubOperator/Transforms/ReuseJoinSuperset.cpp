@@ -57,13 +57,6 @@ static std::string reuseFilterPredSemanticKey(unsigned reuseQueryIndex) {
    return columnSemanticKey(kReuseFilterPredScope, llvm::Twine(reuseQueryIndex).str());
 }
 
-static bool parseReuseFilterPredSemanticKey(llvm::StringRef semanticKey, unsigned& reuseQueryIndex) {
-   size_t sep = semanticKey.find('\x1f');
-   if (sep == llvm::StringRef::npos) return false;
-   if (semanticKey.take_front(sep) != kReuseFilterPredScope) return false;
-   return !semanticKey.drop_front(sep + 1).getAsInteger(10, reuseQueryIndex);
-}
-
 static bool parseFilterPredLayoutSemanticKey(llvm::StringRef semanticKey, unsigned& predIndex) {
    if (parseReuseFilterPredSemanticKey(semanticKey, predIndex)) return true;
    return static_cast<bool>(parseFilterPredMemberSlot(semanticKey));
@@ -1610,17 +1603,6 @@ struct ConsumerCachedHivSites {
    llvm::SmallVector<subop::ScanListOp, 16> scanListsFromTraverse;
 };
 
-/// Per \c cache_get: aligned HIV + SSA closure of all probe-side uses (lists, gathers, nested steps).
-struct ConsumerCacheGetProbeClosure {
-   std::optional<uint64_t> cacheKey;
-   subop::HashIndexedViewType alignedHiv = nullptr;
-   subop::HashIndexedViewType consumerHivBeforeAlign = nullptr;
-   CachedJoinBufferLayout consumerLayout;
-   llvm::DenseSet<void*> ssaClosure;
-   llvm::StringSet<> probeLookupScopes;
-   llvm::SmallVector<subop::ScanListOp, 16> scanListsFromTraverse;
-};
-
 static void traverseConsumerHivUsesFromRoot(mlir::Value root, subop::HashIndexedViewType consumerHiv,
                                             subop::HashIndexedViewType consumerHivBeforeAlign,
                                             const CachedJoinBufferLayout& consumerLayout,
@@ -1846,6 +1828,9 @@ static void alignScanListAndProbeUsesInBlock(subop::ScanListOp scanList, subop::
    scanElem.getColumn().type = expectedLer;
    scanList.setElemAttr(scanElem);
 
+   subop::ListType expectedListTy = subop::ListType::get(ctx, expectedLer);
+   if (scanList.getList().getType() != expectedListTy) scanList.getList().setType(expectedListTy);
+
    debugProbeAlign(dbg, [&](llvm::raw_ostream& os) {
       os << "  scan_list elem_type_after=" << mlirTypeToString(scanElem.getColumn().type);
    });
@@ -2054,12 +2039,14 @@ static void traverseConsumerHivUsesFromRoot(mlir::Value root, subop::HashIndexed
 static ConsumerCacheGetProbeClosure buildConsumerCacheGetProbeClosure(
    mlir::ModuleOp consumer, mlir::Value cacheGetResult, subop::HashIndexedViewType alignedHiv,
    subop::HashIndexedViewType consumerHivBeforeAlign, const CachedJoinBufferLayout& consumerLayout,
-   std::optional<uint64_t> cacheKey) {
+   std::optional<uint64_t> cacheKey, std::optional<unsigned> consumerReuseQueryIndex) {
    ConsumerCacheGetProbeClosure out;
+   out.cacheGetRoot = cacheGetResult;
    out.alignedHiv = alignedHiv;
    out.consumerHivBeforeAlign = consumerHivBeforeAlign;
    out.consumerLayout = consumerLayout;
    out.cacheKey = cacheKey;
+   out.consumerReuseQueryIndex = consumerReuseQueryIndex;
    ConsumerCachedHivSites sites;
    sites.consumerHivBeforeAlign = consumerHivBeforeAlign;
    ProbeAlignDebugCtx traverseDbg;
@@ -2079,6 +2066,18 @@ static ConsumerCacheGetProbeClosure buildConsumerCacheGetProbeClosure(
    return out;
 }
 
+static bool scanListListCarrierSharesAlignedHivKeyLayout(subop::ScanListOp scan,
+                                                         subop::HashIndexedViewType alignedHiv) {
+   auto listTy = mlir::dyn_cast<subop::ListType>(scan.getList().getType());
+   if (!listTy) return false;
+   auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(listTy.getT());
+   if (!ler || !lookupEntryRefEmbedsHashIndexedView(ler)) return false;
+   auto st = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState());
+   if (!st) return false;
+   return st.getCompareHashForLookup() == alignedHiv.getCompareHashForLookup() &&
+          st.getKeyMembers().getMembers().size() == alignedHiv.getKeyMembers().getMembers().size();
+}
+
 static bool scanListReachedFromCacheGetHivTraverse(subop::ScanListOp scan, subop::HashIndexedViewType alignedHiv,
                                                    const ConsumerCacheGetProbeClosure& probe,
                                                    const ProbeAlignDebugCtx* dbg) {
@@ -2086,6 +2085,8 @@ static bool scanListReachedFromCacheGetHivTraverse(subop::ScanListOp scan, subop
    const bool inClosure = opaqueClosureContains(probe.ssaClosure, scan.getList());
    const bool seenOnTraverse = llvm::is_contained(probe.scanListsFromTraverse, scan);
    if (listEmbeds && inClosure && seenOnTraverse) return true;
+   // Q1 may still carry pre-align embedded HIV (e.g. filter_pred$0) on the list operand while cache_get is $1.
+   if (seenOnTraverse && inClosure && scanListListCarrierSharesAlignedHivKeyLayout(scan, alignedHiv)) return true;
 
    if (listEmbeds && (inClosure || seenOnTraverse)) {
       llvm::StringRef reason = !seenOnTraverse   ? "not_reached_from_cache_get_traverse"
@@ -2444,15 +2445,43 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    return consumerHiv;
 }
 
-static void patchSyntheticJoinBufferFilterPredsImpl(
+} // namespace
+
+bool parseReuseFilterPredSemanticKey(llvm::StringRef semanticKey, unsigned& reuseQueryIndex) {
+   size_t sep = semanticKey.find('\x1f');
+   if (sep == llvm::StringRef::npos) return false;
+   if (semanticKey.take_front(sep) != "reuse_filter_pred") return false;
+   return !semanticKey.drop_front(sep + 1).getAsInteger(10, reuseQueryIndex);
+}
+
+ClonedJoinBufferBuildSitesByKey recordClonedJoinBufferBuildSites(mlir::ModuleOp synthetic,
+                                                                 llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+                                                                 const ModuleReuseInfo& reuseSynthetic) {
+   ClonedJoinBufferBuildSitesByKey out;
+   for (const CacheTarget& t : targetsInSynthetic) {
+      if (!t.state || !mlir::isa<subop::HashIndexedViewType>(t.state.getType())) continue;
+      mlir::Value mergedBuf = resolveJoinMergedBuffer(t.state, synthetic, reuseSynthetic);
+      subop::ExecutionStepOp buildStep = findBufferBuildStepWithTableMaterialize(mergedBuf, reuseSynthetic);
+      if (!buildStep) buildStep = findBufferBuildStepWithTableScan(synthetic);
+      if (!buildStep) continue;
+      ClonedJoinBufferBuildSite site;
+      site.cacheKey = t.cacheKey;
+      site.syntheticHiv = t.state;
+      site.syntheticMergedBuffer = mergedBuf;
+      site.syntheticBuildStep = buildStep;
+      out[t.cacheKey] = site;
+   }
+   return out;
+}
+
+void insertSyntheticFilterPredsAfterColumnUnion(
    mlir::ModuleOp synthetic, mlir::ModuleOp query0, mlir::ModuleOp query1,
    llvm::ArrayRef<CrossQueryStateMatchPair> matches, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
-   const CachedJoinBufferLayoutsByKey& layoutsByKey) {
+   const CachedJoinBufferLayoutsByKey& layoutsByKey, const ClonedJoinBufferBuildSitesByKey& buildSites) {
    if (!kEnableReuseStateFilterPredReapply) return;
 
    auto reuse0 = collectModuleReuseInfo(query0);
    auto reuse1 = collectModuleReuseInfo(query1);
-   auto reuseSynthetic = collectModuleReuseInfo(synthetic);
 
    llvm::DenseMap<uint64_t, const CrossQueryStateMatchPair*> matchByKey;
    for (const auto& m : matches) {
@@ -2460,24 +2489,18 @@ static void patchSyntheticJoinBufferFilterPredsImpl(
       matchByKey[m.cacheKey] = &m;
    }
 
+   auto& mm = synthetic.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+
    for (const CacheTarget& t : targetsInSynthetic) {
       auto itL = layoutsByKey.find(t.cacheKey);
       auto itM = matchByKey.find(t.cacheKey);
-      if (itL == layoutsByKey.end() || itM == matchByKey.end()) continue;
+      auto itB = buildSites.find(t.cacheKey);
+      if (itL == layoutsByKey.end() || itM == matchByKey.end() || itB == buildSites.end()) continue;
       const CachedJoinBufferLayout& layout = itL->second;
       const CrossQueryStateMatchPair& match = *itM->second;
-
-      mlir::Value synthHiv = t.state;
-      if (!mlir::isa<subop::HashIndexedViewType>(synthHiv.getType())) continue;
-      mlir::Value mergedBuf = synthHiv;
-      if (auto it = reuseSynthetic.mergedFromShadowState.find(synthHiv);
-          it != reuseSynthetic.mergedFromShadowState.end()) {
-         mergedBuf = it->second;
-      }
-      subop::ExecutionStepOp buildStep = findBufferBuildStepWithTableMaterialize(mergedBuf, reuseSynthetic);
+      subop::ExecutionStepOp buildStep = itB->second.syntheticBuildStep;
       if (!buildStep) continue;
 
-      auto& mm = synthetic.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
       mlir::Value hivs[] = {resolveCacheTargetStateForReuse(match.stateA, reuse0),
                             resolveCacheTargetStateForReuse(match.stateB, reuse1)};
       ModuleReuseInfo* reuses[] = {&reuse0, &reuse1};
@@ -2486,17 +2509,12 @@ static void patchSyntheticJoinBufferFilterPredsImpl(
          unsigned qIdx = 0;
          if (!parseReuseFilterPredSemanticKey(layout.payloadSemanticKeys[i], qIdx)) continue;
          llvm::StringRef predName = mm.getName(layout.payloadMembers[i]);
-         auto filters = decodeFiltersFromTableScanInExecutionStep(buildStep);
-         if (filters.empty()) {
-            filters = decodeFiltersForStateFromWriterSteps(hivs[qIdx], *reuses[qIdx]);
-            filters = restrictFiltersToTableScanInExecutionStep(buildStep, filters);
-         }
+         auto filters = decodeFiltersForStateFromWriterSteps(hivs[qIdx], *reuses[qIdx]);
+         filters = restrictFiltersToTableScanInExecutionStep(buildStep, filters);
          insertWriteSidePredIntoBufferConstructionStepForPredMember(buildStep, filters, predName);
       }
    }
 }
-
-} // namespace
 
 void syncProbeGatherMappingsInModule(mlir::ModuleOp module) {
    auto& cm = module.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
@@ -2513,16 +2531,10 @@ void syncProbeGatherMappingsInModule(mlir::ModuleOp module) {
    syncProbeListCarriersInClosure(module, nullptr);
 }
 
-void patchSyntheticJoinBufferFilterPredsFromMatchedQueries(
-   mlir::ModuleOp synthetic, mlir::ModuleOp query0, mlir::ModuleOp query1,
-   llvm::ArrayRef<CrossQueryStateMatchPair> matches, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
-   const CachedJoinBufferLayoutsByKey& layoutsByKey) {
-   patchSyntheticJoinBufferFilterPredsImpl(synthetic, query0, query1, matches, targetsInSynthetic, layoutsByKey);
-}
-
 void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const CachedJoinBufferLayout& layout,
                                             std::optional<uint64_t> cacheKey,
-                                            std::optional<unsigned> consumerReuseQueryIndex) {
+                                            std::optional<unsigned> consumerReuseQueryIndex,
+                                            llvm::SmallVectorImpl<ConsumerCacheGetProbeClosure>* outProbeClosures) {
    if (!layout.producerHiv) return;
 
    subop::HashIndexedViewType producerHiv = layout.producerHiv;
@@ -2538,7 +2550,8 @@ void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const Cache
       get.getResult().setType(alignedHiv);
       const uint64_t key = static_cast<uint64_t>(get.getKey());
       ConsumerCacheGetProbeClosure probe = buildConsumerCacheGetProbeClosure(
-         consumer, get.getResult(), alignedHiv, consumerHivBeforeAlign, consumerLayout, key);
+         consumer, get.getResult(), alignedHiv, consumerHivBeforeAlign, consumerLayout, key,
+         consumerReuseQueryIndex);
       if (consumerHivBeforeAlign && consumerHivBeforeAlign != alignedHiv) {
          ProbeAlignDebugCtx refreshDbg;
          refreshDbg.cacheKey = probe.cacheKey;
@@ -2582,6 +2595,61 @@ void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const Cache
 
    syncProbeListCarriersInClosure(consumer, &unionClosure);
    syncExecutionStepPortsForModule(consumer, nullptr);
+
+   if (outProbeClosures) {
+      outProbeClosures->assign(perCacheGet.begin(), perCacheGet.end());
+      for (ConsumerCacheGetProbeClosure& probe : *outProbeClosures) {
+         for (void* p : unionClosure) probe.ssaClosure.insert(p);
+      }
+   }
+}
+
+static void refreshProbeClosureFromCacheGetRoot(mlir::ModuleOp consumer, ConsumerCacheGetProbeClosure& probe) {
+   if (!probe.cacheGetRoot || !probe.alignedHiv) return;
+   ConsumerCachedHivSites sites;
+   sites.consumerHivBeforeAlign = probe.consumerHivBeforeAlign;
+   ProbeAlignDebugCtx traverseDbg;
+   traverseDbg.cacheKey = probe.cacheKey;
+   traverseDbg.passName = "probe_pred_retraverse";
+   traverseConsumerHivUsesFromRoot(probe.cacheGetRoot, probe.alignedHiv, probe.consumerHivBeforeAlign,
+                                   probe.consumerLayout, sites, &traverseDbg);
+   probe.ssaClosure = std::move(sites.ssaClosure);
+   probe.probeLookupScopes = std::move(sites.probeLookupScopes);
+   probe.scanListsFromTraverse = std::move(sites.scanListsFromTraverse);
+   for (;;) {
+      size_t before = probe.ssaClosure.size();
+      expandClosureThroughExecutionStepPorts(consumer, probe.ssaClosure);
+      expandClosureThroughNestedExecutionGroupPorts(consumer, probe.ssaClosure);
+      if (probe.ssaClosure.size() == before) break;
+   }
+}
+
+static std::optional<subop::HashIndexedViewType> hashIndexedViewFromScanListCarrier(
+   subop::ScanListOp scanList) {
+   if (auto listTy = mlir::dyn_cast<subop::ListType>(scanList.getList().getType())) {
+      if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(listTy.getT())) {
+         if (auto st = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState())) return st;
+      }
+   }
+   if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(scanList.getElem().getColumn().type)) {
+      if (auto st = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState())) return st;
+   }
+   return std::nullopt;
+}
+
+static bool scanListTargetsAlignedHivPredSlot(mlir::MLIRContext* ctx, subop::ScanListOp scanList,
+                                               subop::HashIndexedViewType alignedHiv, subop::Member predMember,
+                                               subop::HashIndexedViewType consumerHivBeforeAlign) {
+   setValueCarrierType(scanList.getList(), alignedHiv, consumerHivBeforeAlign);
+   std::optional<subop::HashIndexedViewType> stOpt = hashIndexedViewFromScanListCarrier(scanList);
+   if (!stOpt) return false;
+   subop::HashIndexedViewType st = *stOpt;
+   if (st.getCompareHashForLookup() != alignedHiv.getCompareHashForLookup()) return false;
+   if (st.getKeyMembers().getMembers().size() != alignedHiv.getKeyMembers().getMembers().size()) return false;
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   llvm::StringRef predName = mm.getName(predMember);
+   return valueMembersContainMemberNamed(ctx, st.getValueMembers(), predName) &&
+          valueMembersContainMemberNamed(ctx, alignedHiv.getValueMembers(), predName);
 }
 
 void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::ModuleOp query0, mlir::ModuleOp query1,
@@ -2682,7 +2750,8 @@ void finalizeConsumerCachedJoinProbeColumnAttrs(mlir::ModuleOp consumer, const C
 
       const uint64_t key = static_cast<uint64_t>(get.getKey());
       ConsumerCacheGetProbeClosure probe = buildConsumerCacheGetProbeClosure(
-         consumer, get.getResult(), alignedHiv, /*consumerHivBeforeAlign=*/nullptr, consumerLayout, key);
+         consumer, get.getResult(), alignedHiv, /*consumerHivBeforeAlign=*/nullptr, consumerLayout, key,
+         consumerReuseQueryIndex);
 
       alignScanListForProbeClosure(consumer, probe, "finalize");
       ProbeAlignDebugCtx remapDbg;
@@ -2719,6 +2788,45 @@ void resyncConsumerCachedHivCarrierTypesFromCacheGet(mlir::ModuleOp consumer,
       propagateJoinSupersetColumnAttrsForClosure(consumer, sites.ssaClosure);
       syncExecutionStepPortsForModule(consumer, nullptr);
    });
+}
+
+void applyProbePredFiltersForConsumerClosures(mlir::ModuleOp consumer,
+                                              llvm::MutableArrayRef<ConsumerCacheGetProbeClosure> probeClosures) {
+   if (!kEnableReuseStateFilterPredReapply) return;
+   auto* ctx = consumer.getContext();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   for (ConsumerCacheGetProbeClosure& probe : probeClosures) {
+      if (!probe.alignedHiv) continue;
+      refreshProbeClosureFromCacheGetRoot(consumer, probe);
+      alignScanListForProbeClosure(consumer, probe, "probe_pred_align");
+
+      subop::Member predMember;
+      if (probe.consumerReuseQueryIndex) {
+         predMember = makeOrGetPredMemberForSlot(ctx, *probe.consumerReuseQueryIndex);
+      } else if (auto found = findFilterPredMemberOnHashIndexedView(probe.alignedHiv)) {
+         predMember = *found;
+      } else {
+         continue;
+      }
+
+      ProbeAlignDebugCtx dbg;
+      dbg.cacheKey = probe.cacheKey;
+      dbg.passName = "probe_pred_filter";
+      llvm::DenseSet<subop::ScanListOp> seen;
+      auto tryInsertOnScanList = [&](subop::ScanListOp scanList) {
+         if (!seen.insert(scanList).second) return;
+         if (!opaqueClosureContains(probe.ssaClosure, scanList.getList())) return;
+         if (!scanListTargetsAlignedHivPredSlot(ctx, scanList, probe.alignedHiv, predMember,
+                                                probe.consumerHivBeforeAlign)) {
+            return;
+         }
+         tuples::ColumnRefAttr entryRef = cm.createRef(&scanList.getElem().getColumn());
+         insertProbePredFilterImmediatelyAfterScanProducer(scanList.getOperation(), scanList.getRes(), entryRef,
+                                                           predMember);
+      };
+      for (subop::ScanListOp scanList : probe.scanListsFromTraverse) tryInsertOnScanList(scanList);
+      consumer.walk([&](subop::ScanListOp scanList) { tryInsertOnScanList(scanList); });
+   }
 }
 
 void refreshCachedJoinLayoutsFromSyntheticCachePuts(mlir::ModuleOp synthetic,

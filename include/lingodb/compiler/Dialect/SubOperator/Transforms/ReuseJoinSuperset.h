@@ -7,6 +7,8 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 
+#include "llvm/ADT/StringSet.h"
+
 #include <optional>
 
 namespace lingodb::compiler::dialect::subop {
@@ -28,6 +30,24 @@ struct CachedJoinBufferLayout {
 
 using CachedJoinBufferLayoutsByKey = llvm::DenseMap<uint64_t, CachedJoinBufferLayout>;
 
+/// Union payload semantic key \c reuse_filter_pred\x1fN → query index \p N.
+bool parseReuseFilterPredSemanticKey(llvm::StringRef semanticKey, unsigned& reuseQueryIndex);
+
+/// Per \c cache_get: aligned HIV + SSA closure of probe-side uses (lookup → scan_list), same discovery as
+/// \c alignConsumerModulesToCachedJoinLayout.
+struct ConsumerCacheGetProbeClosure {
+   std::optional<uint64_t> cacheKey;
+   /// \c cache_get result SSA root used to rediscover probe \c scan_list sites after layout align.
+   mlir::Value cacheGetRoot;
+   std::optional<unsigned> consumerReuseQueryIndex;
+   subop::HashIndexedViewType alignedHiv = nullptr;
+   subop::HashIndexedViewType consumerHivBeforeAlign = nullptr;
+   CachedJoinBufferLayout consumerLayout;
+   llvm::DenseSet<void*> ssaClosure;
+   ::llvm::StringSet<> probeLookupScopes;
+   llvm::SmallVector<subop::ScanListOp, 16> scanListsFromTraverse;
+};
+
 /// Widen join-buffer / HIV construction in \p synthetic so stored payload columns are the semantic
 /// union of matched HIV states in \p query0 and \p query1. Updates scan_refs / gather / materialize /
 /// merge / create_hash_indexed_view in the cloned producer IR.
@@ -45,14 +65,25 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
 /// When \p cacheKey is set, only that \c cache_get root is processed.
 void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const CachedJoinBufferLayout& layout,
                                             std::optional<uint64_t> cacheKey = std::nullopt,
-                                            std::optional<unsigned> consumerReuseQueryIndex = std::nullopt);
+                                            std::optional<unsigned> consumerReuseQueryIndex = std::nullopt,
+                                            llvm::SmallVectorImpl<ConsumerCacheGetProbeClosure>* outProbeClosures =
+                                               nullptr);
 
-/// After union widening, materialize each per-query \c filter_pred$N on the synthetic join-buffer writer
-/// using that query's table-scan pushdown filters.
-void patchSyntheticJoinBufferFilterPredsFromMatchedQueries(
+/// After \c extendSyntheticJoinBuffersToColumnUnion, record table→buffer build steps in cloned synthetic IR.
+ClonedJoinBufferBuildSitesByKey recordClonedJoinBufferBuildSites(mlir::ModuleOp synthetic,
+                                                                 llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+                                                                 const ModuleReuseInfo& reuseSynthetic);
+
+/// Materialize each per-query \c filter_pred$N on the synthetic join-buffer writer (table descr → MLIR after
+/// \c scan_refs). Requires union layout and \p buildSites from \c recordClonedJoinBufferBuildSites.
+void insertSyntheticFilterPredsAfterColumnUnion(
    mlir::ModuleOp synthetic, mlir::ModuleOp query0, mlir::ModuleOp query1,
    llvm::ArrayRef<CrossQueryStateMatchPair> matches, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
-   const CachedJoinBufferLayoutsByKey& layoutsByKey);
+   const CachedJoinBufferLayoutsByKey& layoutsByKey, const ClonedJoinBufferBuildSitesByKey& buildSites);
+
+/// Insert \c gather filter_pred + \c filter(all_true) on \c scan_list ops discovered via \c cache_get closure.
+void applyProbePredFiltersForConsumerClosures(mlir::ModuleOp consumer,
+                                              llvm::MutableArrayRef<ConsumerCacheGetProbeClosure> probeClosures);
 
 /// After \c insertCachePutsForTargets on the synthetic module, re-record layouts from \c cache_put
 /// state types (includes `filter_pred$0` when join-buffer pred reuse is enabled).
