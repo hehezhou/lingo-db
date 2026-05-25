@@ -2334,12 +2334,15 @@ static void remapClosureGathersToAlignedConsumerHiv(mlir::ModuleOp consumer,
 /// Per-consumer HIV for \c cache_get: payload physical order follows the cached producer layout, but each slot
 /// reuses the consumer's own \c member$N name and column type when that query already had the column; union-only
 /// columns are inserted with producer types under fresh \c member$N slots (no type overwrite on existing members).
+/// All union \c filter_pred$N slots are retained (same as synthetic); \p consumerReuseQueryIndex only selects which
+/// pred is gathered on probe — not which preds appear in the aligned HIV type.
 static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp consumer,
                                                                 subop::HashIndexedViewType producerHiv,
                                                                 const CachedJoinBufferLayout& layout,
                                                                 subop::HashIndexedViewType consumerHivBeforeAlign,
                                                                 std::optional<unsigned> consumerReuseQueryIndex,
                                                                 CachedJoinBufferLayout& outConsumerLayout) {
+   (void)consumerReuseQueryIndex;
    auto* ctx = consumer.getContext();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
 
@@ -2347,7 +2350,6 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    collectConsumerPayloadSemanticMembers(consumer, semanticToConsumer);
 
    llvm::DenseMap<subop::Member, subop::Member> producerPayloadToConsumer;
-   llvm::DenseSet<subop::Member> excludedProducerPredSlots;
    llvm::StringMap<subop::Member> assignedBySemantic;
    assert(layout.payloadSemanticKeys.size() == layout.payloadMembers.size());
 
@@ -2373,10 +2375,6 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
 
       unsigned predIdx = 0;
       if (parseFilterPredLayoutSemanticKey(semKey, predIdx)) {
-         if (consumerReuseQueryIndex && predIdx != *consumerReuseQueryIndex) {
-            excludedProducerPredSlots.insert(producerMem);
-            continue;
-         }
          subop::Member consumerMem = makeOrGetPredMemberForSlot(ctx, predIdx);
          assignedBySemantic[semKey] = consumerMem;
          producerPayloadToConsumer[producerMem] = consumerMem;
@@ -2397,7 +2395,6 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    llvm::SmallVector<subop::Member> valueMembers;
    valueMembers.reserve(producerHiv.getValueMembers().getMembers().size());
    for (subop::Member m : producerHiv.getValueMembers().getMembers()) {
-      if (excludedProducerPredSlots.contains(m)) continue;
       if (auto it = producerPayloadToConsumer.find(m); it != producerPayloadToConsumer.end()) {
          valueMembers.push_back(it->second);
       } else if (consumerHivBeforeAlign) {
@@ -2431,7 +2428,6 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    outConsumerLayout.payloadSemanticKeys.reserve(layout.payloadMembers.size());
    for (size_t i = 0; i < layout.payloadMembers.size(); ++i) {
       subop::Member m = layout.payloadMembers[i];
-      if (excludedProducerPredSlots.contains(m)) continue;
       subop::Member consumerMem;
       if (auto it = producerPayloadToConsumer.find(m); it != producerPayloadToConsumer.end()) {
          consumerMem = it->second;
@@ -2597,9 +2593,12 @@ void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const Cache
    syncExecutionStepPortsForModule(consumer, nullptr);
 
    if (outProbeClosures) {
-      outProbeClosures->assign(perCacheGet.begin(), perCacheGet.end());
-      for (ConsumerCacheGetProbeClosure& probe : *outProbeClosures) {
-         for (void* p : unionClosure) probe.ssaClosure.insert(p);
+      const size_t appendStart = outProbeClosures->size();
+      for (ConsumerCacheGetProbeClosure& probe : perCacheGet) {
+         outProbeClosures->push_back(std::move(probe));
+      }
+      for (size_t i = appendStart; i < outProbeClosures->size(); ++i) {
+         for (void* p : unionClosure) (*outProbeClosures)[i].ssaClosure.insert(p);
       }
    }
 }
@@ -2815,7 +2814,8 @@ void applyProbePredFiltersForConsumerClosures(mlir::ModuleOp consumer,
       llvm::DenseSet<subop::ScanListOp> seen;
       auto tryInsertOnScanList = [&](subop::ScanListOp scanList) {
          if (!seen.insert(scanList).second) return;
-         if (!opaqueClosureContains(probe.ssaClosure, scanList.getList())) return;
+         const bool fromCacheGetTraverse = llvm::is_contained(probe.scanListsFromTraverse, scanList);
+         if (!fromCacheGetTraverse && !opaqueClosureContains(probe.ssaClosure, scanList.getList())) return;
          if (!scanListTargetsAlignedHivPredSlot(ctx, scanList, probe.alignedHiv, predMember,
                                                 probe.consumerHivBeforeAlign)) {
             return;
