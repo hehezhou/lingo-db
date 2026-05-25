@@ -2201,12 +2201,24 @@ static void collectConsumerPayloadSemanticMembers(mlir::ModuleOp consumer,
       out.try_emplace(columnSemanticKey(scope, leaf), ConsumerColumnBinding{mem, colTy});
    };
 
+   auto recordOnHivState = [&](subop::Member mem, tuples::ColumnDefAttr def) {
+      auto [scope, leaf] = cm.getName(&def.getColumn());
+      record(mem, scope, leaf, def.getColumn().type);
+   };
+
    consumer.walk([&](subop::GatherOp gather) {
       auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(gather.getRef().getColumn().type);
       if (!ler || !mlir::isa<subop::HashIndexedViewType>(ler.getState())) return;
       for (auto [mem, def] : gather.getMapping().getMapping()) {
-         auto [scope, leaf] = cm.getName(&def.getColumn());
-         out.try_emplace(columnSemanticKey(scope, leaf), ConsumerColumnBinding{mem, def.getColumn().type});
+         recordOnHivState(mem, def);
+      }
+   });
+   consumer.walk([&](subop::ScatterOp scatter) {
+      auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(scatter.getRef().getColumn().type);
+      if (!ler || !mlir::isa<subop::HashIndexedViewType>(ler.getState())) return;
+      for (auto [mem, colRef] : scatter.getMapping().getMapping()) {
+         auto [scope, leaf] = cm.getName(&colRef.getColumn());
+         record(mem, scope, leaf, colRef.getColumn().type);
       }
    });
    consumer.walk([&](subop::MaterializeOp mat) {
@@ -2216,6 +2228,12 @@ static void collectConsumerPayloadSemanticMembers(mlir::ModuleOp consumer,
          record(mem, scope, leaf, colRef.getColumn().type);
       }
    });
+}
+
+static bool consumerQueryHadPayloadColumn(const CachedJoinBufferLayout& layout, llvm::StringRef semKey,
+                                          unsigned consumerQueryIndex) {
+   if (consumerQueryIndex == 0) return llvm::is_contained(layout.query0SemanticKeys, semKey);
+   return llvm::is_contained(layout.query1SemanticKeys, semKey);
 }
 
 /// Remap \c gather member keys to the aligned \c cache_get HIV layout (semantic keys, not slot guessing).
@@ -2346,7 +2364,6 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
                                                                 subop::HashIndexedViewType consumerHivBeforeAlign,
                                                                 std::optional<unsigned> consumerReuseQueryIndex,
                                                                 CachedJoinBufferLayout& outConsumerLayout) {
-   (void)consumerReuseQueryIndex;
    auto* ctx = consumer.getContext();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
 
@@ -2390,6 +2407,13 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
          reused = it->second.member;
       } else {
          reused = findConsumerMemberForPayloadSlotByLeaf(semKey, semanticToConsumer);
+      }
+      // Probe gathers use @lookup_u_* column defs; reuse the consumer's pre-cache_get HIV slot name
+      // when this query already had the column (assignPayloadMembersForPlan keeps member$N / flag$N).
+      if (!reused && consumerHivBeforeAlign && consumerReuseQueryIndex &&
+          consumerQueryHadPayloadColumn(layout, semKey, *consumerReuseQueryIndex)) {
+         auto& producerMm = producerHiv.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+         reused = findConsumerMemberByName(producerMm.getName(producerMem), consumerHivBeforeAlign);
       }
       subop::Member consumerMem = ensureConsumerMember(reused, producerSlotTy);
       assignedBySemantic[semKey] = consumerMem;
@@ -2737,33 +2761,16 @@ void syncLookupCarrierAttrsFromState(mlir::ModuleOp module) {
    }
 }
 
-void finalizeConsumerCachedJoinProbeColumnAttrs(mlir::ModuleOp consumer, const CachedJoinBufferLayout& layout,
-                                                std::optional<uint64_t> cacheKey,
-                                                std::optional<unsigned> consumerReuseQueryIndex) {
-   if (!layout.producerHiv) return;
+void finalizeConsumerCachedJoinProbeColumnAttrs(mlir::ModuleOp consumer, ConsumerCacheGetProbeClosure& probe) {
+   if (!probe.alignedHiv) return;
 
-   consumer.walk([&](subop::CacheGetOp get) {
-      if (cacheKey && static_cast<uint64_t>(get.getKey()) != *cacheKey) return;
-      auto alignedHiv = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
-      if (!alignedHiv) return;
-
-      CachedJoinBufferLayout consumerLayout;
-      buildConsumerAlignedHivType(consumer, layout.producerHiv, layout, /*consumerHivBeforeAlign=*/nullptr,
-                                  consumerReuseQueryIndex, consumerLayout);
-
-      const uint64_t key = static_cast<uint64_t>(get.getKey());
-      ConsumerCacheGetProbeClosure probe = buildConsumerCacheGetProbeClosure(
-         consumer, get.getResult(), alignedHiv, /*consumerHivBeforeAlign=*/nullptr, consumerLayout, key,
-         consumerReuseQueryIndex);
-
-      alignScanListForProbeClosure(consumer, probe, "finalize");
-      ProbeAlignDebugCtx remapDbg;
-      remapDbg.cacheKey = probe.cacheKey;
-      remapDbg.passName = "finalize-remap";
-      remapClosureGathersToAlignedConsumerHiv(consumer, &probe.ssaClosure, probe.alignedHiv, probe.consumerLayout,
-                                              &probe.probeLookupScopes, &remapDbg);
-      syncProbeListCarriersInClosure(consumer, &probe.ssaClosure);
-   });
+   alignScanListForProbeClosure(consumer, probe, "finalize");
+   ProbeAlignDebugCtx remapDbg;
+   remapDbg.cacheKey = probe.cacheKey;
+   remapDbg.passName = "finalize-remap";
+   remapClosureGathersToAlignedConsumerHiv(consumer, &probe.ssaClosure, probe.alignedHiv, probe.consumerLayout,
+                                           &probe.probeLookupScopes, &remapDbg);
+   syncProbeListCarriersInClosure(consumer, &probe.ssaClosure);
 }
 
 void resyncConsumerCachedHivCarrierTypesFromCacheGet(mlir::ModuleOp consumer,
@@ -2847,6 +2854,12 @@ void refreshCachedJoinLayoutsFromSyntheticCachePuts(mlir::ModuleOp synthetic,
 
          CachedJoinBufferLayout layout;
          layout.producerHiv = hivTy;
+         if (prev) {
+            layout.query0SemanticKeys = prev->query0SemanticKeys;
+            layout.query1SemanticKeys = prev->query1SemanticKeys;
+            layout.query0SlotInUnion = prev->query0SlotInUnion;
+            layout.query1SlotInUnion = prev->query1SlotInUnion;
+         }
          size_t idx = 0;
          for (subop::Member m : hivTy.getValueMembers().getMembers()) {
             layout.payloadMembers.push_back(m);

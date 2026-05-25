@@ -98,9 +98,7 @@ void resyncConsumerCachedHivCarrierTypesFromCacheGet(mlir::ModuleOp consumer,
 
 /// Reconcile probe \c scan_list / \c gather column metadata with the aligned \c cache_get HIV, only within the
 /// SSA closure rooted at that \c cache_get (run after pred reapply / resync).
-void finalizeConsumerCachedJoinProbeColumnAttrs(mlir::ModuleOp consumer, const CachedJoinBufferLayout& layout,
-                                                std::optional<uint64_t> cacheKey = std::nullopt,
-                                                std::optional<unsigned> consumerReuseQueryIndex = std::nullopt);
+void finalizeConsumerCachedJoinProbeColumnAttrs(mlir::ModuleOp consumer, ConsumerCacheGetProbeClosure& probe);
 
 /// Fix lookup list / nested probe types to match each \c LookupOp's HIV (after union or pred layout passes).
 void syncLookupCarrierAttrsFromState(mlir::ModuleOp module);

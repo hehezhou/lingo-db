@@ -687,15 +687,15 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    }
    for (auto& t : targets0) {
       resyncConsumerCachedHivCarrierTypesFromCacheGet(query0, t.cacheKey);
-      if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
-         finalizeConsumerCachedJoinProbeColumnAttrs(query0, it->second, t.cacheKey, 0);
-      }
    }
    for (auto& t : targets1) {
       resyncConsumerCachedHivCarrierTypesFromCacheGet(query1, t.cacheKey);
-      if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
-         finalizeConsumerCachedJoinProbeColumnAttrs(query1, it->second, t.cacheKey, 1);
-      }
+   }
+   for (ConsumerCacheGetProbeClosure& probe : probeClosuresQ0) {
+      finalizeConsumerCachedJoinProbeColumnAttrs(query0, probe);
+   }
+   for (ConsumerCacheGetProbeClosure& probe : probeClosuresQ1) {
+      finalizeConsumerCachedJoinProbeColumnAttrs(query1, probe);
    }
 
    return res;
