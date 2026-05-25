@@ -1451,9 +1451,13 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
              "join superset: payload slot out of range");
       subop::Member bufMem = plan.payloadMembers[payloadSlotInPlan];
 
-      mlir::Value mapStream = hashMapOp.getResult();
-      mlir::OpBuilder gb(hashMapOp);
-      gb.setInsertionPointAfter(hashMapOp);
+      // Chain union-only gathers on the current materialize stream (clone build chain + prior
+      // union-only gathers), not from hashMapOp each time.
+      mlir::Value mapStream = matOp.getStream();
+      mlir::Operation* streamAnchor = mapStream.getDefiningOp();
+      if (!streamAnchor) streamAnchor = hashMapOp;
+      mlir::OpBuilder gb(streamAnchor);
+      gb.setInsertionPointAfter(streamAnchor);
       auto mapping = subop::ColumnDefMemberMappingAttr::get(
          ctx, llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>>{{tableMem, colDef}});
       auto gatherTy = mapStream.getType();
