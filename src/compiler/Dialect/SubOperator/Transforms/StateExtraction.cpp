@@ -263,6 +263,8 @@ mlir::Value canonicalizeStateValue(subop::ExecutionStepOp step, mlir::Value v) {
    return inputs[idx];
 }
 
+static mlir::Value resolveStateOperandThroughNestedRegions(mlir::Value v);
+
 static subop::ExecutionStepOp findEnclosingExecutionStep(mlir::Value v) {
    if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(v)) {
       auto* b = ba.getOwner();
@@ -279,7 +281,65 @@ static subop::ExecutionStepOp findEnclosingExecutionStep(mlir::Value v) {
    return {};
 }
 
-// Canonicalize across nested regions/steps until we reach a step input/result or an external value.
+static subop::ExecutionGroupOp getMainExecutionGroup(mlir::ModuleOp moduleOp) {
+   subop::ExecutionGroupOp group;
+   moduleOp.walk([&](subop::ExecutionGroupOp g) {
+      assert(!group && "expected exactly one execution_group per module");
+      group = g;
+   });
+   assert(group && "module must contain an execution_group");
+   return group;
+}
+
+static bool isTopLevelExecutionStep(subop::ExecutionStepOp step) {
+   return step && mlir::isa<subop::ExecutionGroupOp>(step->getParentOp());
+}
+
+static subop::ExecutionStepOp findTopLevelExecutionStep(subop::ExecutionStepOp step) {
+   if (!step) return step;
+   if (isTopLevelExecutionStep(step)) return step;
+   if (auto outer = step->getParentOfType<subop::ExecutionStepOp>()) return findTopLevelExecutionStep(outer);
+   return step;
+}
+
+/// Map nested / in-step SSA to the owning top-level `execution_step` result when possible.
+static mlir::Value liftToTopLevelGroupState(mlir::Value v) {
+   if (!v) return v;
+   if (isFuncBlockArgument(v)) return v;
+
+   subop::ExecutionStepOp step = findEnclosingExecutionStep(v);
+   if (!step) return v;
+
+   subop::ExecutionStepOp top = findTopLevelExecutionStep(step);
+   mlir::Value mapped = resolveStateOperandThroughNestedRegions(v);
+   mapped = canonicalizeStateValue(top, mapped);
+
+   for (mlir::Value r : top.getResults()) {
+      if (!isStateType(r.getType()) && !isThreadLocalOfStateType(r.getType())) continue;
+      auto& block = top.getSubOps().front();
+      auto ret = mlir::dyn_cast<subop::ExecutionStepReturnOp>(block.getTerminator());
+      if (!ret) continue;
+      for (mlir::Value o : ret.getOperands()) {
+         if (!o) continue;
+         mlir::Value canonRet = canonicalizeStateValue(top, o);
+         if (canonRet == r || canonRet == mapped || o == mapped) return r;
+      }
+   }
+   return mapped;
+}
+
+static bool executionStepReturnsStateValue(subop::ExecutionStepOp step) {
+   auto& block = step.getSubOps().front();
+   auto ret = mlir::dyn_cast<subop::ExecutionStepReturnOp>(block.getTerminator());
+   if (!ret) return false;
+   for (mlir::Value o : ret.getOperands()) {
+      if (!o) continue;
+      if (isStateType(o.getType()) || isThreadLocalOfStateType(o.getType())) return true;
+   }
+   return false;
+}
+
+// Canonicalize across nested regions/steps until we reach a top-level execution_group state port.
 static mlir::Value canonicalizeStateValueDeep(mlir::Value v) {
    llvm::DenseSet<void*> seen;
    while (true) {
@@ -290,9 +350,10 @@ static mlir::Value canonicalizeStateValueDeep(mlir::Value v) {
       if (!step) {
          // Outside any execution_step: must be a func argument (external), otherwise missing mapping.
          assert(isFuncBlockArgument(v) && "state value outside any execution_step must be a func argument");
+         return liftToTopLevelGroupState(v);
       }
       auto c = canonicalizeStateValue(step, v);
-      if (c == v) return v;
+      if (c == v) return liftToTopLevelGroupState(v);
       v = c;
    }
 }
@@ -1457,7 +1518,6 @@ static void registerModuleExecutionSteps(mlir::ModuleOp moduleOp, ModuleMatchAnd
       a.stepByIndex[stepIdx] = step;
 
       bool tableRef = isExternalTableRefStep(step);
-      bool createOnly = isCreateOnlyExecutionStep(step);
 
       if (tableRef) {
          auto& block = step.getSubOps().front();
@@ -1477,10 +1537,11 @@ static void registerModuleExecutionSteps(mlir::ModuleOp moduleOp, ModuleMatchAnd
 
       for (auto r : step.getResults()) {
          if (!isStateType(r.getType()) && !isThreadLocalOfStateType(r.getType())) continue;
-         auto& info = recordState(r);
+         mlir::Value key = canonicalizeStateValueDeep(r);
+         auto& info = recordState(key);
          if (info.createdAt < 0) info.createdAt = stepIdx;
-         a.createdAtByState[r] = info.createdAt;
-         if (!createOnly && !tableRef) info.writes.insert(stepIdx);
+         a.createdAtByState[key] = info.createdAt;
+         if (tableRef || executionStepReturnsStateValue(step)) info.writes.insert(stepIdx);
       }
 
       auto& block = step.getSubOps().front();
@@ -1552,6 +1613,42 @@ static ModuleStepRwAnalysis analyzeModuleExecutionStepRw(ModuleMatchAndReuseAnal
 }
 
 static void finalizeModuleMatchAnalysis(mlir::ModuleOp moduleOp, ModuleMatchAndReuseAnalysis& a) {
+   llvm::DenseMap<mlir::Value, ModuleMatchAndReuseAnalysis::StateInfo> collapsed;
+   for (auto& it : a.stateInfo) {
+      mlir::Value key = canonicalizeStateValueDeep(it.first);
+      auto& dst = collapsed[key];
+      if (dst.createdAt < 0 || (it.second.createdAt >= 0 && it.second.createdAt < dst.createdAt)) {
+         dst.createdAt = it.second.createdAt;
+      }
+      dst.reads.insert(it.second.reads.begin(), it.second.reads.end());
+      dst.writes.insert(it.second.writes.begin(), it.second.writes.end());
+   }
+   a.stateInfo = std::move(collapsed);
+   a.createdAtByState.clear();
+   for (auto& it : a.stateInfo) {
+      if (it.second.createdAt >= 0) a.createdAtByState[it.first] = it.second.createdAt;
+   }
+
+   llvm::DenseMap<mlir::Value, llvm::SmallVector<subop::ExecutionStepOp, 8>> collapsedWriters;
+   for (auto& kv : a.reuse.writerStepsByState) {
+      auto& dst = collapsedWriters[canonicalizeStateValueDeep(kv.first)];
+      for (subop::ExecutionStepOp s : kv.second) dst.push_back(s);
+   }
+   a.reuse.writerStepsByState = std::move(collapsedWriters);
+
+   llvm::DenseMap<mlir::Value, subop::ExecutionStepOp> collapsedCreateOnly;
+   for (auto& kv : a.reuse.createOnlyStepForState) {
+      collapsedCreateOnly[canonicalizeStateValueDeep(kv.first)] = kv.second;
+   }
+   a.reuse.createOnlyStepForState = std::move(collapsedCreateOnly);
+
+   llvm::DenseMap<mlir::Value, mlir::Value> collapsedShadow;
+   for (auto& kv : a.mergedFromShadowState) {
+      collapsedShadow[canonicalizeStateValueDeep(kv.first)] = canonicalizeStateValueDeep(kv.second);
+   }
+   a.mergedFromShadowState = std::move(collapsedShadow);
+   a.reuse.mergedFromShadowState = a.mergedFromShadowState;
+
    for (auto& it : a.stateInfo) {
       a.writesByState[it.first] = it.second.writes;
       a.statesSorted.push_back(it.first);
@@ -1587,16 +1684,21 @@ static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp 
 static llvm::SmallVector<mlir::Value, 64> collectReuseCandidateStates(mlir::ModuleOp moduleOp,
                                                                     const ModuleMatchAndReuseAnalysis& a) {
    llvm::SmallVector<mlir::Value, 64> candidates;
-   moduleOp.walk([&](subop::ExecutionStepOp step) {
+   subop::ExecutionGroupOp group = getMainExecutionGroup(moduleOp);
+   for (mlir::Operation& op : group.getSubOps().front()) {
+      auto step = mlir::dyn_cast<subop::ExecutionStepOp>(&op);
+      if (!step) continue;
+      assert(isTopLevelExecutionStep(step) && "execution_group body must contain only top-level steps");
       for (mlir::Value r : step.getResults()) {
          if (!isStateType(r.getType()) && !isThreadLocalOfStateType(r.getType())) continue;
-         auto itCreated = a.createdAtByState.find(r);
+         mlir::Value key = canonicalizeStateValueDeep(r);
+         auto itCreated = a.createdAtByState.find(key);
          assert(itCreated != a.createdAtByState.end() && "execution_step state result must be tracked");
          if (itCreated->second < 0) continue;
-         if (isTransparentDepCarrierType(r.getType())) continue;
-         candidates.push_back(r);
+         if (isTransparentDepCarrierType(key.getType())) continue;
+         candidates.push_back(key);
       }
-   });
+   }
    llvm::sort(candidates, [&](mlir::Value x, mlir::Value y) {
       int cx = a.createdAtByState.lookup(x);
       int cy = a.createdAtByState.lookup(y);
