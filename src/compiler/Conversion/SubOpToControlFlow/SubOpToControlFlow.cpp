@@ -998,13 +998,20 @@ class MaterializeTableLowering : public SubOpTupleStreamConsumerConversionPatter
    public:
    using SubOpTupleStreamConsumerConversionPattern<subop::MaterializeOp>::SubOpTupleStreamConsumerConversionPattern;
 
+   static subop::ResultTableType getResultTableTypeForMaterializeState(mlir::Type stateTy) {
+      if (auto rt = mlir::dyn_cast_or_null<subop::ResultTableType>(stateTy)) return rt;
+      if (auto tl = mlir::dyn_cast_or_null<subop::ThreadLocalType>(stateTy))
+         return mlir::dyn_cast_or_null<subop::ResultTableType>(tl.getWrapped());
+      return {};
+   }
+
    LogicalResult match(subop::MaterializeOp materializeOp) const override {
-      if (!mlir::isa<subop::ResultTableType>(materializeOp.getState().getType())) return failure();
-      return success();
+      return success(getResultTableTypeForMaterializeState(materializeOp.getState().getType()) != nullptr);
    }
 
    void rewrite(subop::MaterializeOp materializeOp, OpAdaptor adaptor, SubOpRewriter& rewriter, ColumnMapping& mapping) const override {
-      auto stateType = mlir::cast<subop::ResultTableType>(materializeOp.getState().getType());
+      auto stateType = getResultTableTypeForMaterializeState(materializeOp.getState().getType());
+      assert(stateType && "match() should guarantee result_table or thread_local<result_table>");
       mlir::Type wantRefTy = typeConverter->convertType(stateType);
       assert(wantRefTy && "result_table must lower to a util ref type");
       mlir::Value ptr = adaptor.getState();
@@ -2598,12 +2605,21 @@ class MaterializeVectorLowering : public SubOpTupleStreamConsumerConversionPatte
 class LookupSimpleStateLowering : public SubOpTupleStreamConsumerConversionPattern<subop::LookupOp> {
    public:
    using SubOpTupleStreamConsumerConversionPattern<subop::LookupOp>::SubOpTupleStreamConsumerConversionPattern;
+
+   static subop::SimpleStateType getSimpleStateTypeForLookupState(mlir::Type stateTy) {
+      if (auto st = mlir::dyn_cast_or_null<subop::SimpleStateType>(stateTy)) return st;
+      if (auto tl = mlir::dyn_cast_or_null<subop::ThreadLocalType>(stateTy))
+         return mlir::dyn_cast_or_null<subop::SimpleStateType>(tl.getWrapped());
+      return {};
+   }
+
    LogicalResult match(subop::LookupOp lookupOp) const override {
-      if (!mlir::isa<subop::SimpleStateType>(lookupOp.getState().getType())) return failure();
-      return success();
+      return success(getSimpleStateTypeForLookupState(lookupOp.getState().getType()) != nullptr);
    }
 
    void rewrite(subop::LookupOp lookupOp, OpAdaptor adaptor, SubOpRewriter& rewriter, ColumnMapping& mapping) const override {
+      // IR operand may be thread_local<simple_state>; execution_step entry already unwraps TLS
+      // operands when [isThreadLocal], so treat like plain simple_state here.
       mapping.define(lookupOp.getRef(), adaptor.getState());
       rewriter.replaceTupleStream(lookupOp, mapping);
    }
