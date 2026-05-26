@@ -295,6 +295,14 @@ static bool isTopLevelExecutionStep(subop::ExecutionStepOp step) {
    return step && mlir::isa<subop::ExecutionGroupOp>(step->getParentOp());
 }
 
+static void walkTopLevelExecutionSteps(mlir::ModuleOp moduleOp,
+                                       llvm::function_ref<void(subop::ExecutionStepOp)> fn) {
+   subop::ExecutionGroupOp group = getMainExecutionGroup(moduleOp);
+   for (mlir::Operation& op : group.getSubOps().front()) {
+      if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(&op)) fn(step);
+   }
+}
+
 static subop::ExecutionStepOp findTopLevelExecutionStep(subop::ExecutionStepOp step) {
    if (!step) return step;
    if (isTopLevelExecutionStep(step)) return step;
@@ -539,7 +547,8 @@ static StateDepEligibility evaluateStateDepEligibility(
    return resolveDepEligibilityRec(canon, dag, tableDescrByTableState, visiting);
 }
 
-static std::optional<mlir::Value> findUpstreamLookupHashIndexedView(mlir::Value v);
+/// Trace SSA backward through nested regions / tuple pipelines to the owning `!subop.state` value.
+static mlir::Value findUpstreamLookupHashIndexedView(mlir::Value v);
 
 llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRW(subop::ExecutionStepOp step) {
    llvm::DenseMap<mlir::Value, RWFlags> res;
@@ -564,15 +573,22 @@ llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRW(subop::ExecutionStepOp s
          res[canonicalizeStateValueDeep(stv)].write = true;
          continue;
       }
-      if (auto hiv = mlir::dyn_cast<subop::CreateHashIndexedView>(&op)) {
-         mlir::Value src = hiv.getSource();
-         assert(isStateType(src.getType()) || isThreadLocalOfStateType(src.getType()));
-         res[canonicalizeStateValueDeep(src)].read = true;
-         mlir::Value out = hiv.getResult();
-         assert(isStateType(out.getType()) || isThreadLocalOfStateType(out.getType()));
-         res[canonicalizeStateValueDeep(out)].write = true;
-         continue;
-      }
+         if (auto hiv = mlir::dyn_cast<subop::CreateHashIndexedView>(&op)) {
+            mlir::Value src = hiv.getSource();
+            assert(isStateType(src.getType()) || isThreadLocalOfStateType(src.getType()));
+            res[canonicalizeStateValueDeep(src)].read = true;
+            mlir::Value out = hiv.getResult();
+            assert(isStateType(out.getType()) || isThreadLocalOfStateType(out.getType()));
+            res[canonicalizeStateValueDeep(out)].write = true;
+            continue;
+         }
+         if (auto lock = mlir::dyn_cast<subop::LockOp>(&op)) {
+            mlir::Value st = findUpstreamLookupHashIndexedView(lock.getStream());
+            auto key = canonicalizeStateValueDeep(st);
+            res[key].read = true;
+            res[key].write = true;
+            continue;
+         }
       if (auto lookup = mlir::dyn_cast<subop::LookupOp>(&op)) {
          mlir::Value st = lookup.getState();
          assert(isStateType(st.getType()) || isThreadLocalOfStateType(st.getType()));
@@ -580,9 +596,20 @@ llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRW(subop::ExecutionStepOp s
          continue;
       }
       if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(&op)) {
-         if (std::optional<mlir::Value> hiv = findUpstreamLookupHashIndexedView(scanList.getList())) {
-            res[canonicalizeStateValueDeep(*hiv)].read = true;
-         }
+         mlir::Value st = findUpstreamLookupHashIndexedView(scanList.getList());
+         res[canonicalizeStateValueDeep(st)].read = true;
+         continue;
+      }
+      if (auto scatter = mlir::dyn_cast<subop::ScatterOp>(&op)) {
+         mlir::Value st = findUpstreamLookupHashIndexedView(scatter.getStream());
+         res[canonicalizeStateValueDeep(st)].write = true;
+         continue;
+      }
+      if (auto reduce = mlir::dyn_cast<subop::ReduceOp>(&op)) {
+         mlir::Value st = findUpstreamLookupHashIndexedView(reduce.getStream());
+         auto key = canonicalizeStateValueDeep(st);
+         res[key].read = true;
+         res[key].write = true;
          continue;
       }
       if (auto from = mlir::dyn_cast<subop::CreateFrom>(&op)) {
@@ -622,8 +649,10 @@ llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRW(subop::ExecutionStepOp s
    return res;
 }
 
+static llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRWWithNested(subop::ExecutionStepOp topStep);
+
 void printStepStateRW(subop::ExecutionStepOp step, llvm::raw_ostream& os) {
-   auto m = analyzeStepStateRW(step);
+   auto m = isTopLevelExecutionStep(step) ? analyzeStepStateRWWithNested(step) : analyzeStepStateRW(step);
    if (m.empty()) {
       return;
    }
@@ -651,10 +680,10 @@ mlir::Value getReturnedInternalValueForStepResult(subop::ExecutionStepOp step, u
    return inputs[resultIdx];
 }
 
-static void addConstructionStepsForSingleState(
-   mlir::Value state, const llvm::DenseMap<mlir::Value, int>& createdAtByState,
-   const llvm::DenseMap<mlir::Value, llvm::SmallSet<int, 16>>& writesByState,
-   const llvm::DenseMap<int, int>* nestedStepParentIdx, llvm::SmallVectorImpl<int>& outSteps) {
+static void addConstructionStepsForSingleState(mlir::Value state,
+                                               const llvm::DenseMap<mlir::Value, int>& createdAtByState,
+                                               const llvm::DenseMap<mlir::Value, llvm::SmallSet<int, 16>>& writesByState,
+                                               llvm::SmallVectorImpl<int>& outSteps) {
    mlir::Value stateCanon = canonicalizeStateValueDeep(state);
    auto itC = createdAtByState.find(stateCanon);
    assert(itC != createdAtByState.end() && "state must have a recorded createdAt");
@@ -667,11 +696,6 @@ static void addConstructionStepsForSingleState(
    for (int w : itW->second) {
       assert(w >= createdAt && "write steps must not occur before creation");
       outSteps.push_back(w);
-      if (nestedStepParentIdx) {
-         if (auto itP = nestedStepParentIdx->find(w); itP != nestedStepParentIdx->end()) {
-            outSteps.push_back(itP->second);
-         }
-      }
    }
 }
 
@@ -692,18 +716,15 @@ static void forEachShadowChainPredecessorValue(
 }
 
 llvm::SmallVector<int, 8> getConstructionStepIndicesForState(
-   mlir::Value state,
-   const llvm::DenseMap<mlir::Value, int>& createdAtByState,
+   mlir::Value state, const llvm::DenseMap<mlir::Value, int>& createdAtByState,
    const llvm::DenseMap<mlir::Value, llvm::SmallSet<int, 16>>& writesByState,
-   const llvm::DenseMap<mlir::Value, mlir::Value>& mergedFromShadowState,
-   const llvm::DenseMap<int, int>* nestedStepParentIdx) {
+   const llvm::DenseMap<mlir::Value, mlir::Value>& mergedFromShadowState) {
    llvm::SmallVector<int, 8> steps;
    mlir::Value stateCanon = canonicalizeStateValueDeep(state);
 
-   addConstructionStepsForSingleState(stateCanon, createdAtByState, writesByState, nestedStepParentIdx, steps);
+   addConstructionStepsForSingleState(stateCanon, createdAtByState, writesByState, steps);
    forEachShadowChainPredecessorValue(stateCanon, mergedFromShadowState, [&](mlir::Value shadow) {
-      addConstructionStepsForSingleState(canonicalizeStateValueDeep(shadow), createdAtByState, writesByState,
-                                         nestedStepParentIdx, steps);
+      addConstructionStepsForSingleState(canonicalizeStateValueDeep(shadow), createdAtByState, writesByState, steps);
    });
 
    llvm::sort(steps);
@@ -711,22 +732,14 @@ llvm::SmallVector<int, 8> getConstructionStepIndicesForState(
    return steps;
 }
 
-/// Same `execution_step` index used for nested steps: use parent step RW (nested body merged in).
-static int effectiveRwStepIndex(int stepIdx, const llvm::DenseMap<int, int>& nestedStepParentIdx) {
-   if (auto it = nestedStepParentIdx.find(stepIdx); it != nestedStepParentIdx.end()) return it->second;
-   return stepIdx;
-}
-
 /// Direct state deps from step RW: within one step, every read `r` and write `w` implies `w` depends on `r`.
 static void appendSameStepRwDirectPrereqs(
    mlir::Value constructedState, llvm::ArrayRef<int> stepIndices,
-   const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep,
-   const llvm::DenseMap<int, int>& nestedStepParentIdx, llvm::DenseSet<mlir::Value>& seen,
+   const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep, llvm::DenseSet<mlir::Value>& seen,
    llvm::SmallVectorImpl<mlir::Value>& out) {
    mlir::Value selfCanon = canonicalizeStateValueDeep(constructedState);
    for (int si : stepIndices) {
-      int rwStep = effectiveRwStepIndex(si, nestedStepParentIdx);
-      auto itRw = rwByStep.find(rwStep);
+      auto itRw = rwByStep.find(si);
       assert(itRw != rwByStep.end());
       bool writesSelf = false;
       for (auto& kv : itRw->second) {
@@ -743,11 +756,10 @@ static void appendSameStepRwDirectPrereqs(
 
 llvm::SmallVector<mlir::Value, 8> getPrereqStatesForConstructionSteps(
    llvm::ArrayRef<int> stepIndices, mlir::Value constructedState,
-   const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep,
-   const llvm::DenseMap<int, int>& nestedStepParentIdx) {
+   const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep) {
    llvm::SmallVector<mlir::Value, 8> prereqs;
    llvm::DenseSet<mlir::Value> seen;
-   appendSameStepRwDirectPrereqs(constructedState, stepIndices, rwByStep, nestedStepParentIdx, seen, prereqs);
+   appendSameStepRwDirectPrereqs(constructedState, stepIndices, rwByStep, seen, prereqs);
    return prereqs;
 }
 
@@ -763,32 +775,20 @@ static void mergeRwInto(llvm::DenseMap<mlir::Value, RWFlags>& dst,
 static void augmentStepRwWithNestedScanListHivReads(subop::ExecutionStepOp step,
                                                     llvm::DenseMap<mlir::Value, RWFlags>& rw) {
    step.walk([&](subop::ScanListOp scan) {
-      if (auto hiv = findUpstreamLookupHashIndexedView(scan.getList())) {
-         rw[canonicalizeStateValueDeep(*hiv)].read = true;
-      }
+      mlir::Value st = findUpstreamLookupHashIndexedView(scan.getList());
+      rw[canonicalizeStateValueDeep(st)].read = true;
    });
 }
 
-static void buildNestedStepParentMapAndMergeRw(
-   const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex,
-   llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep,
-   llvm::DenseMap<int, int>& nestedStepParentIdx) {
-   for (auto& it : stepByIndex) {
-      int parentIdx = it.first;
-      subop::ExecutionStepOp parent = it.second;
-      parent.walk([&](subop::ExecutionStepOp nested) {
-         if (nested == parent) return;
-         for (auto& itChild : stepByIndex) {
-            if (itChild.second != nested) continue;
-            nestedStepParentIdx[itChild.first] = parentIdx;
-            auto itRwChild = rwByStep.find(itChild.first);
-            assert(itRwChild != rwByStep.end());
-            mergeRwInto(rwByStep[parentIdx], itRwChild->second);
-            augmentStepRwWithNestedScanListHivReads(parent, rwByStep[parentIdx]);
-            return;
-         }
-      });
-   }
+/// RW for a top-level step: direct body plus all nested `execution_step` bodies (merged, no separate indices).
+static llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRWWithNested(subop::ExecutionStepOp topStep) {
+   llvm::DenseMap<mlir::Value, RWFlags> res = analyzeStepStateRW(topStep);
+   topStep.walk([&](subop::ExecutionStepOp nested) {
+      if (nested == topStep) return;
+      mergeRwInto(res, analyzeStepStateRW(nested));
+   });
+   augmentStepRwWithNestedScanListHivReads(topStep, res);
+   return res;
 }
 
 /// Map an entry-region block argument produced by `execution_step` / `nested_execution_group` /
@@ -803,6 +803,14 @@ static mlir::Value mapRegionArgToParentOperand(mlir::BlockArgument ba) {
    if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(parent)) {
       if (idx < step.getNumOperands()) return step.getOperand(idx);
       return ba;
+   }
+   if (auto nm = mlir::dyn_cast<subop::NestedMapOp>(parent)) {
+      // Region arg 0 is the outer tuple stream; nested parameters (lists, keys, refs) are
+      // bound from the same lookup/nested_map pipeline — trace via the stream operand.
+      return nm.getStream();
+   }
+   if (auto lock = mlir::dyn_cast<subop::LockOp>(parent)) {
+      return lock.getStream();
    }
    if (auto neg = mlir::dyn_cast<subop::NestedExecutionGroupOp>(parent)) {
       if (idx < neg.getNumOperands()) return neg.getOperand(idx);
@@ -845,8 +853,10 @@ static void appendNestedStateOperandsAsPrereqs(subop::ExecutionStepOp step, mlir
    });
 }
 
-/// Trace SSA backward through nested regions / producers to a hash_indexed_view used by subop.lookup.
-static std::optional<mlir::Value> findUpstreamLookupHashIndexedView(mlir::Value v) {
+/// Trace SSA backward through nested regions / tuple pipelines to the `!subop.state` (or
+/// `thread_local<state>`) that owns lookup entry refs / lists. Asserts if no state is found.
+static mlir::Value findUpstreamLookupHashIndexedView(mlir::Value v) {
+   assert(v && "findUpstreamLookupHashIndexedView requires a non-null seed");
    llvm::DenseSet<void*> visited;
    llvm::SmallVector<mlir::Value, 8> stack;
    stack.push_back(v);
@@ -854,7 +864,7 @@ static std::optional<mlir::Value> findUpstreamLookupHashIndexedView(mlir::Value 
       mlir::Value cur = stack.pop_back_val();
       void* key = cur.getAsOpaquePointer();
       if (!visited.insert(key).second) continue;
-      if (mlir::isa<subop::HashIndexedViewType>(cur.getType())) {
+      if (isStateType(cur.getType()) || isThreadLocalOfStateType(cur.getType())) {
          return canonicalizeStateValueDeep(cur);
       }
       if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(cur)) {
@@ -865,10 +875,32 @@ static std::optional<mlir::Value> findUpstreamLookupHashIndexedView(mlir::Value 
          if (auto lookup = mlir::dyn_cast<subop::LookupOp>(def)) {
             return canonicalizeStateValueDeep(lookup.getState());
          }
+         if (auto lookupOrInsert = mlir::dyn_cast<subop::LookupOrInsertOp>(def)) {
+            return canonicalizeStateValueDeep(lookupOrInsert.getState());
+         }
+         if (auto insert = mlir::dyn_cast<subop::InsertOp>(def)) {
+            return canonicalizeStateValueDeep(insert.getState());
+         }
+         if (auto scanRefs = mlir::dyn_cast<subop::ScanRefsOp>(def)) {
+            return canonicalizeStateValueDeep(scanRefs.getState());
+         }
+         if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(def)) {
+            stack.push_back(scanList.getList());
+            continue;
+         }
+         if (auto nm = mlir::dyn_cast<subop::NestedMapOp>(def)) {
+            stack.push_back(nm.getStream());
+            continue;
+         }
+         if (mlir::isa<subop::UnwrapOptionalRefOp>(def)) {
+            for (mlir::Value op : def->getOperands()) stack.push_back(op);
+            continue;
+         }
          for (mlir::Value op : def->getOperands()) stack.push_back(op);
       }
    }
-   return std::nullopt;
+   assert(false && "could not trace SSA back to a subop state (lookup/list/entry-ref pipeline)");
+   return v;
 }
 
 static bool isGetExternalLeafState(mlir::Value v) {
@@ -1476,10 +1508,9 @@ struct StateMatchProfile {
    std::string storedValueMembersFingerprint;
 };
 
-/// Phase 1 output: per-step state read/write (nested child RW merged into parents).
+/// Phase 1 output: per top-level-step state read/write (nested bodies merged into parent).
 struct ModuleStepRwAnalysis {
    llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>> rwByStep;
-   llvm::DenseMap<int, int> nestedStepParentIdx;
 };
 
 /// Phase 4 output: construction / type fingerprints (only computed for eligible states).
@@ -1502,7 +1533,6 @@ struct ModuleMatchAndReuseAnalysis {
    llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>> rwByStep;
    llvm::DenseMap<mlir::Value, int> createdAtByState;
    llvm::DenseMap<mlir::Value, mlir::Value> mergedFromShadowState;
-   llvm::DenseMap<int, int> nestedStepParentIdx;
    llvm::DenseMap<mlir::Value, llvm::SmallSet<int, 16>> writesByState;
    llvm::SmallVector<mlir::Value, 64> statesSorted;
    ModuleReuseInfo reuse;
@@ -1513,21 +1543,17 @@ static void registerModuleExecutionSteps(mlir::ModuleOp moduleOp, ModuleMatchAnd
    auto recordState = [&](mlir::Value v) -> ModuleMatchAndReuseAnalysis::StateInfo& { return a.stateInfo[v]; };
 
    size_t idx = 0;
-   moduleOp.walk([&](subop::ExecutionStepOp step) {
+   walkTopLevelExecutionSteps(moduleOp, [&](subop::ExecutionStepOp step) {
       int stepIdx = static_cast<int>(idx++);
       a.stepByIndex[stepIdx] = step;
 
       bool tableRef = isExternalTableRefStep(step);
 
       if (tableRef) {
-         auto& block = step.getSubOps().front();
          subop::GetExternalOp geOp;
-         for (auto& op : block.without_terminator()) {
-            if (auto g = mlir::dyn_cast<subop::GetExternalOp>(&op)) {
-               geOp = g;
-               break;
-            }
-         }
+         step.walk([&](subop::GetExternalOp g) {
+            geOp = g;
+         });
          assert(geOp && "table_ref step must contain get_external");
          assert(step.getNumResults() == 1 && "table_ref step must return one value");
          mlir::Value t = canonicalizeStateValueDeep(step.getResult(0));
@@ -1544,19 +1570,27 @@ static void registerModuleExecutionSteps(mlir::ModuleOp moduleOp, ModuleMatchAnd
          if (tableRef || executionStepReturnsStateValue(step)) info.writes.insert(stepIdx);
       }
 
-      auto& block = step.getSubOps().front();
-      for (auto& op : block.without_terminator()) {
-         auto merge = mlir::dyn_cast<subop::MergeOp>(op);
-         if (!merge) continue;
+      step.walk([&](subop::MergeOp merge) {
          mlir::Value in = canonicalizeStateValueDeep(merge.getThreadLocal());
          mlir::Value out = canonicalizeStateValueDeep(merge.getResult());
          a.mergedFromShadowState[out] = in;
          a.reuse.mergedFromShadowState[out] = in;
-      }
+      });
+
+      step.walk([&](mlir::Operation* op) {
+         for (auto r : op->getResults()) {
+            auto t = r.getType();
+            if (!isStateType(t) && !isThreadLocalOfStateType(t)) continue;
+            auto& info = recordState(r);
+            if (info.createdAt < 0) info.createdAt = stepIdx;
+            a.createdAtByState[r] = info.createdAt;
+         }
+      });
 
       if (isCreateOnlyExecutionStep(step)) {
          llvm::SmallVector<mlir::Value, 4> keys;
          for (mlir::Value r : step.getResults()) if (r) keys.push_back(r);
+         auto& block = step.getSubOps().front();
          if (auto ret = mlir::dyn_cast<subop::ExecutionStepReturnOp>(block.getTerminator())) {
             for (mlir::Value o : ret.getOperands()) if (o) keys.push_back(o);
          }
@@ -1581,7 +1615,7 @@ static ModuleStepRwAnalysis analyzeModuleExecutionStepRw(ModuleMatchAndReuseAnal
 
    for (int stepIdx : stepOrder) {
       subop::ExecutionStepOp step = a.stepByIndex[stepIdx];
-      llvm::DenseMap<mlir::Value, RWFlags> stepRw = analyzeStepStateRW(step);
+      llvm::DenseMap<mlir::Value, RWFlags> stepRw = analyzeStepStateRWWithNested(step);
       rw.rwByStep[stepIdx] = stepRw;
       a.rwByStep[stepIdx] = stepRw;
 
@@ -1606,8 +1640,6 @@ static ModuleStepRwAnalysis analyzeModuleExecutionStepRw(ModuleMatchAndReuseAnal
       a.reuse.steps.push_back(std::move(re));
    }
 
-   buildNestedStepParentMapAndMergeRw(a.stepByIndex, rw.rwByStep, rw.nestedStepParentIdx);
-   a.nestedStepParentIdx = rw.nestedStepParentIdx;
    a.rwByStep = rw.rwByStep;
    return rw;
 }
@@ -1800,7 +1832,7 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
 
    ModuleMatchAndReuseAnalysis module = analyzeModuleForMatchAndReuse(moduleOp);
 
-   ModuleStepRwAnalysis stepRw{module.rwByStep, module.nestedStepParentIdx};
+   ModuleStepRwAnalysis stepRw{module.rwByStep};
 
    // Phase 2: same-step RW → state dependency DAG.
    StateDependencyGraph depGraph = buildStateDependencyGraphFromStepRw(stepRw.rwByStep);
@@ -1813,7 +1845,7 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
    for (mlir::Value state : candidates) {
       auto constructionStepIndices = getConstructionStepIndicesForState(
          canonicalizeStateValueDeep(state), module.createdAtByState, module.writesByState,
-         module.mergedFromShadowState, &stepRw.nestedStepParentIdx);
+         module.mergedFromShadowState);
 
       StateDepEligibility depElig;
       bool eligible = determineStateReuseEligibility(
@@ -1887,7 +1919,7 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
    });
 
    size_t idx = 0;
-   moduleOp.walk([&](subop::ExecutionStepOp step) {
+   walkTopLevelExecutionSteps(moduleOp, [&](subop::ExecutionStepOp step) {
       int stepIdx = static_cast<int>(idx++);
       stepByIndex[stepIdx] = step;
 
@@ -1910,22 +1942,19 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
          }
       }
 
-      // Record creation for internal state-typed SSA values inside step body.
-      {
-         auto& block = step.getSubOps().front();
-         for (auto& op : block.without_terminator()) {
-            for (auto r : op.getResults()) {
-               auto t = r.getType();
-               if (!isStateType(t) && !isThreadLocalOfStateType(t)) continue;
-               auto& info = recordState(r);
-               if (info.createdAt < 0) info.createdAt = stepIdx;
-               createdAtByState[r] = info.createdAt;
-            }
+      // Record creation for state-typed SSA anywhere under this top-level step (incl. nested steps).
+      step.walk([&](mlir::Operation* op) {
+         for (auto r : op->getResults()) {
+            auto t = r.getType();
+            if (!isStateType(t) && !isThreadLocalOfStateType(t)) continue;
+            auto& info = recordState(r);
+            if (info.createdAt < 0) info.createdAt = stepIdx;
+            createdAtByState[r] = info.createdAt;
          }
-      }
+      });
 
-      // Record read/write usage of state operands inside this step.
-      auto rw = analyzeStepStateRW(step);
+      // RW: top-level body + all nested execution_step bodies merged here.
+      auto rw = analyzeStepStateRWWithNested(step);
       rwByStep[stepIdx] = rw;
       for (auto it : rw) {
          auto& info = recordState(it.first);
@@ -2019,17 +2048,13 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
       return a.getAsOpaquePointer() < b.getAsOpaquePointer();
    });
 
-   llvm::DenseMap<int, int> nestedStepParentIdx;
-   buildNestedStepParentMapAndMergeRw(stepByIndex, rwByStep, nestedStepParentIdx);
-
    llvm::DenseSet<mlir::Value> shadowChainPartners;
    for (auto& kv : mergedFromShadowState) shadowChainPartners.insert(kv.second);
 
    for (auto s : states) {
       if (shadowChainPartners.contains(s)) continue;
 
-      auto stepIdxs =
-         getConstructionStepIndicesForState(s, createdAtByState, writesByState, mergedFromShadowState, &nestedStepParentIdx);
+      auto stepIdxs = getConstructionStepIndicesForState(s, createdAtByState, writesByState, mergedFromShadowState);
       auto prereqStepIdxs = sortedUniqueStepIndices(stepIdxs);
       os << "\n// -- state ";
       s.printAsOperand(os, flags);
@@ -2045,8 +2070,7 @@ void printExecutionSteps(mlir::ModuleOp moduleOp, llvm::raw_ostream& os) {
          os << "\n";
       }
 
-      llvm::SmallVector<mlir::Value, 8> prereqs =
-         getPrereqStatesForConstructionSteps(prereqStepIdxs, s, rwByStep, nestedStepParentIdx);
+      llvm::SmallVector<mlir::Value, 8> prereqs = getPrereqStatesForConstructionSteps(prereqStepIdxs, s, rwByStep);
       llvm::DenseSet<mlir::Value> prereqSeen;
       for (auto pv : prereqs) prereqSeen.insert(pv);
       for (int si : prereqStepIdxs) {
