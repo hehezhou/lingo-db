@@ -337,7 +337,8 @@ static bool isTransparentDepCarrierType(mlir::Type t) {
    return false;
 }
 
-static bool isTableStateValue(mlir::Value v);
+/// State produced by a lone `get_external` in an execution_step (table or external hash index, etc.).
+static bool isGetExternalLeafState(mlir::Value v);
 
 struct RWFlags {
    bool read = false;
@@ -417,7 +418,7 @@ static StateDepEligibility resolveDepEligibilityRec(
          soleTransparent = p;
          continue;
       }
-      if (isTableStateValue(p)) {
+      if (isGetExternalLeafState(p)) {
          nTable++;
          continue;
       }
@@ -441,15 +442,23 @@ static StateDepEligibility resolveDepEligibilityRec(
    }
 
    assert(nTransparent == 0 && "unexpected transparent predecessor");
-   assert(nTable == preds.size() && "only table predecessors expected");
+   assert(nTable == preds.size() && "only get_external leaf predecessors expected");
 
    StateDepEligibility out;
    out.eligible = true;
    out.depTokensSorted.reserve(nTable);
    for (mlir::Value p : preds) {
       auto itD = tableDescrByTableState.find(p);
-      assert(itD != tableDescrByTableState.end() && "table predecessor must have GetExternal descr");
-      out.depTokensSorted.push_back(std::string("table:") + itD->second);
+      assert(itD != tableDescrByTableState.end() && "get_external leaf predecessor must have GetExternal descr");
+      std::string token;
+      if (mlir::isa<subop::TableType>(p.getType())) {
+         token = std::string("table:") + itD->second;
+      } else if (mlir::isa<subop::ExternalHashIndexType>(p.getType())) {
+         token = std::string("externalhashindex:") + itD->second;
+      } else {
+         llvm_unreachable("get_external leaf predecessor must be table or externalhashindex");
+      }
+      out.depTokensSorted.push_back(std::move(token));
    }
    llvm::sort(out.depTokensSorted);
    out.depTokensSorted.erase(std::unique(out.depTokensSorted.begin(), out.depTokensSorted.end()),
@@ -799,8 +808,8 @@ static std::optional<mlir::Value> findUpstreamLookupHashIndexedView(mlir::Value 
    return std::nullopt;
 }
 
-static bool isTableStateValue(mlir::Value v) {
-   return mlir::isa<subop::TableType>(v.getType());
+static bool isGetExternalLeafState(mlir::Value v) {
+   return mlir::isa<subop::TableType, subop::ExternalHashIndexType>(v.getType());
 }
 
 // Keep small string helpers for type fingerprints / debug keys.
@@ -1085,7 +1094,7 @@ struct StepDagHasher {
             return static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(itDs->second.tableName)));
          }
       }
-      assert(!isTableStateValue(v) && "module table state must have GetExternal descr");
+      assert(!isGetExternalLeafState(v) && "get_external leaf state must have GetExternal descr");
       return hashMlirType(v.getType());
    }
 
@@ -1356,6 +1365,11 @@ std::string normalizedSubopStateTypeFingerprint(subop::MemberManager& mm, mlir::
       return std::string("table{members=") + fingerprintSortedMemberPairs(mm, tbl.getMembers().getMembers()) +
              ",filtered=" + (tbl.getFiltered() ? "1" : "0") + "}";
    }
+   if (auto ehi = mlir::dyn_cast<subop::ExternalHashIndexType>(t)) {
+      return std::string("externalhashindex{key_types=") +
+             fingerprintMemberTypesMultiset(mm, ehi.getKeyMembers().getMembers()) +
+             ",val_types=" + fingerprintMemberTypesMultiset(mm, ehi.getValueMembers().getMembers()) + "}";
+   }
    if (auto heap = mlir::dyn_cast<subop::HeapType>(t)) {
       return std::string("heap{members=") + fingerprintSortedMemberPairs(mm, heap.getMembers().getMembers()) +
              ",max=" + std::to_string(heap.getMaxElements()) + "}";
@@ -1365,6 +1379,7 @@ std::string normalizedSubopStateTypeFingerprint(subop::MemberManager& mm, mlir::
 }
 
 llvm::DenseMap<mlir::Value, std::string> buildTableDescrByTableState(mlir::ModuleOp moduleOp) {
+   // Maps every `get_external` execution_step result (table, externalhashindex, …) to normalized descr hex.
    llvm::DenseMap<mlir::Value, std::string> tableDescr;
    moduleOp.walk([&](subop::ExecutionStepOp step) {
       if (!isExternalTableRefStep(step)) return;
