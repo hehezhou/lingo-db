@@ -409,9 +409,9 @@ static StateDepEligibility resolveDepEligibilityRec(
    }
 
    unsigned nTransparent = 0;
-   unsigned nTable = 0;
    unsigned nOther = 0;
    mlir::Value soleTransparent;
+   llvm::SmallVector<mlir::Value, 4> leafPreds;
    for (mlir::Value p : preds) {
       if (isTransparentDepCarrierType(p.getType())) {
          nTransparent++;
@@ -419,14 +419,16 @@ static StateDepEligibility resolveDepEligibilityRec(
          continue;
       }
       if (isGetExternalLeafState(p)) {
-         nTable++;
+         leafPreds.push_back(p);
          continue;
       }
       nOther++;
    }
 
-   if (nTransparent > 0 && preds.size() > 1) {
-      assert(false && "state with a transparent dep must not have multiple direct predecessors");
+   // Transparent carriers are not independent states: at most one direct transparent pred; its
+   // external deps are folded in below. Other state preds are allowed but make reuse ineligible.
+   if (nTransparent > 1) {
+      assert(false && "state must not have multiple direct transparent predecessors");
    }
 
    if (nOther > 0) {
@@ -434,32 +436,32 @@ static StateDepEligibility resolveDepEligibilityRec(
       return {false, {}};
    }
 
-   if (nTransparent == 1 && preds.size() == 1) {
-      StateDepEligibility inner =
-         resolveDepEligibilityRec(soleTransparent, dag, tableDescrByTableState, visiting);
-      visiting.erase(stateCanon);
-      return inner;
-   }
-
-   assert(nTransparent == 0 && "unexpected transparent predecessor");
-   assert(nTable == preds.size() && "only get_external leaf predecessors expected");
-
    StateDepEligibility out;
    out.eligible = true;
-   out.depTokensSorted.reserve(nTable);
-   for (mlir::Value p : preds) {
+   out.depTokensSorted.reserve(leafPreds.size() + 4);
+
+   for (mlir::Value p : leafPreds) {
       auto itD = tableDescrByTableState.find(p);
       assert(itD != tableDescrByTableState.end() && "get_external leaf predecessor must have GetExternal descr");
-      std::string token;
       if (mlir::isa<subop::TableType>(p.getType())) {
-         token = std::string("table:") + itD->second;
+         out.depTokensSorted.push_back(std::string("table:") + itD->second);
       } else if (mlir::isa<subop::ExternalHashIndexType>(p.getType())) {
-         token = std::string("externalhashindex:") + itD->second;
+         out.depTokensSorted.push_back(std::string("externalhashindex:") + itD->second);
       } else {
          llvm_unreachable("get_external leaf predecessor must be table or externalhashindex");
       }
-      out.depTokensSorted.push_back(std::move(token));
    }
+
+   if (nTransparent == 1) {
+      StateDepEligibility inner =
+         resolveDepEligibilityRec(soleTransparent, dag, tableDescrByTableState, visiting);
+      if (!inner.eligible) {
+         visiting.erase(stateCanon);
+         return {false, {}};
+      }
+      out.depTokensSorted.append(inner.depTokensSorted.begin(), inner.depTokensSorted.end());
+   }
+
    llvm::sort(out.depTokensSorted);
    out.depTokensSorted.erase(std::unique(out.depTokensSorted.begin(), out.depTokensSorted.end()),
                              out.depTokensSorted.end());
@@ -2143,8 +2145,8 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
    }
 
    os << "\n// ==== cross-query state matches (experimental) ====\n";
-   os << "// Eligible states: deps resolve to external tables only (via transparent carriers), constructionHash + type_fp match.\n";
-   os << "// Special cases: transparent buffer/thread_local (dep carriers); hash_indexed_view (join match details).\n";
+   os << "// Eligible states: deps resolve to get_external leaves (optionally via one transparent carrier chain), constructionHash + type_fp match.\n";
+   os << "// Special cases: transparent buffer/thread_local (folded, not reuse targets); hash_indexed_view (join match details).\n";
 
    // Debug helper: print eligible join hash_indexed_view profiles per query (capped).
    {
