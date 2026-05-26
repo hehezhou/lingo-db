@@ -398,7 +398,8 @@ bool isCreateOnlyExecutionStep(subop::ExecutionStepOp step) {
    return true;
 }
 
-/// Buffer / thread_local / sorted_view carriers: never cross-query reuse targets.
+/// Type-side predicate for "transparent" dependency carriers.
+/// Actual transparency is computed from RW usage and stored on a per-value basis.
 static bool isTransparentDepCarrierType(mlir::Type t) {
    if (mlir::isa<subop::BufferType>(t)) return true;
    if (mlir::isa<subop::SortedViewType>(t)) return true;
@@ -413,6 +414,52 @@ struct RWFlags {
    bool read = false;
    bool write = false;
 };
+
+static bool isTransparentStateValue(mlir::Value v, const llvm::DenseSet<mlir::Value>& transparentStates) {
+   if (!v) return false;
+   if (!isTransparentDepCarrierType(v.getType())) return false;
+   return transparentStates.contains(canonicalizeStateValueDeep(v));
+}
+
+/// Compute "transparent" states (a) type is buffer/thread_local/sorted_view AND
+/// (b) it has exactly one successor step: used as pure read in exactly one step, and that step has
+///     exactly one write state.
+static llvm::DenseSet<mlir::Value> computeTransparentStatesFromRw(
+   const llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>>& rwByStep) {
+   llvm::DenseMap<mlir::Value, llvm::SmallVector<int, 4>> pureReadStepsByState;
+
+   llvm::DenseMap<int, unsigned> writeCountByStep;
+   for (auto& it : rwByStep) {
+      unsigned wc = 0;
+      for (auto& kv : it.second) if (kv.second.write) wc++;
+      writeCountByStep[it.first] = wc;
+   }
+
+   for (auto& it : rwByStep) {
+      int stepIdx = it.first;
+      for (auto& kv : it.second) {
+         mlir::Value s = canonicalizeStateValueDeep(kv.first);
+         const RWFlags& f = kv.second;
+         if (!isTransparentDepCarrierType(s.getType())) continue;
+         if (f.read && !f.write) {
+            pureReadStepsByState[s].push_back(stepIdx);
+         }
+      }
+   }
+
+   llvm::DenseSet<mlir::Value> out;
+   for (auto& it : pureReadStepsByState) {
+      mlir::Value s = it.first;
+      auto& steps = it.second;
+      llvm::sort(steps);
+      steps.erase(std::unique(steps.begin(), steps.end()), steps.end());
+      if (steps.size() != 1) continue;
+      int onlyStep = steps[0];
+      if (writeCountByStep.lookup(onlyStep) != 1) continue;
+      out.insert(s);
+   }
+   return out;
+}
 
 /// Same-step RW edges: predecessor `r` must be available before writer `w` is constructed in that step.
 struct StateDependencyGraph {
@@ -463,6 +510,7 @@ struct StateDepEligibility {
 
 static StateDepEligibility resolveDepEligibilityRec(
    mlir::Value state, const StateDependencyGraph& dag,
+   const llvm::DenseSet<mlir::Value>& transparentStates,
    const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState, llvm::DenseSet<mlir::Value>& visiting) {
    mlir::Value stateCanon = canonicalizeStateValueDeep(state);
    assert(visiting.insert(stateCanon).second && "state dependency graph must be acyclic");
@@ -471,7 +519,7 @@ static StateDepEligibility resolveDepEligibilityRec(
 
    if (preds.empty()) {
       visiting.erase(stateCanon);
-      if (isTransparentDepCarrierType(stateCanon.getType())) {
+      if (isTransparentStateValue(stateCanon, transparentStates)) {
          return {false, {}};
       }
       return {true, {}};
@@ -482,7 +530,7 @@ static StateDepEligibility resolveDepEligibilityRec(
    mlir::Value soleTransparent;
    llvm::SmallVector<mlir::Value, 4> leafPreds;
    for (mlir::Value p : preds) {
-      if (isTransparentDepCarrierType(p.getType())) {
+      if (isTransparentStateValue(p, transparentStates)) {
          nTransparent++;
          soleTransparent = p;
          continue;
@@ -523,7 +571,7 @@ static StateDepEligibility resolveDepEligibilityRec(
 
    if (nTransparent == 1) {
       StateDepEligibility inner =
-         resolveDepEligibilityRec(soleTransparent, dag, tableDescrByTableState, visiting);
+         resolveDepEligibilityRec(soleTransparent, dag, transparentStates, tableDescrByTableState, visiting);
       if (!inner.eligible) {
          visiting.erase(stateCanon);
          return {false, {}};
@@ -540,11 +588,12 @@ static StateDepEligibility resolveDepEligibilityRec(
 
 static StateDepEligibility evaluateStateDepEligibility(
    mlir::Value reuseTarget, const StateDependencyGraph& dag,
+   const llvm::DenseSet<mlir::Value>& transparentStates,
    const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState) {
    mlir::Value canon = canonicalizeStateValueDeep(reuseTarget);
-   assert(!isTransparentDepCarrierType(canon.getType()) && "transparent states are not reuse targets");
+   assert(!isTransparentStateValue(canon, transparentStates) && "transparent states are not reuse targets");
    llvm::DenseSet<mlir::Value> visiting;
-   return resolveDepEligibilityRec(canon, dag, tableDescrByTableState, visiting);
+   return resolveDepEligibilityRec(canon, dag, transparentStates, tableDescrByTableState, visiting);
 }
 
 /// Trace SSA backward through nested regions / tuple pipelines to the owning `!subop.state` value.
@@ -1411,7 +1460,6 @@ std::string fingerprintMemberTypesMultiset(subop::MemberManager& mm, llvm::Array
 std::string normalizedSubopStateTypeFingerprint(subop::MemberManager& mm, mlir::Type t) {
    assert(!mlir::isa<subop::HashIndexedViewType>(t) &&
           "hash_indexed_view must use normalizedHashIndexedViewTypeFingerprintForJoinMatch");
-   assert(!isTransparentDepCarrierType(t) && "transparent states are not reuse match targets");
    if (auto rt = mlir::dyn_cast<subop::ResultTableType>(t)) {
       // Ignore compiler-chosen member names: only the multiset of member types matters for cross-module matching.
       return std::string("result_table{types=") + fingerprintMemberTypesMultiset(mm, rt.getMembers().getMembers()) + "}";
@@ -1533,6 +1581,7 @@ struct ModuleMatchAndReuseAnalysis {
    llvm::DenseMap<int, llvm::DenseMap<mlir::Value, RWFlags>> rwByStep;
    llvm::DenseMap<mlir::Value, int> createdAtByState;
    llvm::DenseMap<mlir::Value, mlir::Value> mergedFromShadowState;
+   llvm::DenseSet<mlir::Value> transparentStates;
    llvm::DenseMap<mlir::Value, llvm::SmallSet<int, 16>> writesByState;
    llvm::SmallVector<mlir::Value, 64> statesSorted;
    ModuleReuseInfo reuse;
@@ -1641,6 +1690,7 @@ static ModuleStepRwAnalysis analyzeModuleExecutionStepRw(ModuleMatchAndReuseAnal
    }
 
    a.rwByStep = rw.rwByStep;
+   a.transparentStates = computeTransparentStatesFromRw(a.rwByStep);
    return rw;
 }
 
@@ -1727,7 +1777,10 @@ static llvm::SmallVector<mlir::Value, 64> collectReuseCandidateStates(mlir::Modu
          auto itCreated = a.createdAtByState.find(key);
          assert(itCreated != a.createdAtByState.end() && "execution_step state result must be tracked");
          if (itCreated->second < 0) continue;
+         // Carrier states (buffers, sorted views, thread_local<state>) are never reuse match targets.
+         // "Transparent" is an eligibility/dep property; matching still only supports concrete state types.
          if (isTransparentDepCarrierType(key.getType())) continue;
+         if (isTransparentStateValue(key, a.transparentStates)) continue;
          candidates.push_back(key);
       }
    }
@@ -1759,11 +1812,12 @@ static bool determineStateReuseEligibility(
    const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState,
    StateDepEligibility& outDep) {
    mlir::Value stateCanon = canonicalizeStateValueDeep(state);
-   assert(!isTransparentDepCarrierType(stateCanon.getType()) && "transparent states are never reuse targets");
+   assert(!isTransparentStateValue(stateCanon, module.transparentStates) && "transparent states are never reuse targets");
+   assert(!isTransparentDepCarrierType(stateCanon.getType()) && "carrier states are never reuse match targets");
    assert(!module.writesByState.lookup(stateCanon).empty() &&
           "reuse candidate must be constructed in at least one execution_step");
 
-   outDep = evaluateStateDepEligibility(stateCanon, depGraph, tableDescrByTableState);
+   outDep = evaluateStateDepEligibility(stateCanon, depGraph, module.transparentStates, tableDescrByTableState);
    if (!outDep.eligible) return false;
 
    for (int si : constructionStepIndices) {
