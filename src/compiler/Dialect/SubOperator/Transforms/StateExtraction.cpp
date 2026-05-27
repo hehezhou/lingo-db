@@ -43,7 +43,7 @@ namespace {
 
 static std::string renderExternalDataSourceDescrMatchString(
    const lingodb::runtime::ExternalDatasourceProperty& ds,
-   llvm::ArrayRef<lingodb::runtime::ExternalDatasourceProperty::Mapping> mapping) {
+   llvm::ArrayRef<lingodb::runtime::ExternalDatasourceProperty::Mapping> mapping, bool includeFilters = true) {
    using lingodb::runtime::ExternalDatasourceProperty;
    using lingodb::runtime::FilterDescription;
    using lingodb::runtime::FilterOp;
@@ -51,12 +51,14 @@ static std::string renderExternalDataSourceDescrMatchString(
    llvm::SmallVector<ExternalDatasourceProperty::Mapping, 8> mappingSorted(mapping.begin(), mapping.end());
    llvm::sort(mappingSorted, [](const auto& a, const auto& b) { return a.memberName < b.memberName; });
 
-   // Normalize filters: de-duplicate then sort by a stable key.
-   std::unordered_set<FilterDescription> uniq;
    llvm::SmallVector<FilterDescription, 8> filters;
-   for (auto& f : ds.filterDescriptions) {
-      if (!uniq.insert(f).second) continue;
-      filters.push_back(f);
+   if (includeFilters) {
+      // Normalize filters: de-duplicate then sort by a stable key.
+      std::unordered_set<FilterDescription> uniq;
+      for (auto& f : ds.filterDescriptions) {
+         if (!uniq.insert(f).second) continue;
+         filters.push_back(f);
+      }
    }
    auto filterOpToStr = [](FilterOp op) -> const char* {
       switch (op) {
@@ -90,14 +92,16 @@ static std::string renderExternalDataSourceDescrMatchString(
       out = os.str();
       return out;
    };
-   llvm::sort(filters, [&](const FilterDescription& a, const FilterDescription& b) {
-      if (a.columnName != b.columnName) return a.columnName < b.columnName;
-      if (a.columnId != b.columnId) return a.columnId < b.columnId;
-      if (a.op != b.op) return static_cast<uint8_t>(a.op) < static_cast<uint8_t>(b.op);
-      auto av = filterValueToStr(a);
-      auto bv = filterValueToStr(b);
-      return av < bv;
-   });
+   if (includeFilters) {
+      llvm::sort(filters, [&](const FilterDescription& a, const FilterDescription& b) {
+         if (a.columnName != b.columnName) return a.columnName < b.columnName;
+         if (a.columnId != b.columnId) return a.columnId < b.columnId;
+         if (a.op != b.op) return static_cast<uint8_t>(a.op) < static_cast<uint8_t>(b.op);
+         auto av = filterValueToStr(a);
+         auto bv = filterValueToStr(b);
+         return av < bv;
+      });
+   }
 
    // Render to a stable string that we still use for matching (for now).
    std::string s;
@@ -1153,7 +1157,7 @@ static void relaxJoinHivDepTokensInProfile(
          if (itFull == tableDescrByTableState.end() || itFull->second != descr) continue;
          auto kept = filterExternalDatasourceMappingForJoinMatch(ds.mapping,
                                                                  joinDetails.joinKeyColumnIdentifiersSanitized);
-         tok = std::string("table:") + renderExternalDataSourceDescrMatchString(ds, kept);
+         tok = std::string("table:") + renderExternalDataSourceDescrMatchString(ds, kept, /*includeFilters=*/false);
          break;
       }
    }
@@ -1230,15 +1234,19 @@ struct StepDagHasher {
 
    uint64_t hashExternalLeaf(mlir::Value v) {
       assert(tableDescrByTableState);
+      if (relaxJoinPayloadColumns && externalDatasourceByTableState) {
+         if (auto itDs = externalDatasourceByTableState->find(v); itDs != externalDatasourceByTableState->end()) {
+            std::string descr =
+               renderExternalDataSourceDescrMatchString(itDs->second, itDs->second.mapping, /*includeFilters=*/false);
+            uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(descr)));
+            h = hashCombineU64(h, hashMlirType(v.getType()));
+            return h;
+         }
+      }
       if (auto it = tableDescrByTableState->find(v); it != tableDescrByTableState->end()) {
          uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(it->second)));
          h = hashCombineU64(h, hashMlirType(v.getType()));
          return h;
-      }
-      if (relaxJoinPayloadColumns && externalDatasourceByTableState) {
-         if (auto itDs = externalDatasourceByTableState->find(v); itDs != externalDatasourceByTableState->end()) {
-            return static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(itDs->second.tableName)));
-         }
       }
       assert(!isGetExternalLeafState(v) && "get_external leaf state must have GetExternal descr");
       return hashMlirType(v.getType());
