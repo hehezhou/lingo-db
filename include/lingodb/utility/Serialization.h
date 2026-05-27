@@ -1,5 +1,6 @@
 #ifndef LINGODB_UTILITY_SERIALIZATION_H
 #define LINGODB_UTILITY_SERIALIZATION_H
+#include <cassert>
 #include <cstddef>
 #include <fstream>
 #include <memory>
@@ -194,9 +195,23 @@ class Serializer {
 };
 class Deserializer {
    ByteReader& reader;
+   std::optional<marker_t> pushedBackMarker;
 
    public:
    Deserializer(ByteReader& reader) : reader(reader) {}
+
+   /// Return one previously pushed-back marker on the next marker read (used for optional trailing properties).
+   void pushBackMarker(marker_t marker) {
+      assert(!pushedBackMarker.has_value() && "Deserializer supports a single pushed-back marker");
+      pushedBackMarker = marker;
+   }
+
+   marker_t readMarker() { return read<uint16_t>(); }
+
+   template <class T>
+   T readSerializedPayload() {
+      return read<T>();
+   }
 
    private:
    template <std::same_as<bool> T>
@@ -209,6 +224,11 @@ class Deserializer {
    }
    template <std::same_as<uint16_t> T>
    T read() {
+      if (pushedBackMarker) {
+         uint16_t m = *pushedBackMarker;
+         pushedBackMarker.reset();
+         return m;
+      }
       return reader.read<T>();
    }
    template <std::same_as<int> T>

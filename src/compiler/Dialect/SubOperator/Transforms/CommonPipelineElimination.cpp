@@ -117,7 +117,8 @@ class CommonPipelineEliminationPass : public mlir::PassWrapper<CommonPipelineEli
                if (other.inGroup) {
                   continue;
                }
-               if (curr.dataSource.filterDescriptions == other.dataSource.filterDescriptions) {
+               if (curr.dataSource.filterDescriptions == other.dataSource.filterDescriptions &&
+                   curr.dataSource.orFilterClauses == other.dataSource.orFilterClauses) {
                   std::unordered_set<std::string> colsCurr;
                   std::unordered_set<std::string> colsOther;
                   for (auto& mapping : curr.dataSource.mapping) {

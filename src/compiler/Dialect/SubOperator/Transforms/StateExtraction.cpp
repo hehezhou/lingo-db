@@ -115,11 +115,24 @@ static std::string renderExternalDataSourceDescrMatchString(
       ss << mappingSorted[i].memberName << "->" << mappingSorted[i].identifier;
    }
    ss << "]";
+   auto renderFilterList = [&](llvm::ArrayRef<FilterDescription> list) {
+      for (size_t i = 0; i < list.size(); i++) {
+         if (i) ss << ",";
+         ss << list[i].columnName << "#" << list[i].columnId << ":" << filterOpToStr(list[i].op) << "{"
+            << filterValueToStr(list[i]) << "}";
+      }
+   };
    ss << ";filters=[";
-   for (size_t i = 0; i < filters.size(); i++) {
-      if (i) ss << ",";
-      ss << filters[i].columnName << "#" << filters[i].columnId << ":" << filterOpToStr(filters[i].op) << "{"
-         << filterValueToStr(filters[i]) << "}";
+   renderFilterList(filters);
+   ss << "]";
+   ss << ";or_filters=[";
+   if (includeFilters) {
+      for (size_t ci = 0; ci < ds.orFilterClauses.size(); ci++) {
+         if (ci) ss << "|";
+         ss << "(";
+         renderFilterList(ds.orFilterClauses[ci]);
+         ss << ")";
+      }
    }
    ss << "]";
    ss.flush();

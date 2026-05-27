@@ -21,16 +21,21 @@ static utility::Tracer::Event tableScan("Tablescan", "tableScan");
 class TableSource : public lingodb::runtime::DataSource {
    lingodb::runtime::TableStorage& tableStorage;
    std::unordered_map<std::string, std::string> memberToColumn;
-   std::vector<lingodb::runtime::FilterDescription> restrictions;
+   std::vector<lingodb::runtime::FilterDescription> filters;
+   std::vector<std::vector<lingodb::runtime::FilterDescription>> orFilterClauses;
 
    public:
-   TableSource(lingodb::runtime::TableStorage& tableStorage, std::unordered_map<std::string, std::string> memberToColumn, std::vector<lingodb::runtime::FilterDescription> restrictions) : tableStorage(tableStorage), memberToColumn(memberToColumn), restrictions(restrictions) {}
+   TableSource(lingodb::runtime::TableStorage& tableStorage, std::unordered_map<std::string, std::string> memberToColumn,
+               std::vector<lingodb::runtime::FilterDescription> filters,
+               std::vector<std::vector<lingodb::runtime::FilterDescription>> orFilterClauses)
+      : tableStorage(tableStorage), memberToColumn(memberToColumn), filters(std::move(filters)),
+        orFilterClauses(std::move(orFilterClauses)) {}
    void iterate(bool parallel, std::vector<std::string> members, const std::function<void(lingodb::runtime::BatchView*)>& cb) override {
       std::vector<std::string> columns;
       for (const auto& member : members) {
          columns.push_back(memberToColumn.at(member));
       }
-      auto scanTask = tableStorage.createScanTask({parallel, columns, restrictions, cb});
+      auto scanTask = tableStorage.createScanTask({parallel, columns, filters, orFilterClauses, cb});
       lingodb::scheduler::awaitChildTask(std::move(scanTask));
    }
 };
@@ -59,7 +64,7 @@ lingodb::runtime::DataSource* lingodb::runtime::DataSource::get(lingodb::runtime
    std::string tableName;
    std::unordered_map<std::string, std::string> memberToColumn;
    std::unordered_set<FilterDescription> uniqueRestrictions;
-   std::vector<FilterDescription> restrictions;
+   std::vector<FilterDescription> filters;
 
    std::string dataSourceRaw = description.str();
    auto dataSource = utility::deserializeFromHexString<ExternalDatasourceProperty>(dataSourceRaw);
@@ -69,8 +74,9 @@ lingodb::runtime::DataSource* lingodb::runtime::DataSource::get(lingodb::runtime
          continue;
       }
       uniqueRestrictions.insert(filterDesc);
-      restrictions.push_back(filterDesc);
+      filters.push_back(filterDesc);
    }
+   std::vector<std::vector<FilterDescription>> orFilterClauses = std::move(dataSource.orFilterClauses);
    for (auto& mapping : dataSource.mapping) {
       memberToColumn[mapping.memberName] = mapping.identifier;
    }
@@ -78,7 +84,7 @@ lingodb::runtime::DataSource* lingodb::runtime::DataSource::get(lingodb::runtime
    if (auto maybeRelation = session.getCatalog()->getTypedEntry<catalog::TableCatalogEntry>(tableName)) {
       auto relation = maybeRelation.value();
 
-      auto* ts = new TableSource(relation->getTableStorage(), memberToColumn, restrictions);
+      auto* ts = new TableSource(relation->getTableStorage(), memberToColumn, std::move(filters), std::move(orFilterClauses));
       getCurrentExecutionContext()->registerState({ts, [](void* ptr) { delete reinterpret_cast<TableSource*>(ptr); }});
       return ts;
 

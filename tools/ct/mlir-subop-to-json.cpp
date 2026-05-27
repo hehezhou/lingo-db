@@ -544,6 +544,34 @@ class ToJson {
                   }
                   j["filters"].push_back(fj);
                }
+               j["or_filter_clauses"] = nlohmann::json::array();
+               for (const auto& clause : datasource.orFilterClauses) {
+                  nlohmann::json clauseJ = nlohmann::json::array();
+                  for (const auto& f : clause) {
+                     nlohmann::json fj;
+                     fj["columnName"] = f.columnName;
+                     fj["columnId"] = f.columnId;
+                     switch (f.op) {
+                        case lingodb::runtime::FilterOp::EQ: fj["op"] = "EQ"; break;
+                        case lingodb::runtime::FilterOp::NEQ: fj["op"] = "NEQ"; break;
+                        case lingodb::runtime::FilterOp::LT: fj["op"] = "LT"; break;
+                        case lingodb::runtime::FilterOp::LTE: fj["op"] = "LTE"; break;
+                        case lingodb::runtime::FilterOp::GT: fj["op"] = "GT"; break;
+                        case lingodb::runtime::FilterOp::GTE: fj["op"] = "GTE"; break;
+                        case lingodb::runtime::FilterOp::NOTNULL: fj["op"] = "NOTNULL"; break;
+                        case lingodb::runtime::FilterOp::IN: fj["op"] = "IN"; break;
+                        default: fj["op"] = "UNKNOWN"; break;
+                     }
+                     auto size = std::visit([&](auto const& vec) { return vec.size(); }, f.values);
+                     if (size == 0) {
+                        std::visit([&](auto const& v) { fj["value"] = v; }, f.value);
+                     } else {
+                        std::visit([&](auto const& vec) { fj["values"] = vec; }, f.values);
+                     }
+                     clauseJ.push_back(fj);
+                  }
+                  j["or_filter_clauses"].push_back(clauseJ);
+               }
                if (!datasource.index.empty()) {
                   j["index"] = datasource.index;
                   j["indexType"] = datasource.indexType;

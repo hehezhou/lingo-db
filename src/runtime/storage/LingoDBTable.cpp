@@ -539,7 +539,10 @@ std::unique_ptr<scheduler::Task> LingoDBTable::createScanTask(const ScanConfig& 
       assert(colId >= 0);
       colIds.push_back(colId);
    }
-   auto restrictions = lingodb::runtime::Restrictions::create(scanConfig.filters, *schema);
+   std::vector<std::vector<lingodb::runtime::FilterDescription>> clauses;
+   clauses.push_back(scanConfig.filters);
+   clauses.insert(clauses.end(), scanConfig.orFilterClauses.begin(), scanConfig.orFilterClauses.end());
+   auto restrictions = lingodb::runtime::Restrictions::createFromFilterClauses(std::move(clauses), *schema);
    if (scanConfig.parallel) {
       return std::make_unique<ScanBatchesTask>(*this, tableData, colIds, std::move(restrictions), scanConfig.cb);
    } else {

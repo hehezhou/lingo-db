@@ -12,11 +12,19 @@ class Filter {
    virtual ~Filter() {}
 };
 class Restrictions {
-   std::vector<std::pair<std::unique_ptr<lingodb::runtime::Filter>, size_t>> filters;
+   /// Each entry is one AND-clause; rows pass if they satisfy any clause (OR).
+   std::vector<std::vector<std::pair<std::unique_ptr<lingodb::runtime::Filter>, size_t>>> andClauses;
+
+   std::pair<size_t, uint16_t*> applyAndClause(size_t offset, size_t length, uint16_t* selVec1, uint16_t* selVec2,
+                                               const std::vector<std::pair<std::unique_ptr<Filter>, size_t>>& clause,
+                                               std::function<const ArrayView*(size_t)> getArrayView) const;
 
    public:
    std::pair<size_t, uint16_t*> applyFilters(size_t offset, size_t length, uint16_t* selVec1, uint16_t* selVec2, std::function<const ArrayView*(size_t)> getArrayView);
    static std::unique_ptr<Restrictions> create(std::vector<FilterDescription> filterDescs, const arrow::Schema& schema);
+   /// `clauses[0]` is the conjunctive `filterDescriptions` group; further entries are `orFilterClauses`.
+   static std::unique_ptr<Restrictions> createFromFilterClauses(
+      std::vector<std::vector<FilterDescription>> clauses, const arrow::Schema& schema);
 };
 } // namespace lingodb::runtime
 

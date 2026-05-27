@@ -2,6 +2,8 @@
 #define LINGODB_RUNTIME_EXTERNALDATASOURCEPROPERTY_H
 #include "lingodb/utility/Serialization.h"
 #include "storage/TableStorage.h"
+
+#include <cassert>
 namespace lingodb::runtime {
 struct ExternalDatasourceProperty {
    struct Mapping {
@@ -23,7 +25,11 @@ struct ExternalDatasourceProperty {
    };
    std::string tableName;
    std::vector<Mapping> mapping;
+   /// Conjunctive filters: `filterDescriptions[0] AND filterDescriptions[1] AND ...`
    std::vector<runtime::FilterDescription> filterDescriptions{};
+   /// Disjunctive AND-clauses: overall predicate is
+   /// `(filterDescriptions...) OR (orFilterClauses[0]...) OR (orFilterClauses[1]...) OR ...`
+   std::vector<std::vector<runtime::FilterDescription>> orFilterClauses{};
    std::string index;
    std::string indexType;
 
@@ -33,10 +39,11 @@ struct ExternalDatasourceProperty {
       serializer.writeProperty(2, filterDescriptions);
       serializer.writeProperty(3, index);
       serializer.writeProperty(4, indexType);
+      serializer.writeProperty(5, orFilterClauses);
    }
    bool operator==(const ExternalDatasourceProperty& other) const {
       return other.index == index && other.indexType == indexType && other.mapping == mapping && other.tableName == tableName &&
-         other.filterDescriptions == filterDescriptions;
+         other.filterDescriptions == filterDescriptions && other.orFilterClauses == other.orFilterClauses;
    }
 
    static ExternalDatasourceProperty deserialize(lingodb::utility::Deserializer& deserializer) {
@@ -46,6 +53,14 @@ struct ExternalDatasourceProperty {
       prop.filterDescriptions = deserializer.readProperty<std::vector<runtime::FilterDescription>>(2);
       prop.index = deserializer.readProperty<std::string>(3);
       prop.indexType = deserializer.readProperty<std::string>(4);
+      utility::marker_t next = deserializer.readMarker();
+      if (next == 5) {
+         prop.orFilterClauses =
+            deserializer.readSerializedPayload<std::vector<std::vector<runtime::FilterDescription>>>();
+         assert(deserializer.readMarker() == 5 && "Expected orFilterClauses property end marker");
+      } else {
+         deserializer.pushBackMarker(next);
+      }
 
       return prop;
    }

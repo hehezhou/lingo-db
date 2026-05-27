@@ -919,6 +919,80 @@ static ExternalDatasourceProperty mergeExternalDatasource(const ExternalDatasour
    return out;
 }
 
+static bool filterDescrLess(const lingodb::runtime::FilterDescription& a,
+                            const lingodb::runtime::FilterDescription& b) {
+   if (a.columnName != b.columnName) return a.columnName < b.columnName;
+   if (a.columnId != b.columnId) return a.columnId < b.columnId;
+   return static_cast<uint8_t>(a.op) < static_cast<uint8_t>(b.op);
+}
+
+static bool filterClauseEquals(llvm::ArrayRef<lingodb::runtime::FilterDescription> a,
+                               llvm::ArrayRef<lingodb::runtime::FilterDescription> b) {
+   if (a.size() != b.size()) return false;
+   llvm::SmallVector<lingodb::runtime::FilterDescription, 8> sa(a.begin(), a.end());
+   llvm::SmallVector<lingodb::runtime::FilterDescription, 8> sb(b.begin(), b.end());
+   llvm::sort(sa, filterDescrLess);
+   llvm::sort(sb, filterDescrLess);
+   for (size_t i = 0; i < sa.size(); ++i) {
+      if (!(sa[i] == sb[i])) return false;
+   }
+   return true;
+}
+
+/// Merge pushdown filters from matched queries into `(filterDescriptions AND ...) OR (orFilterClauses[i] AND ...)`.
+static void mergeExternalFiltersForOrReuse(ExternalDatasourceProperty& merged,
+                                           llvm::ArrayRef<ExternalDatasourceProperty> filterSources) {
+   llvm::SmallVector<llvm::SmallVector<lingodb::runtime::FilterDescription, 8>, 4> uniqueClauses;
+   auto tryAddClause = [&](llvm::ArrayRef<lingodb::runtime::FilterDescription> clause) {
+      if (clause.empty()) return;
+      for (const auto& existing : uniqueClauses) {
+         if (filterClauseEquals(existing, clause)) return;
+      }
+      uniqueClauses.emplace_back(clause.begin(), clause.end());
+   };
+   for (const ExternalDatasourceProperty& src : filterSources) {
+      tryAddClause(src.filterDescriptions);
+      for (const auto& clause : src.orFilterClauses) tryAddClause(clause);
+   }
+   merged.filterDescriptions.clear();
+   merged.orFilterClauses.clear();
+   if (uniqueClauses.empty()) return;
+   merged.filterDescriptions.assign(uniqueClauses.front().begin(), uniqueClauses.front().end());
+   for (size_t i = 1; i < uniqueClauses.size(); ++i) {
+      merged.orFilterClauses.emplace_back(uniqueClauses[i].begin(), uniqueClauses[i].end());
+   }
+}
+
+static subop::ExecutionStepOp createMergedExternalTableRefStep(mlir::OpBuilder& gb, mlir::Location loc,
+                                                               subop::TableType tableTy, llvm::StringRef descrHex) {
+   auto step = gb.create<subop::ExecutionStepOp>(loc, mlir::TypeRange{tableTy}, mlir::ValueRange{},
+                                                gb.getArrayAttr({gb.getBoolAttr(false)}));
+   auto& block = step.getSubOps().emplaceBlock();
+   mlir::OpBuilder ib = mlir::OpBuilder::atBlockBegin(&block);
+   auto ge = ib.create<subop::GetExternalOp>(loc, tableTy, mlir::StringAttr::get(gb.getContext(), descrHex));
+   ib.create<subop::ExecutionStepReturnOp>(loc, ge.getRes());
+   return step;
+}
+
+static void rewireBuildStepScannedTable(subop::ExecutionStepOp buildStep, subop::ScanRefsOp scanOp,
+                                        mlir::Value oldTableState, mlir::Value newTableState, subop::TableType newTy) {
+   mlir::Value oldCanon = canonicalizeStateValueForReuse(oldTableState);
+   mlir::Block& body = buildStep.getSubOps().front();
+   for (unsigned i = 0; i < buildStep.getNumOperands(); ++i) {
+      if (canonicalizeStateValueForReuse(buildStep.getOperand(i)) != oldCanon) continue;
+      buildStep.setOperand(i, newTableState);
+      if (i < body.getNumArguments()) body.getArgument(i).setType(newTy);
+   }
+   mlir::Value scanSt = scanOp.getState();
+   if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(scanSt)) {
+      assert(ba.getOwner() == &body && "scan_refs table state must be a build-step block argument");
+      ba.setType(newTy);
+   } else {
+      assert(canonicalizeStateValueForReuse(scanSt) == oldCanon && "scan_refs table state must match rewired operand");
+      scanOp.getStateMutable().assign(newTableState);
+   }
+}
+
 static mlir::Type memberTypeForIdentifier(subop::TableType tableTy, subop::MemberManager& mm,
                                           llvm::StringRef identifier) {
    if (!tableTy) return {};
@@ -1310,6 +1384,8 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
                                   countUnionPayloadLeavesOnTable(plan.payloadColumns, donorTableTy, mm) > 0;
 
    if (haveDonorExternal) {
+   llvm::SmallVector<ExternalDatasourceProperty, 4> filterSources;
+   filterSources.push_back(mergedDs);
    for (size_t pi = 0; pi < peerHivs.size(); ++pi) {
       auto [peerMod, peerHiv] = peerHivs[pi];
       if (!peerMod || !peerHiv) continue;
@@ -1322,9 +1398,23 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
       }
       subop::ExecutionStepOp peerBuild = findBufferBuildStepWithTableMaterialize(peerBuf, reusePeer);
       if (!peerBuild) peerBuild = findBufferBuildStepWithTableScan(peerMod);
-      if (peerBuild) mergePeerExternalFromBuildStepScan(mergedDs, haveDs, peerBuild, reusePeer, donorTableName);
+      if (peerBuild) {
+         subop::ScanRefsOp peerScan = findTableScanRefsForExternalTable(peerBuild, donorTableName, reusePeer);
+         if (peerScan) {
+            llvm::StringRef peerTableName;
+            ExternalDatasourceProperty peerDs;
+            bool havePeerDs = false;
+            subop::TableType peerTy;
+            assert(resolveScannedTableExternal(peerBuild, peerScan.getState(), reusePeer, peerTableName, peerDs,
+                                               havePeerDs, peerTy) &&
+                   havePeerDs && peerTableName == donorTableName);
+            filterSources.push_back(std::move(peerDs));
+         }
+         mergePeerExternalFromBuildStepScan(mergedDs, haveDs, peerBuild, reusePeer, donorTableName);
+      }
    }
    assert(haveDs && "join superset: merged external datasource required for donor table");
+   mergeExternalFiltersForOrReuse(mergedDs, filterSources);
 
    auto lookupPeerColumnType = [&](llvm::StringRef identifier) -> mlir::Type {
       for (size_t pi = 0; pi < peerHivs.size(); ++pi) {
@@ -1356,13 +1446,15 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    }
    llvm::sort(mergedDs.mapping, [](const auto& x, const auto& y) { return x.memberName < y.memberName; });
    std::string hex = lingodb::utility::serializeToHexString(mergedDs);
-   std::optional<subop::GetExternalOp> synthGe =
-      resolveGetExternalOpForScannedTable(buildStep, tableState, reuseSynthetic);
-   assert(synthGe && "join superset: scan_refs must resolve to get_external in table construction step");
-   synthGe->setDescrAttr(mlir::StringAttr::get(ctx, hex));
-   refreshTableStateTypesInModule(synthetic, synthGe->getResult(), newTableTy);
-
-   refreshTableStateTypesInModule(synthetic, tableState, newTableTy);
+   subop::ExecutionGroupOp eg = buildStep->getParentOfType<subop::ExecutionGroupOp>();
+   assert(eg && "join superset: buffer build step must live in an execution_group");
+   mlir::OpBuilder gb = mlir::OpBuilder::atBlockBegin(&eg.getSubOps().front());
+   gb.setInsertionPoint(buildStep);
+   subop::ExecutionStepOp mergedTableRefStep =
+      createMergedExternalTableRefStep(gb, buildStep.getLoc(), newTableTy, hex);
+   mlir::Value mergedTableState = mergedTableRefStep.getResult(0);
+   rewireBuildStepScannedTable(buildStep, scanOp, tableState, mergedTableState, newTableTy);
+   refreshTableStateTypesInModule(synthetic, mergedTableState, newTableTy);
    mergedSupplierTableTy = newTableTy;
    }
 

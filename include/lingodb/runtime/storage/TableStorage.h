@@ -81,7 +81,10 @@ struct FilterDescription {
 struct ScanConfig {
    bool parallel;
    std::vector<std::string> columns;
+   /// First disjunct: AND of `filters`.
    std::vector<FilterDescription> filters;
+   /// Further disjuncts: each inner vector is ANDed; combined with `filters` via OR.
+   std::vector<std::vector<FilterDescription>> orFilterClauses;
    std::function<void(lingodb::runtime::BatchView*)> cb;
 };
 class TableStorage {
