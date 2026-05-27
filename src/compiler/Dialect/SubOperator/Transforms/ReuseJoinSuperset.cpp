@@ -9,6 +9,8 @@
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorDialect.h"
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorOpsAttributes.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/StateExtraction.h"
+#include "lingodb/compiler/Dialect/SubOperator/Transforms/ColumnUsageAnalysis.h"
+#include "lingodb/compiler/Dialect/SubOperator/Transforms/StateUsageTransformer.h"
 #include "lingodb/compiler/Dialect/TupleStream/TupleStreamDialect.h"
 #include "lingodb/runtime/ExternalDataSourceProperty.h"
 #include "lingodb/utility/Serialization.h"
@@ -541,12 +543,7 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
          buf = it->second;
       }
       subop::ExecutionStepOp buildStep = findBufferBuildStepWithTableMaterialize(buf, reuse);
-      if (!buildStep) {
-         if (mlir::Operation* def = h.getDefiningOp()) {
-            if (auto mod = def->getParentOfType<mlir::ModuleOp>()) buildStep = findBufferBuildStepWithTableScan(mod);
-         }
-      }
-      if (!buildStep) return;
+      assert(buildStep && "join superset: build step required for ingestHiv");
       buildStep.walk([&](subop::MaterializeOp mat) {
          if (!getInnerBufferTypeForMaterializeState(mat.getState().getType()) &&
              !materializeTargetsJoinBuffer(mat, buf, reuse)) {
@@ -555,7 +552,7 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
          collectPayloadFromMaterialize(mat, linkMemberName, hashMemberName, mm, cm, joinKeyMemberName, unionCols,
                                        reuseQueryIndex);
       });
-      if (kEnableReuseStateFilterPredReapply && buildStep) {
+      if (kEnableReuseStateFilterPredReapply) {
          PayloadColumnSpec predSpec;
          predSpec.scope = kReuseFilterPredScope.str();
          predSpec.leaf = llvm::Twine(reuseQueryIndex).str();
@@ -563,7 +560,7 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
          predSpec.semanticKey = reuseFilterPredSemanticKey(reuseQueryIndex);
          unionCols.try_emplace(predSpec.semanticKey, predSpec);
       }
-      if (buildStep) ingestExternalTableColumnsFromBuildStepScan(buildStep, reuse, unionCols);
+      ingestExternalTableColumnsFromBuildStepScan(buildStep, reuse, unionCols);
    };
    ingestHiv(hivA, reuseA, 0);
    ingestHiv(hivB, reuseB, 1);
@@ -1059,11 +1056,20 @@ static void refreshTableStateTypesInModule(mlir::ModuleOp module, mlir::Value ta
    llvm::SmallVector<subop::Member> refCols;
    for (subop::Member m : newTy.getMembers().getMembers()) refCols.push_back(m);
    auto entryRefTy = subop::TableEntryRefType::get(ctx, subop::StateMembersAttr::get(ctx, refCols));
+
+   // Table scan refs use ColumnManager's global (scope,leaf) objects. Widening must not mutate
+   // ref.getColumn().type in place — other modules may still reference the same Column*.
+   subop::ColumnUsageAnalysis columnUsage(module);
+   subop::SubOpStateUsageTransformer transformer(columnUsage, ctx,
+                                                 [&](mlir::Operation*, mlir::Type) { return entryRefTy; });
+   llvm::DenseMap<tuples::Column*, tuples::ColumnDefAttr> widenedScanRefByColumn;
    module.walk([&](subop::ScanRefsOp scan) {
       if (!opaqueClosureContains(closure, scan.getState())) return;
-      auto ref = scan.getRef();
-      ref.getColumn().type = entryRefTy;
-      scan.setRefAttr(ref);
+      auto oldRef = scan.getRef();
+      tuples::Column* oldCol = &oldRef.getColumn();
+      auto [it, inserted] = widenedScanRefByColumn.try_emplace(oldCol);
+      if (inserted) it->second = transformer.createReplacementColumn(oldRef, entryRefTy);
+      scan.setRefAttr(it->second);
    });
 }
 
@@ -2498,6 +2504,17 @@ ClonedJoinBufferBuildSitesByKey recordClonedJoinBufferBuildSites(mlir::ModuleOp 
    return out;
 }
 
+static subop::ExecutionStepOp findJoinBufferBuildStepForHiv(mlir::ModuleOp module, mlir::Value hiv,
+                                                            const ModuleReuseInfo& reuse) {
+   mlir::Value canon = resolveCacheTargetStateForReuse(hiv, reuse);
+   mlir::Value buf = canon;
+   if (auto it = reuse.mergedFromShadowState.find(canon); it != reuse.mergedFromShadowState.end()) {
+      buf = it->second;
+   }
+   if (subop::ExecutionStepOp step = findBufferBuildStepWithTableMaterialize(buf, reuse)) return step;
+   return findBufferBuildStepWithTableScan(module);
+}
+
 void insertSyntheticFilterPredsAfterColumnUnion(
    mlir::ModuleOp synthetic, mlir::ModuleOp query0, mlir::ModuleOp query1,
    llvm::ArrayRef<CrossQueryStateMatchPair> matches, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
@@ -2528,13 +2545,26 @@ void insertSyntheticFilterPredsAfterColumnUnion(
       mlir::Value hivs[] = {resolveCacheTargetStateForReuse(match.stateA, reuse0),
                             resolveCacheTargetStateForReuse(match.stateB, reuse1)};
       ModuleReuseInfo* reuses[] = {&reuse0, &reuse1};
+      mlir::ModuleOp peerMods[] = {query0, query1};
 
       for (size_t i = 0; i < layout.payloadSemanticKeys.size(); ++i) {
          unsigned qIdx = 0;
          if (!parseReuseFilterPredSemanticKey(layout.payloadSemanticKeys[i], qIdx)) continue;
          llvm::StringRef predName = mm.getName(layout.payloadMembers[i]);
-         auto filters = decodeFiltersForStateFromWriterSteps(hivs[qIdx], *reuses[qIdx]);
-         filters = restrictFiltersToTableScanInExecutionStep(buildStep, filters);
+         assert(qIdx < 2 && "insertSyntheticFilterPreds: reuse_query_index out of range");
+         subop::ExecutionStepOp peerBuild = findJoinBufferBuildStepForHiv(peerMods[qIdx], hivs[qIdx], *reuses[qIdx]);
+         assert(peerBuild &&
+                "insertSyntheticFilterPreds: peer join-buffer build step with table scan_refs required");
+         // Per-query predicates come from the peer query's donor table get_external descr, not from HIV
+         // writer steps (cache_put / create_hash_indexed_view do not read !subop.table).
+         auto peerFilters = decodeFiltersFromTableScanInExecutionStep(peerBuild);
+         const bool peerHasValueFilters = llvm::any_of(
+            peerFilters, [](const runtime::FilterDescription& f) { return f.op != runtime::FilterOp::NOTNULL; });
+         auto filters = restrictFiltersToTableScanInExecutionStep(buildStep, peerFilters);
+         if (peerHasValueFilters) {
+            assert(!filters.empty() &&
+                   "insertSyntheticFilterPreds: peer pushdown filters must map to synthetic donor table scan");
+         }
          insertWriteSidePredIntoBufferConstructionStepForPredMember(buildStep, filters, predName);
       }
    }

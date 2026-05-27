@@ -1025,17 +1025,65 @@ decodeFiltersFromTableScanInExecutionStep(ExecutionStepOp step) {
    return decodeExternalFiltersForTableState(tableState);
 }
 
+static mlir::Value deriveFilterTruthValue(mlir::OpBuilder& rb, mlir::Location loc, mlir::Value v) {
+   if (mlir::isa<mlir::IntegerType>(v.getType()) && v.getType().getIntOrFloatBitWidth() == 1) return v;
+   return rb.create<lingodb::compiler::dialect::db::DeriveTruth>(loc, v);
+}
+
 // Emit one filter predicate (i1). Types aligned with runtime Restrictions::create (table scan).
 static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Location loc,
                                                    subop::MapCreationHelper& helper,
                                                    tuples::ColumnRefAttr colRef,
                                                    const runtime::FilterDescription& f) {
-   if (f.op == runtime::FilterOp::IN) {
-      assert(false && "runtime filter IR: FilterOp::IN not supported yet");
-   }
    mlir::Value colV = helper.access(colRef, loc);
    if (f.op == runtime::FilterOp::NOTNULL) {
       return rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+   }
+   if (f.op == runtime::FilterOp::IN) {
+      if (std::holds_alternative<std::vector<int64_t>>(f.values)) {
+         const auto& vals = std::get<std::vector<int64_t>>(f.values);
+         assert(!vals.empty() && "runtime filter IR: IN requires a non-empty value list");
+         auto itTy = mlir::dyn_cast<mlir::IntegerType>(colV.getType());
+         assert(itTy && "runtime filter IR: IN int64 values require integer column type");
+         mlir::Value acc;
+         for (int64_t v : vals) {
+            mlir::Value c = rb.create<mlir::arith::ConstantIntOp>(loc, v, itTy.getWidth());
+            mlir::Value eq = rb.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, colV, c);
+            acc = acc ? rb.create<mlir::arith::OrIOp>(loc, acc, eq) : eq;
+         }
+         return acc;
+      }
+      if (std::holds_alternative<std::vector<std::string>>(f.values)) {
+         const auto& vals = std::get<std::vector<std::string>>(f.values);
+         assert(!vals.empty() && "runtime filter IR: IN requires a non-empty value list");
+         mlir::Type colTy = getBaseType(colV.getType());
+         assert((mlir::isa<lingodb::compiler::dialect::db::DateType>(colTy) ||
+                 mlir::isa<lingodb::compiler::dialect::db::CharType>(colTy) ||
+                 mlir::isa<lingodb::compiler::dialect::db::StringType>(colTy)) &&
+                "runtime filter IR: IN string values require db.date, db.char, or db.string column");
+         llvm::SmallVector<mlir::Value> candidates;
+         candidates.reserve(vals.size());
+         for (const std::string& s : vals) {
+            candidates.push_back(
+               rb.create<lingodb::compiler::dialect::db::ConstantOp>(loc, colV.getType(), rb.getStringAttr(s)));
+         }
+         auto oneOf = rb.create<lingodb::compiler::dialect::db::OneOfOp>(loc, colV, candidates);
+         return deriveFilterTruthValue(rb, loc, oneOf);
+      }
+      if (std::holds_alternative<std::vector<double>>(f.values)) {
+         const auto& vals = std::get<std::vector<double>>(f.values);
+         assert(!vals.empty() && "runtime filter IR: IN requires a non-empty value list");
+         auto ft = mlir::dyn_cast<mlir::FloatType>(colV.getType());
+         assert(ft && "runtime filter IR: IN double values require float column type");
+         mlir::Value acc;
+         for (double v : vals) {
+            mlir::Value c = rb.create<mlir::arith::ConstantFloatOp>(loc, llvm::APFloat(v), ft);
+            mlir::Value eq = rb.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OEQ, colV, c);
+            acc = acc ? rb.create<mlir::arith::OrIOp>(loc, acc, eq) : eq;
+         }
+         return acc;
+      }
+      assert(false && "runtime filter IR: IN filter has unsupported values variant");
    }
    if (std::holds_alternative<int64_t>(f.value)) {
       int64_t v = std::get<int64_t>(f.value);
@@ -1075,9 +1123,27 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
          default: assert(false && "runtime filter IR: unsupported filter op");
       }
       auto cmp = rb.create<lingodb::compiler::dialect::db::CmpOp>(loc, p, colV, rhs);
-      return rb.create<lingodb::compiler::dialect::db::DeriveTruth>(loc, cmp);
+      return deriveFilterTruthValue(rb, loc, cmp);
    }
-   assert(false && "runtime filter IR: unsupported filter literal type (expected int64 or string)");
+   if (std::holds_alternative<double>(f.value)) {
+      double v = std::get<double>(f.value);
+      auto ft = mlir::dyn_cast<mlir::FloatType>(colV.getType());
+      assert(ft && "runtime filter IR: double literal requires float column type");
+      mlir::Value c = rb.create<mlir::arith::ConstantFloatOp>(loc, llvm::APFloat(v), ft);
+      using P = mlir::arith::CmpFPredicate;
+      P p;
+      switch (f.op) {
+         case runtime::FilterOp::EQ: p = P::OEQ; break;
+         case runtime::FilterOp::NEQ: p = P::ONE; break;
+         case runtime::FilterOp::LT: p = P::OLT; break;
+         case runtime::FilterOp::LTE: p = P::OLE; break;
+         case runtime::FilterOp::GT: p = P::OGT; break;
+         case runtime::FilterOp::GTE: p = P::OGE; break;
+         default: assert(false && "runtime filter IR: unsupported filter op");
+      }
+      return rb.create<mlir::arith::CmpFOp>(loc, p, colV, c);
+   }
+   assert(false && "runtime filter IR: unsupported filter literal type (expected int64, double, or string)");
    return {};
 }
 
@@ -1669,9 +1735,12 @@ void insertWriteSidePredIntoBufferConstructionStepForPredMember(
             materializeConstantTruePredColumnOnStream(pb, scanOp.getLoc(), scanOp.getRes(), predMemberName);
       } else {
          subop::GatherOp filterGather = insertFilterColumnGatherRightAfterScan(scanOp, filters);
-         assert(filterGather && "write_pred_buf: expected filter-column gather after scan");
+         assert(filterGather &&
+                "write_pred_buf: filter-column gather required for table-scan pushdown value filters");
          excludeOps.push_back(filterGather.getOperation());
          auto colByName = buildFilterColByNameFromGather(filterGather);
+         assert(!colByName.empty() &&
+                "write_pred_buf: gathered filter columns must cover pushdown filter identifiers");
          mlir::OpBuilder pb(filterGather);
          pb.setInsertionPointAfter(filterGather);
          std::tie(predStream, predDef) = materializeRuntimeFiltersAsPredicateColumn(
