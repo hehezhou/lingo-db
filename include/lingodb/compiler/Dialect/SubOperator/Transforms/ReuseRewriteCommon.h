@@ -14,6 +14,8 @@ namespace lingodb::compiler::dialect::subop {
 struct CacheTarget {
    mlir::Value state;
    uint64_t cacheKey;
+   /// When false, skip join-buffer \c filter_pred layout / write / probe for this cache key.
+   bool enableFilterPredReuse = true;
 };
 
 /// Cloned synthetic join-buffer build site (table \c scan_refs → \c materialize into buffer), recorded after

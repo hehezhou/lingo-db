@@ -26,12 +26,19 @@ struct CachedJoinBufferLayout {
    /// For each entry in \c query0SemanticKeys / \c query1SemanticKeys, index into the union-ordered arrays above.
    llvm::SmallVector<unsigned> query0SlotInUnion;
    llvm::SmallVector<unsigned> query1SlotInUnion;
+   /// Pre–\c cache_get probe \c gather member slots remapped to aligned \c cache_get HIV members.
+   llvm::DenseMap<subop::Member, subop::Member> probeGatherMemberRemap;
 };
 
 using CachedJoinBufferLayoutsByKey = llvm::DenseMap<uint64_t, CachedJoinBufferLayout>;
 
 /// Union payload semantic key \c reuse_filter_pred\x1fN → query index \p N.
 bool parseReuseFilterPredSemanticKey(llvm::StringRef semanticKey, unsigned& reuseQueryIndex);
+
+/// True when matched HIV peers' donor \c get_external pushdown filters are identical (no \c filter_pred reuse).
+bool joinMatchPeerExternalFiltersIdentical(mlir::ModuleOp query0, mlir::ModuleOp query1, mlir::Value hivA,
+                                           mlir::Value hivB, const ModuleReuseInfo& reuse0,
+                                           const ModuleReuseInfo& reuse1);
 
 /// Per \c cache_get: aligned HIV + SSA closure of probe-side uses (lookup → scan_list), same discovery as
 /// \c alignConsumerModulesToCachedJoinLayout.

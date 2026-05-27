@@ -15,10 +15,6 @@
 
 namespace lingodb::compiler::dialect::subop {
 
-/// Extend join-buffer / hashmap layouts with `filter_pred$0` and re-apply construction filters
-/// after `cache_get`. Set to false while this path is shelved.
-constexpr bool kEnableReuseStateFilterPredReapply = true;
-
 struct ReusePlanRewriteResult {
    mlir::OwningOpRef<mlir::ModuleOp> query0; // synthetic producer that cache_puts reusable states
    size_t numTargetsQuery0 = 0;

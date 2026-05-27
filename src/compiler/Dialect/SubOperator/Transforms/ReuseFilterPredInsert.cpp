@@ -1,4 +1,3 @@
-#include "lingodb/compiler/Dialect/SubOperator/Transforms/CrossQueryStateReuse.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseRewriteCommon.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseFilterPredInsert.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseStateClosure.h"
@@ -25,6 +24,14 @@ static std::optional<unsigned> parseFilterPredMemberSlot(llvm::StringRef memberN
    unsigned slot = 0;
    if (memberName.getAsInteger(10, slot)) return std::nullopt;
    return slot;
+}
+
+static bool hashIndexedViewHasFilterPredMember(mlir::MLIRContext* ctx, subop::HashIndexedViewType hiv) {
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (subop::Member m : hiv.getValueMembers().getMembers()) {
+      if (parseFilterPredMemberSlot(mm.getName(m))) return true;
+   }
+   return false;
 }
 
 subop::Member makeOrGetPredMemberForSlot(mlir::MLIRContext* ctx, unsigned slot) {
@@ -409,7 +416,10 @@ static mlir::Type extendHashMapTypeWithPred(mlir::Type t, subop::Member predMemb
 static subop::HashIndexedViewType extendHashIndexedViewWithPredMemberIfMissing(mlir::MLIRContext* ctx,
                                                                                subop::HashIndexedViewType hiv,
                                                                                subop::Member predMember) {
-   if (valueMembersContainMemberNamed(ctx, hiv.getValueMembers(), "filter_pred$0")) return hiv;
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   if (valueMembersContainMemberNamed(ctx, hiv.getValueMembers(), mm.getName(predMember))) return hiv;
+   // Identical-filter reuse keeps `cache_get` HIV without any `filter_pred$N` — do not introduce one.
+   if (!hashIndexedViewHasFilterPredMember(ctx, hiv)) return hiv;
    auto newVals = appendMember(ctx, hiv.getValueMembers(), predMember);
    return subop::HashIndexedViewType::get(ctx, hiv.getKeyMembers(), newVals, hiv.getCompareHashForLookup());
 }
@@ -435,6 +445,7 @@ static mlir::Type deepReplaceHivLookupEntryRefWithPredLayout(mlir::MLIRContext* 
    }
    if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(t)) {
       if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState())) {
+         if (!hashIndexedViewHasFilterPredMember(ctx, hiv)) return t;
          auto nhiv = extendHashIndexedViewWithPredMemberIfMissing(ctx, hiv, predMember);
          if (nhiv != hiv) return subop::LookupEntryRefType::get(ctx, nhiv);
       }
@@ -493,11 +504,6 @@ static void refreshHivListCarrierValueTypes(mlir::ModuleOp module, const llvm::D
 /// **types of SSA values present in the closure** (after `expandClosureThroughExecutionStepPorts`).
 void propagateSubOpColumnAttrsFromSsaStateLayout(mlir::ModuleOp module,
                                                         const llvm::DenseSet<void*>* closureFilter) {
-   // `alignConsumerHashIndexedViewsWithSyntheticProducer` strips nested lookup/HIV carriers to the
-   // synthetic producer layout; this pass re-extends attrs and SSA with `filter_pred$0` via
-   // `refreshHivListCarrierValueTypes`. Skip entirely while filter-pred reuse is disabled.
-   if (!kEnableReuseStateFilterPredReapply) return;
-
    auto* ctx = module.getContext();
    subop::Member predMember = makeOrGetPredMember(ctx);
    auto shouldUpdateOp = [&](mlir::Operation* op) {

@@ -41,6 +41,8 @@ struct CrossQueryStateMatchPair {
    mlir::Value stateA;
    mlir::Value stateB;
    uint64_t cacheKey = 0;
+   /// Per-match: insert union / synthetic / consumer \c filter_pred$N when peer external filters differ.
+   bool enableFilterPredReuse = true;
 };
 
 struct ModuleReuseInfo {

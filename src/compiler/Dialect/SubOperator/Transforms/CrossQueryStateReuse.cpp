@@ -26,6 +26,55 @@
 namespace lingodb::compiler::dialect::subop {
 namespace {
 
+llvm::SmallVector<CacheTarget, 64> cacheTargetsWithFilterPredReuse(llvm::ArrayRef<CacheTarget> targets) {
+   llvm::SmallVector<CacheTarget, 64> out;
+   out.reserve(targets.size());
+   for (const CacheTarget& t : targets) {
+      if (t.enableFilterPredReuse) out.push_back(t);
+   }
+   return out;
+}
+
+/// SSA closure rooted at one \c cache_get result (expanded through execution_step / nested group ports).
+static llvm::DenseSet<void*> collectSsaClosureFromCacheGetRoot(mlir::ModuleOp module, mlir::Value cacheGetRoot) {
+   llvm::DenseSet<void*> closure;
+   llvm::SmallVector<mlir::Value, 64> worklist;
+   llvm::DenseSet<void*> seenValues;
+   auto enqueueValue = [&](mlir::Value v) {
+      if (!v) return;
+      void* p = v.getAsOpaquePointer();
+      if (!seenValues.insert(p).second) return;
+      worklist.push_back(v);
+      closure.insert(p);
+   };
+   enqueueValue(cacheGetRoot);
+   while (!worklist.empty()) {
+      mlir::Value v = worklist.pop_back_val();
+      for (mlir::Operation* user : v.getUsers()) {
+         closure.insert(user);
+         for (mlir::OpOperand& operand : user->getOpOperands()) {
+            if (operand.get() == v) continue;
+            enqueueValue(operand.get());
+         }
+         if (auto step = mlir::dyn_cast<ExecutionStepOp>(user)) {
+            mlir::Block& body = step.getSubOps().front();
+            for (mlir::BlockArgument arg : body.getArguments()) {
+               for (mlir::Value operand : step.getOperands()) {
+                  if (operand == v) enqueueValue(arg);
+               }
+            }
+         }
+      }
+   }
+   for (;;) {
+      const size_t before = closure.size();
+      expandClosureThroughExecutionStepPorts(module, closure);
+      expandClosureThroughNestedExecutionGroupPorts(module, closure);
+      if (closure.size() == before) break;
+   }
+   return closure;
+}
+
 /// Map any `execution_step` (including nested regions) to the enclosing top-level step that is a
 /// direct child of `donor`'s main block — cloning only ever inserts those top-level ops.
 ///
@@ -226,15 +275,12 @@ void maybeFinalizeModuleAfterJoinBufferFilterPredLayout(mlir::ModuleOp module) {
 
 llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>>
 maybeDecodeFiltersByCacheTargets(llvm::ArrayRef<CacheTarget> targets, const ModuleReuseInfo& reuse) {
-   using FilterMap = llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>>;
-   if (!kEnableReuseStateFilterPredReapply) return FilterMap();
-   return decodeFiltersByCacheTargets(targets, reuse);
+   return decodeFiltersByCacheTargets(cacheTargetsWithFilterPredReuse(targets), reuse);
 }
 
 void maybeApplyWriteSideFilterPredOnProducerHashmap(
    mlir::Value st, const ModuleReuseInfo& reuse,
    const llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*>& rwByStepOp) {
-   if (!kEnableReuseStateFilterPredReapply) return;
    if (!mlir::isa<subop::HashMapType>(st.getType())) return;
 
    auto itTL = reuse.mergedFromShadowState.find(st);
@@ -267,7 +313,6 @@ void maybePatchJoinBufferWritersWithFilterPred(
    llvm::ArrayRef<CacheTarget> targets,
    const llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>>& decodedFiltersByTarget,
    const ModuleReuseInfo& reuse) {
-   if (!kEnableReuseStateFilterPredReapply) return;
    for (auto& t : targets) {
       if (!t.state) continue;
       if (!mlir::isa<subop::BufferType>(t.state.getType())) continue;
@@ -292,8 +337,8 @@ void maybePatchJoinBufferWritersWithFilterPred(
 void applyFilterPredReapplyAfterCacheGetReplacement(
    mlir::Value state, mlir::Value cached, llvm::ArrayRef<runtime::FilterDescription> decodedFilters,
    ExecutionGroupOp group, subop::Member predMember,
-   llvm::DenseSet<mlir::Operation*>& joinBufPredProbeInjectedGroups) {
-   if (!kEnableReuseStateFilterPredReapply) return;
+   llvm::DenseSet<mlir::Operation*>& joinBufPredProbeInjectedGroups, bool enableFilterPredReuse) {
+   if (!enableFilterPredReuse) return;
 
    const bool isAggHt = mlir::isa<subop::PreAggrHtType>(state.getType());
    const bool isJoinHm = mlir::isa<subop::HashMapType>(state.getType());
@@ -333,9 +378,7 @@ void insertCachePutsForTargets(mlir::ModuleOp producerModule, llvm::ArrayRef<Cac
    }
    const ModuleReuseInfo& reuse = *reuseBeforeMutation;
 
-   if (kEnableReuseStateFilterPredReapply) {
-      maybeExtendJoinBufferHashmapLayoutForFilterPred(producerModule, targets, reuse);
-   }
+   maybeExtendJoinBufferHashmapLayoutForFilterPred(producerModule, cacheTargetsWithFilterPredReuse(targets), reuse);
 
    auto rwByStepOp = buildRwByStepOpMap(reuse);
    llvm::DenseSet<uint64_t> seenKeys;
@@ -370,9 +413,7 @@ void insertCachePutsForTargets(mlir::ModuleOp producerModule, llvm::ArrayRef<Cac
       builder.create<CachePutOp>(loc, builder.getI64IntegerAttr(static_cast<int64_t>(t.cacheKey)), block.getArgument(0));
       builder.create<ExecutionStepReturnOp>(loc, mlir::ValueRange{});
    }
-   if (kEnableReuseStateFilterPredReapply) {
-      maybeFinalizeModuleAfterJoinBufferFilterPredLayout(producerModule);
-   }
+   maybeFinalizeModuleAfterJoinBufferFilterPredLayout(producerModule);
 }
 
 void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, llvm::ArrayRef<CacheTarget> targets,
@@ -394,8 +435,9 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
       cacheGetStateTypeBeforePredLayout[t.state.getAsOpaquePointer()] = t.state.getType();
    }
 
-   if (kEnableReuseStateFilterPredReapply && !joinBufferHashmapLayoutAlreadyApplied) {
-      maybeExtendJoinBufferHashmapLayoutForFilterPred(consumerModule, targets, reuse);
+   if (!joinBufferHashmapLayoutAlreadyApplied) {
+      maybeExtendJoinBufferHashmapLayoutForFilterPred(consumerModule, cacheTargetsWithFilterPredReuse(targets),
+                                                    reuse);
    }
 
    auto findEnclosingExecutionGroup = [&](mlir::Value v) -> ExecutionGroupOp {
@@ -428,8 +470,9 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
    llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>> decodedFiltersByTarget =
       maybeDecodeFiltersByCacheTargets(targets, reuse);
 
-   if (kEnableReuseStateFilterPredReapply && !joinBufferWritePredAlreadyApplied) {
-      maybePatchJoinBufferWritersWithFilterPred(targets, decodedFiltersByTarget, reuse);
+   if (!joinBufferWritePredAlreadyApplied) {
+      maybePatchJoinBufferWritersWithFilterPred(cacheTargetsWithFilterPredReuse(targets), decodedFiltersByTarget,
+                                              reuse);
    }
 
    // Erase plan from initial `ModuleReuseInfo` only: backward closure from `execution_group_return`
@@ -447,7 +490,7 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
 
    llvm::DenseSet<mlir::Value> replacedClosureValues = expandNeededStatesFromTargets(targets, reuse);
 
-   auto rewriteOne = [&](mlir::Value state, uint64_t cacheKey) {
+   auto rewriteOne = [&](mlir::Value state, uint64_t cacheKey, bool enableFilterPredReuse) {
       assert(!mlir::isa<ThreadLocalType>(state.getType()) &&
              "rewrite must never target thread_local-wrapped states");
 
@@ -495,17 +538,17 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
       state.replaceAllUsesWith(cached);
 
       subop::Member predMember;
-      if (kEnableReuseStateFilterPredReapply) {
+      if (enableFilterPredReuse) {
          predMember = makeOrGetPredMember(consumerModule.getContext());
       }
       llvm::DenseSet<mlir::Operation*> joinBufPredProbeInjectedGroups;
       applyFilterPredReapplyAfterCacheGetReplacement(state, cached, decodedFilters, group, predMember,
-                                                     joinBufPredProbeInjectedGroups);
+                                                     joinBufPredProbeInjectedGroups, enableFilterPredReuse);
    };
 
    for (auto& t : targets) {
       if (!t.state) continue;
-      rewriteOne(t.state, t.cacheKey);
+      rewriteOne(t.state, t.cacheKey, t.enableFilterPredReuse);
    }
 
    // Recompute live states from `execution_group_return` **after** `cache_get` replacement so the
@@ -549,8 +592,21 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
       }
    }
 
-   propagateSubOpColumnAttrsFromSsaStateLayout(consumerModule, nullptr);
-   if (kEnableReuseStateFilterPredReapply) {
+   llvm::DenseSet<void*> filterPredReuseClosure;
+   bool anyFilterPredReuseTarget = false;
+   for (const CacheTarget& t : targets) {
+      if (!t.enableFilterPredReuse) continue;
+      anyFilterPredReuseTarget = true;
+      auto itCached = keyToCached.find(t.cacheKey);
+      if (itCached == keyToCached.end()) continue;
+      llvm::DenseSet<void*> perGet =
+         collectSsaClosureFromCacheGetRoot(consumerModule, itCached->second);
+      filterPredReuseClosure.insert(perGet.begin(), perGet.end());
+   }
+   if (anyFilterPredReuseTarget) {
+      propagateSubOpColumnAttrsFromSsaStateLayout(consumerModule,
+                                                  filterPredReuseClosure.empty() ? nullptr
+                                                                                 : &filterPredReuseClosure);
       alignBufferMergeThreadLocalsWithExtendedMergeResult(consumerModule);
    }
 }
@@ -561,26 +617,40 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    llvm::ArrayRef<CrossQueryStateMatchPair> matches) {
    ReusePlanRewriteResult res;
 
+   llvm::SmallVector<CrossQueryStateMatchPair, 64> matchesLocal(matches.begin(), matches.end());
+
    llvm::SmallVector<CacheTarget, 64> targets0;
    llvm::SmallVector<CacheTarget, 64> targets1;
-   targets0.reserve(matches.size());
-   targets1.reserve(matches.size());
+   targets0.reserve(matchesLocal.size());
+   targets1.reserve(matchesLocal.size());
 
    auto reuse0Early = collectModuleReuseInfo(query0);
    auto reuse1Early = collectModuleReuseInfo(query1);
 
-   for (auto& m : matches) {
+   for (auto& m : matchesLocal) {
+      bool enableFilterPredReuse = true;
+      if (m.stateA && m.stateB) {
+         mlir::Value hivA = resolveCacheTargetStateForReuse(m.stateA, reuse0Early);
+         mlir::Value hivB = resolveCacheTargetStateForReuse(m.stateB, reuse1Early);
+         if (mlir::isa<subop::HashIndexedViewType>(hivA.getType()) &&
+             mlir::isa<subop::HashIndexedViewType>(hivB.getType()) &&
+             joinMatchPeerExternalFiltersIdentical(query0, query1, m.stateA, m.stateB, reuse0Early, reuse1Early)) {
+            enableFilterPredReuse = false;
+         }
+      }
+      m.enableFilterPredReuse = enableFilterPredReuse;
+
       if (m.stateA) {
          mlir::Value ta = resolveCacheTargetStateForReuse(m.stateA, reuse0Early);
          assert(!mlir::isa<ThreadLocalType>(ta.getType()) &&
                 "match pairs must never target thread_local-wrapped states");
-         targets0.push_back(CacheTarget{ta, m.cacheKey});
+         targets0.push_back(CacheTarget{ta, m.cacheKey, enableFilterPredReuse});
       }
       if (m.stateB) {
          mlir::Value tb = resolveCacheTargetStateForReuse(m.stateB, reuse1Early);
          assert(!mlir::isa<ThreadLocalType>(tb.getType()) &&
                 "match pairs must never target thread_local-wrapped states");
-         targets1.push_back(CacheTarget{tb, m.cacheKey});
+         targets1.push_back(CacheTarget{tb, m.cacheKey, enableFilterPredReuse});
       }
    }
 
@@ -649,7 +719,7 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
          }
       }
       assert(mapped && "reuse target must map into synthetic query0 module");
-      targetsQ0.push_back(CacheTarget{mapped, t.cacheKey});
+      targetsQ0.push_back(CacheTarget{mapped, t.cacheKey, t.enableFilterPredReuse});
    }
    res.numTargetsQuery0Mapped = targetsQ0.size();
    res.numTargetsQuery0MappedNoTable = countNoTable(targetsQ0);
@@ -662,10 +732,10 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       recordClonedJoinBufferBuildSites(*res.query0, targetsQ0, reuseSynthetic);
 
    CachedJoinBufferLayoutsByKey producerLayoutsByKey;
-   extendSyntheticJoinBuffersToColumnUnion(*res.query0, query0, query1, matches, targetsQ0, mapping,
+   extendSyntheticJoinBuffersToColumnUnion(*res.query0, query0, query1, matchesLocal, targetsQ0, mapping,
                                            &producerLayoutsByKey);
-   insertSyntheticFilterPredsAfterColumnUnion(*res.query0, query0, query1, matches, targetsQ0, producerLayoutsByKey,
-                                              joinBuildSites);
+   insertSyntheticFilterPredsAfterColumnUnion(*res.query0, query0, query1, matchesLocal, targetsQ0,
+                                              producerLayoutsByKey, joinBuildSites);
 
    // Producer: cache_puts (cloned synthetic IR — needs its own reuse snapshot).
    {
@@ -684,19 +754,21 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
 
    for (auto& t : targets0) {
       if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
-         alignConsumerModulesToCachedJoinLayout(query0, it->second, t.cacheKey, 0, &probeClosuresQ0);
+         std::optional<unsigned> consumerQ =
+            t.enableFilterPredReuse ? std::optional<unsigned>(0u) : std::nullopt;
+         alignConsumerModulesToCachedJoinLayout(query0, it->second, t.cacheKey, consumerQ, &probeClosuresQ0);
       }
    }
    for (auto& t : targets1) {
       if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
-         alignConsumerModulesToCachedJoinLayout(query1, it->second, t.cacheKey, 1, &probeClosuresQ1);
+         std::optional<unsigned> consumerQ =
+            t.enableFilterPredReuse ? std::optional<unsigned>(1u) : std::nullopt;
+         alignConsumerModulesToCachedJoinLayout(query1, it->second, t.cacheKey, consumerQ, &probeClosuresQ1);
       }
    }
 
-   if (kEnableReuseStateFilterPredReapply) {
-      applyProbePredFiltersForConsumerClosures(query0, probeClosuresQ0);
-      applyProbePredFiltersForConsumerClosures(query1, probeClosuresQ1);
-   }
+   applyProbePredFiltersForConsumerClosures(query0, probeClosuresQ0);
+   applyProbePredFiltersForConsumerClosures(query1, probeClosuresQ1);
    for (auto& t : targets0) {
       resyncConsumerCachedHivCarrierTypesFromCacheGet(query0, t.cacheKey);
    }
