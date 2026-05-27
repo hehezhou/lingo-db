@@ -353,7 +353,8 @@ static mlir::Value canonicalizeStateValueDeep(mlir::Value v) {
    while (true) {
       assert(v && "canonicalizeStateValueDeep called with null value");
       void* key = v.getAsOpaquePointer();
-      assert(seen.insert(key).second && "canonicalizeStateValueDeep hit a cycle");
+      auto seenInsert = seen.insert(key);
+      assert(seenInsert.second && "canonicalizeStateValueDeep hit a cycle");
       auto step = findEnclosingExecutionStep(v);
       if (!step) {
          // Outside any execution_step: must be a func argument (external), otherwise missing mapping.
@@ -513,7 +514,8 @@ static StateDepEligibility resolveDepEligibilityRec(
    const llvm::DenseSet<mlir::Value>& transparentStates,
    const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState, llvm::DenseSet<mlir::Value>& visiting) {
    mlir::Value stateCanon = canonicalizeStateValueDeep(state);
-   assert(visiting.insert(stateCanon).second && "state dependency graph must be acyclic");
+   auto visitingInsert = visiting.insert(stateCanon);
+   assert(visitingInsert.second && "state dependency graph must be acyclic");
 
    llvm::ArrayRef<mlir::Value> preds = directPredecessorsInDepGraph(stateCanon, dag);
 

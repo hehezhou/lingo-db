@@ -148,7 +148,8 @@ void runPasses(mlir::ModuleOp moduleOp, lingodb::catalog::Catalog* catalog) {
       mlir::PassManager qoptPm(moduleOp.getContext());
       qoptPm.enableVerifier(true);
       relalg::createQueryOptPipeline(qoptPm, catalog);
-      assert(succeeded(qoptPm.run(moduleOp)));
+      auto res = qoptPm.run(moduleOp);
+      assert(succeeded(res));
    }
 
    // 2) Lower RelAlg -> SubOp.
@@ -156,7 +157,8 @@ void runPasses(mlir::ModuleOp moduleOp, lingodb::catalog::Catalog* catalog) {
       mlir::PassManager lowerRelAlgPm(moduleOp.getContext());
       lowerRelAlgPm.enableVerifier(true);
       relalg::createLowerRelAlgToSubOpPipeline(lowerRelAlgPm);
-      assert(succeeded(lowerRelAlgPm.run(moduleOp)));
+      auto res = lowerRelAlgPm.run(moduleOp);
+      assert(succeeded(res));
    }
 
    // 3) SubOp "opt" pipeline (matching Execution.cpp up to PrepareLoweringPass).
@@ -180,7 +182,8 @@ void runPasses(mlir::ModuleOp moduleOp, lingodb::catalog::Catalog* catalog) {
       }
       optSubOpPm.addPass(subop::createPrepareLoweringPass());
 
-      assert(succeeded(optSubOpPm.run(moduleOp)));
+      auto res = optSubOpPm.run(moduleOp);
+      assert(succeeded(res));
    }
 }
 
