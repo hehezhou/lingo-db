@@ -445,16 +445,7 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
       returnPipelineSeedsForErase.push_back(o);
    }
 
-   llvm::DenseSet<void*> liveFromReturnReuseOnly =
-      closureLiveStatesFromReuseReturnSeeds(returnPipelineSeedsForErase, reuse, rwByStepOp);
-
    llvm::DenseSet<mlir::Value> replacedClosureValues = expandNeededStatesFromTargets(targets, reuse);
-   llvm::DenseSet<void*> obsoleteStateCanonPtrs;
-   for (mlir::Value rv : replacedClosureValues) {
-      mlir::Value c = canonicalizeStateValueForReuse(rv);
-      if (!liveFromReturnReuseOnly.contains(c.getAsOpaquePointer()))
-         obsoleteStateCanonPtrs.insert(c.getAsOpaquePointer());
-   }
 
    auto rewriteOne = [&](mlir::Value state, uint64_t cacheKey) {
       assert(!mlir::isa<ThreadLocalType>(state.getType()) &&
@@ -515,6 +506,17 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
    for (auto& t : targets) {
       if (!t.state) continue;
       rewriteOne(t.state, t.cacheKey);
+   }
+
+   // Recompute live states from `execution_group_return` **after** `cache_get` replacement so the
+   // backward closure does not treat replaced HIV/buffer construction as still required.
+   llvm::DenseSet<void*> liveFromReturnReuseOnly =
+      closureLiveStatesFromReuseReturnSeeds(returnPipelineSeedsForErase, reuse, rwByStepOp);
+   llvm::DenseSet<void*> obsoleteStateCanonPtrs;
+   for (mlir::Value rv : replacedClosureValues) {
+      mlir::Value c = canonicalizeStateValueForReuse(rv);
+      if (!liveFromReturnReuseOnly.contains(c.getAsOpaquePointer()))
+         obsoleteStateCanonPtrs.insert(c.getAsOpaquePointer());
    }
 
    // Erase top-level steps that (per initial `reuse`) only write pipeline states in `obsoleteStateCanonPtrs`

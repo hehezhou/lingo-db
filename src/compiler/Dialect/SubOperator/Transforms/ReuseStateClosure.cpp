@@ -338,6 +338,9 @@ llvm::DenseSet<void*> closureLiveStatesFromReuseReturnSeeds(
    auto enqueue = [&](mlir::Value v) {
       v = peelBlockArgsToEnclosingOperands(v);
       if (!isPipelineStateValue(v)) return;
+      // After `cache_get` replacement, stale `StepRW::reads` may still name dead SSA values;
+      // only walk states that remain connected to the return pipeline.
+      if (v.use_empty()) return;
       mlir::Value c = canonicalizeStateValueForReuse(v);
       void* k = c.getAsOpaquePointer();
       if (!live.insert(k).second) return;
