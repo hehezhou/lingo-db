@@ -519,7 +519,10 @@ int main(int argc, char** argv) {
    optimizationMs += rewriteMs;
    llvm::outs() << "\n// reuse_targets: query[0]=" << rewriteRes.numTargetsQuery0
                   << " query[1]=" << rewriteRes.numTargetsQuery1 << "\n";
+   llvm::outs() << "\n// reuse_targets_no_table: query[0]=" << rewriteRes.numTargetsQuery0NoTable
+                  << " query[1]=" << rewriteRes.numTargetsQuery1NoTable << "\n";
    llvm::outs() << "\n// reuse_targets_q0_mapped: " << rewriteRes.numTargetsQuery0Mapped << "\n";
+   llvm::outs() << "\n// reuse_targets_q0_mapped_no_table: " << rewriteRes.numTargetsQuery0MappedNoTable << "\n";
 
    // With `LINGODB_DUMP_SUBOP_DIR`, replay lowering into `snapshots/` by default.
    // Set `LINGODB_DUMP_LOWERING=0` to write only `consumer-subop.mlir`.

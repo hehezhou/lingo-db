@@ -584,6 +584,15 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
 
    res.numTargetsQuery0 = targets0.size();
    res.numTargetsQuery1 = targets1.size();
+   auto countNoTable = [](llvm::ArrayRef<CacheTarget> targets) -> size_t {
+      size_t n = 0;
+      for (auto& t : targets) {
+         if (!mlir::isa<TableType>(t.state.getType())) n++;
+      }
+      return n;
+   };
+   res.numTargetsQuery0NoTable = countNoTable(targets0);
+   res.numTargetsQuery1NoTable = countNoTable(targets1);
 
    if (targets0.empty() || targets1.empty()) {
       return res;
@@ -641,6 +650,7 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       targetsQ0.push_back(CacheTarget{mapped, t.cacheKey});
    }
    res.numTargetsQuery0Mapped = targetsQ0.size();
+   res.numTargetsQuery0MappedNoTable = countNoTable(targetsQ0);
    if (targetsQ0.empty()) {
       return res;
    }

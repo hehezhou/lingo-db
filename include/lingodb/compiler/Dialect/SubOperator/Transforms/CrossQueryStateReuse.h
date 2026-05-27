@@ -24,6 +24,10 @@ struct ReusePlanRewriteResult {
    size_t numTargetsQuery0 = 0;
    size_t numTargetsQuery1 = 0;
    size_t numTargetsQuery0Mapped = 0;
+   // Convenience counters for reporting: exclude `!subop.table<...>` targets (external tables).
+   size_t numTargetsQuery0NoTable = 0;
+   size_t numTargetsQuery1NoTable = 0;
+   size_t numTargetsQuery0MappedNoTable = 0;
 };
 
 // Three-stage pipeline:
