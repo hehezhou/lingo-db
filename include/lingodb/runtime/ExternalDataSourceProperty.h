@@ -43,7 +43,7 @@ struct ExternalDatasourceProperty {
    }
    bool operator==(const ExternalDatasourceProperty& other) const {
       return other.index == index && other.indexType == indexType && other.mapping == mapping && other.tableName == tableName &&
-         other.filterDescriptions == filterDescriptions && other.orFilterClauses == other.orFilterClauses;
+         other.filterDescriptions == filterDescriptions && other.orFilterClauses == orFilterClauses;
    }
 
    static ExternalDatasourceProperty deserialize(lingodb::utility::Deserializer& deserializer) {
@@ -57,7 +57,9 @@ struct ExternalDatasourceProperty {
       if (next == 5) {
          prop.orFilterClauses =
             deserializer.readSerializedPayload<std::vector<std::vector<runtime::FilterDescription>>>();
-         assert(deserializer.readMarker() == 5 && "Expected orFilterClauses property end marker");
+         utility::marker_t end = deserializer.readMarker();
+         assert(end == 5 && "Expected orFilterClauses property end marker");
+         (void)end;
       } else {
          deserializer.pushBackMarker(next);
       }

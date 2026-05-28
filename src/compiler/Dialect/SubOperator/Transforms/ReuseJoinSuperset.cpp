@@ -191,6 +191,21 @@ static mlir::Value resolveJoinMergedBuffer(mlir::Value hivOrBuf, mlir::ModuleOp 
 }
 
 static subop::ExecutionStepOp findBufferBuildStepWithTableMaterialize(mlir::Value mergedBuffer,
+                                                                      const ModuleReuseInfo& reuse);
+static subop::ExecutionStepOp findBufferBuildStepWithTableScan(mlir::ModuleOp module);
+
+static subop::ExecutionStepOp findJoinBufferBuildStepForHiv(mlir::ModuleOp module, mlir::Value hiv,
+                                                            const ModuleReuseInfo& reuse) {
+   mlir::Value canon = resolveCacheTargetStateForReuse(hiv, reuse);
+   mlir::Value buf = canon;
+   if (auto it = reuse.mergedFromShadowState.find(canon); it != reuse.mergedFromShadowState.end()) {
+      buf = it->second;
+   }
+   if (subop::ExecutionStepOp step = findBufferBuildStepWithTableMaterialize(buf, reuse)) return step;
+   return findBufferBuildStepWithTableScan(module);
+}
+
+static subop::ExecutionStepOp findBufferBuildStepWithTableMaterialize(mlir::Value mergedBuffer,
                                                                         const ModuleReuseInfo& reuse) {
    for (const ModuleReuseInfo::StepRW& rw : reuse.steps) {
       subop::ExecutionStepOp step = rw.step;
@@ -262,16 +277,6 @@ static subop::Member tableMemberForIdentifier(subop::TableType tableTy, subop::M
 static ExternalDatasourceProperty mergeExternalDatasource(const ExternalDatasourceProperty& a,
                                                         const ExternalDatasourceProperty& b);
 
-static subop::ScanRefsOp findTableScanRefsInBuildStep(subop::ExecutionStepOp buildStep) {
-   mlir::Block& body = buildStep.getSubOps().front();
-   for (mlir::Operation& op : body.without_terminator()) {
-      auto s = mlir::dyn_cast<subop::ScanRefsOp>(&op);
-      if (!s) continue;
-      if (mlir::isa<subop::TableType>(s.getState().getType())) return s;
-   }
-   return {};
-}
-
 /// Unique \c get_external in an external-table construction step (\c isExternalTableRefStep).
 static subop::GetExternalOp findUniqueGetExternalInTableRefStep(subop::ExecutionStepOp tableStep) {
    assert(isExternalTableRefStep(tableStep) && "expected external table_ref construction step");
@@ -332,42 +337,6 @@ static bool resolveScannedTableExternal(subop::ExecutionStepOp buildStep, mlir::
    return false;
 }
 
-static std::optional<subop::GetExternalOp> resolveGetExternalOpForScannedTable(subop::ExecutionStepOp buildStep,
-                                                                               mlir::Value tableStateInBody,
-                                                                               const ModuleReuseInfo& reuse) {
-   mlir::Value external = tableStateInBody;
-   if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(external)) {
-      if (ba.getOwner() == &buildStep.getSubOps().front() && ba.getArgNumber() < buildStep.getNumOperands()) {
-         external = buildStep.getOperand(ba.getArgNumber());
-      }
-   }
-   external = peelBlockArgsToEnclosingOperands(external);
-
-   if (auto ge = mlir::dyn_cast_or_null<subop::GetExternalOp>(external.getDefiningOp())) return ge;
-
-   if (auto tableStep = mlir::dyn_cast_or_null<subop::ExecutionStepOp>(external.getDefiningOp())) {
-      assert(isExternalTableRefStep(tableStep) &&
-             "scan_refs table state must come from external table_ref construction step");
-      return findUniqueGetExternalInTableRefStep(tableStep);
-   }
-
-   mlir::Value canon = canonicalizeStateValueForReuse(external);
-   if (findReuseMap(reuse.externalDatasourceByTableState, canon) !=
-       reuse.externalDatasourceByTableState.end()) {
-      subop::GetExternalOp ge;
-      for (const ModuleReuseInfo::StepRW& rw : reuse.steps) {
-         subop::ExecutionStepOp step = rw.step;
-         if (!isExternalTableRefStep(step)) continue;
-         if (canonicalizeStateValueForReuse(step.getResult(0)) != canon) continue;
-         assert(!ge && "table state must map to exactly one external table_ref step");
-         ge = findUniqueGetExternalInTableRefStep(step);
-      }
-      assert(ge && "scan_refs must resolve to get_external in table construction step");
-      return ge;
-   }
-   return std::nullopt;
-}
-
 static subop::ScanRefsOp findTableScanRefsForExternalTable(subop::ExecutionStepOp buildStep, llvm::StringRef tableName,
                                                          const ModuleReuseInfo& reuse) {
    mlir::Block& body = buildStep.getSubOps().front();
@@ -385,6 +354,28 @@ static subop::ScanRefsOp findTableScanRefsForExternalTable(subop::ExecutionStepO
       if (resolved == tableName) return scanOp;
    }
    return {};
+}
+
+struct ResolvedExternalTableScan {
+   subop::ScanRefsOp scanOp;
+   llvm::StringRef tableName;
+   ExternalDatasourceProperty datasource;
+   subop::TableType tableType;
+};
+
+static std::optional<ResolvedExternalTableScan> resolveExternalTableScanForDonor(subop::ExecutionStepOp buildStep,
+                                                                                 const ModuleReuseInfo& reuse,
+                                                                                 llvm::StringRef donorTableName) {
+   subop::ScanRefsOp scanOp = findTableScanRefsForExternalTable(buildStep, donorTableName, reuse);
+   if (!scanOp) return std::nullopt;
+   ResolvedExternalTableScan resolved;
+   resolved.scanOp = scanOp;
+   bool haveDs = false;
+   bool ok = resolveScannedTableExternal(buildStep, scanOp.getState(), reuse, resolved.tableName, resolved.datasource,
+                                         haveDs, resolved.tableType);
+   if (!ok || !haveDs || resolved.tableName != donorTableName)
+      llvm_unreachable("join superset: peer table scan must resolve to donor table");
+   return resolved;
 }
 
 static unsigned countUnionPayloadLeavesOnTable(llvm::ArrayRef<PayloadColumnSpec> payloadColumns,
@@ -461,45 +452,31 @@ static void ingestExternalTableColumnsFromBuildStepScan(subop::ExecutionStepOp b
          assert(spec.colType && "external table mapping column must exist on scanned table type");
          spec.semanticKey = columnSemanticKey(spec.scope, spec.leaf);
          unionCols.try_emplace(spec.semanticKey, spec);
-      }
-   });
-   assert(sawTableScan && "join union ingest: build step must contain scan_refs on a table state");
+	      }
+	   });
+   if (!sawTableScan) llvm_unreachable("join union ingest: build step must contain scan_refs on a table state");
 }
 
 static void mergePeerExternalFromBuildStepScan(ExternalDatasourceProperty& merged, bool& haveMerged,
-                                             subop::ExecutionStepOp peerBuild, const ModuleReuseInfo& reusePeer,
-                                             llvm::StringRef donorTableName) {
-   subop::ScanRefsOp scanOp = findTableScanRefsForExternalTable(peerBuild, donorTableName, reusePeer);
-   if (!scanOp) return;
-   llvm::StringRef peerTableName;
-   ExternalDatasourceProperty peerDs;
-   bool havePeer = false;
-   subop::TableType peerTy;
-   assert(resolveScannedTableExternal(peerBuild, scanOp.getState(), reusePeer, peerTableName, peerDs, havePeer,
-                                      peerTy) &&
-          havePeer && peerTableName == donorTableName);
+                                               subop::ExecutionStepOp peerBuild, const ModuleReuseInfo& reusePeer,
+                                               llvm::StringRef donorTableName) {
+   auto resolved = resolveExternalTableScanForDonor(peerBuild, reusePeer, donorTableName);
+   if (!resolved) return;
    if (!haveMerged) {
-      merged = peerDs;
+      merged = resolved->datasource;
       haveMerged = true;
    } else {
-      merged = mergeExternalDatasource(merged, peerDs);
+      merged = mergeExternalDatasource(merged, resolved->datasource);
    }
 }
 
 static mlir::Type columnTypeForIdentifierFromPeerBuildScan(subop::ExecutionStepOp peerBuild,
                                                            const ModuleReuseInfo& reusePeer,
                                                            llvm::StringRef donorTableName, llvm::StringRef identifier) {
-   subop::ScanRefsOp scanOp = findTableScanRefsForExternalTable(peerBuild, donorTableName, reusePeer);
-   if (!scanOp) return {};
-   llvm::StringRef peerTableName;
-   ExternalDatasourceProperty peerDs;
-   bool havePeer = false;
-   subop::TableType peerTy;
-   assert(resolveScannedTableExternal(peerBuild, scanOp.getState(), reusePeer, peerTableName, peerDs, havePeer,
-                                      peerTy) &&
-          havePeer && peerTableName == donorTableName);
+   auto resolved = resolveExternalTableScanForDonor(peerBuild, reusePeer, donorTableName);
+   if (!resolved) return {};
    auto& mm = peerBuild.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   mlir::Type ty = memberTypeForIdentifier(peerTy, mm, identifier);
+   mlir::Type ty = memberTypeForIdentifier(resolved->tableType, mm, identifier);
    assert(ty && "peer scanned table must contain union payload column");
    return ty;
 }
@@ -701,7 +678,8 @@ static void assignPayloadMembersForPlan(subop::MemberManager& mm, lingodb::compi
       }
       if (auto it = bySemanticKey.find(spec.semanticKey); it != bySemanticKey.end()) {
          mlir::Type wantTy = cloneTypeToContext(spec.colType, synthCtx);
-         assert(mm.getType(it->second) == wantTy && "join superset: reused member type must match union column");
+         if (mm.getType(it->second) != wantTy)
+            llvm_unreachable("join superset: reused member type must match union column");
          plan.payloadMembers.push_back(it->second);
          continue;
       }
@@ -1116,31 +1094,6 @@ static subop::GatherOp findPeerGatherForSemanticKey(subop::ExecutionStepOp peerB
    return found;
 }
 
-static subop::GatherOp findTableGatherOnStream(mlir::Block& body, mlir::Value stream, subop::MaterializeOp matOp) {
-   subop::GatherOp found;
-   for (mlir::Operation& op : body.without_terminator()) {
-      if (!op.isBeforeInBlock(matOp.getOperation())) continue;
-      if (auto g = mlir::dyn_cast<subop::GatherOp>(&op)) {
-         if (g.getStream() == stream) found = g;
-      }
-   }
-   return found;
-}
-
-static bool extendGatherMapping(subop::GatherOp gather, subop::Member tableMem, tuples::ColumnDefAttr colDef,
-                                mlir::MLIRContext* ctx) {
-   auto m = gather.getMapping();
-   for (auto& [mem, def] : m.getMapping()) {
-      if (mem == tableMem) return false;
-      (void)def;
-   }
-   llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> pairs;
-   for (auto& p : m.getMapping()) pairs.push_back(p);
-   pairs.push_back({tableMem, colDef});
-   gather.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, pairs));
-   return true;
-}
-
 /// Propagate a widened \c !subop.table type along SSA values and \c execution_step operand/block-arg ports.
 static void refreshTableStateTypesInModule(mlir::ModuleOp module, mlir::Value tableStateRoot, subop::TableType newTy) {
    if (!tableStateRoot || !newTy) return;
@@ -1454,26 +1407,10 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
       auto [peerMod, peerHiv] = peerHivs[pi];
       if (!peerMod || !peerHiv) continue;
       const ModuleReuseInfo& reusePeer = *peerReuses[pi];
-      mlir::Value peerCanon = resolveCacheTargetStateForReuse(peerHiv, reusePeer);
-      mlir::Value peerBuf = peerCanon;
-      if (auto it = reusePeer.mergedFromShadowState.find(peerCanon);
-          it != reusePeer.mergedFromShadowState.end()) {
-         peerBuf = it->second;
-      }
-      subop::ExecutionStepOp peerBuild = findBufferBuildStepWithTableMaterialize(peerBuf, reusePeer);
-      if (!peerBuild) peerBuild = findBufferBuildStepWithTableScan(peerMod);
+      subop::ExecutionStepOp peerBuild = findJoinBufferBuildStepForHiv(peerMod, peerHiv, reusePeer);
       if (peerBuild) {
-         subop::ScanRefsOp peerScan = findTableScanRefsForExternalTable(peerBuild, donorTableName, reusePeer);
-         if (peerScan) {
-            llvm::StringRef peerTableName;
-            ExternalDatasourceProperty peerDs;
-            bool havePeerDs = false;
-            subop::TableType peerTy;
-            assert(resolveScannedTableExternal(peerBuild, peerScan.getState(), reusePeer, peerTableName, peerDs,
-                                               havePeerDs, peerTy) &&
-                   havePeerDs && peerTableName == donorTableName);
-            filterSources.push_back(std::move(peerDs));
-         }
+         if (auto resolved = resolveExternalTableScanForDonor(peerBuild, reusePeer, donorTableName))
+            filterSources.push_back(std::move(resolved->datasource));
          mergePeerExternalFromBuildStepScan(mergedDs, haveDs, peerBuild, reusePeer, donorTableName);
       }
    }
@@ -1485,14 +1422,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
          auto [peerMod, peerHiv] = peerHivs[pi];
          if (!peerMod || !peerHiv) continue;
          const ModuleReuseInfo& reusePeer = *peerReuses[pi];
-         mlir::Value peerCanon = resolveCacheTargetStateForReuse(peerHiv, reusePeer);
-         mlir::Value peerBuf = peerCanon;
-         if (auto it = reusePeer.mergedFromShadowState.find(peerCanon);
-             it != reusePeer.mergedFromShadowState.end()) {
-            peerBuf = it->second;
-         }
-         subop::ExecutionStepOp peerBuild = findBufferBuildStepWithTableMaterialize(peerBuf, reusePeer);
-         if (!peerBuild) peerBuild = findBufferBuildStepWithTableScan(peerMod);
+         subop::ExecutionStepOp peerBuild = findJoinBufferBuildStepForHiv(peerMod, peerHiv, reusePeer);
          if (!peerBuild) continue;
          if (mlir::Type ty =
                 columnTypeForIdentifierFromPeerBuildScan(peerBuild, reusePeer, donorTableName, identifier)) {
@@ -1573,14 +1503,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
          auto [peerMod, peerHiv] = peerHivs[pi];
          if (!peerMod || !peerHiv) continue;
          const ModuleReuseInfo& reusePeer = *peerReuses[pi];
-         mlir::Value peerCanon = resolveCacheTargetStateForReuse(peerHiv, reusePeer);
-         mlir::Value peerBuf = peerCanon;
-         if (auto it = reusePeer.mergedFromShadowState.find(peerCanon);
-             it != reusePeer.mergedFromShadowState.end()) {
-            peerBuf = it->second;
-         }
-         subop::ExecutionStepOp peerBuild = findBufferBuildStepWithTableMaterialize(peerBuf, reusePeer);
-         if (!peerBuild) peerBuild = findBufferBuildStepWithTableScan(peerMod);
+         subop::ExecutionStepOp peerBuild = findJoinBufferBuildStepForHiv(peerMod, peerHiv, reusePeer);
          if (!peerBuild) continue;
          auto& peerCm = peerMod.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
          templateGather = findPeerGatherForSemanticKey(peerBuild, spec.semanticKey, peerCm);
@@ -2209,6 +2132,33 @@ static void traverseConsumerHivUsesFromRoot(mlir::Value root, subop::HashIndexed
    }
 }
 
+static void expandConsumerProbeClosureThroughPorts(mlir::ModuleOp consumer, llvm::DenseSet<void*>& closure) {
+   for (;;) {
+      size_t before = closure.size();
+      expandClosureThroughExecutionStepPorts(consumer, closure);
+      expandClosureThroughNestedExecutionGroupPorts(consumer, closure);
+      if (closure.size() == before) break;
+   }
+}
+
+static void refreshConsumerCacheGetProbeClosure(mlir::ModuleOp consumer, ConsumerCacheGetProbeClosure& probe,
+                                                llvm::StringRef passName) {
+   assert(probe.cacheGetRoot && "consumer probe closure must have a cache_get root");
+   assert(probe.alignedHiv && "consumer probe closure must have an aligned HIV layout");
+
+   ConsumerCachedHivSites sites;
+   sites.consumerHivBeforeAlign = probe.consumerHivBeforeAlign;
+   ProbeAlignDebugCtx traverseDbg;
+   traverseDbg.cacheKey = probe.cacheKey;
+   traverseDbg.passName = passName;
+   traverseConsumerHivUsesFromRoot(probe.cacheGetRoot, probe.alignedHiv, probe.consumerHivBeforeAlign,
+                                   probe.consumerLayout, sites, &traverseDbg);
+   probe.ssaClosure = std::move(sites.ssaClosure);
+   probe.probeLookupScopes = std::move(sites.probeLookupScopes);
+   probe.scanListsFromTraverse = std::move(sites.scanListsFromTraverse);
+   expandConsumerProbeClosureThroughPorts(consumer, probe.ssaClosure);
+}
+
 static ConsumerCacheGetProbeClosure buildConsumerCacheGetProbeClosure(
    mlir::ModuleOp consumer, mlir::Value cacheGetResult, subop::HashIndexedViewType alignedHiv,
    subop::HashIndexedViewType consumerHivBeforeAlign, const CachedJoinBufferLayout& consumerLayout,
@@ -2220,22 +2170,7 @@ static ConsumerCacheGetProbeClosure buildConsumerCacheGetProbeClosure(
    out.consumerLayout = consumerLayout;
    out.cacheKey = cacheKey;
    out.consumerReuseQueryIndex = consumerReuseQueryIndex;
-   ConsumerCachedHivSites sites;
-   sites.consumerHivBeforeAlign = consumerHivBeforeAlign;
-   ProbeAlignDebugCtx traverseDbg;
-   traverseDbg.cacheKey = cacheKey;
-   traverseDbg.passName = "traverse";
-   traverseConsumerHivUsesFromRoot(cacheGetResult, alignedHiv, consumerHivBeforeAlign, consumerLayout, sites,
-                                   &traverseDbg);
-   out.ssaClosure = std::move(sites.ssaClosure);
-   out.probeLookupScopes = std::move(sites.probeLookupScopes);
-   out.scanListsFromTraverse = std::move(sites.scanListsFromTraverse);
-   for (;;) {
-      size_t before = out.ssaClosure.size();
-      expandClosureThroughExecutionStepPorts(consumer, out.ssaClosure);
-      expandClosureThroughNestedExecutionGroupPorts(consumer, out.ssaClosure);
-      if (out.ssaClosure.size() == before) break;
-   }
+   refreshConsumerCacheGetProbeClosure(consumer, out, "traverse");
    return out;
 }
 
@@ -2325,10 +2260,6 @@ static void refreshStaleEmbeddedHivCarriers(mlir::ModuleOp module, subop::HashIn
       if (updates.empty()) break;
       for (auto [val, nt] : updates) val.setType(nt);
    }
-}
-
-static void syncExecutionStepPortsForModule(mlir::ModuleOp module, const llvm::DenseSet<void*>* closureFilter) {
-   synchronizeExecutionStepPortTypes(module, closureFilter);
 }
 
 struct ConsumerColumnBinding {
@@ -2562,7 +2493,7 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
 
    llvm::DenseMap<subop::Member, subop::Member> producerPayloadToConsumer;
    llvm::StringMap<subop::Member> assignedBySemantic;
-   std::optional<subop::Member> pendingProbeGatherRemapFrom;
+   llvm::DenseMap<subop::Member, subop::Member> probeGatherMemberRemap;
    assert(layout.payloadSemanticKeys.size() == layout.payloadMembers.size());
 
    auto ensureConsumerMember = [&](std::optional<subop::Member> reused, mlir::Type producerSlotTy) -> subop::Member {
@@ -2584,6 +2515,7 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
       mlir::Type producerSlotTy = layout.payloadColumnTypes[i];
       llvm::StringRef semKey = layout.payloadSemanticKeys[i];
       subop::Member producerMem = layout.payloadMembers[i];
+      std::optional<subop::Member> probeGatherRemapFrom;
 
       unsigned predIdx = 0;
       if (parseFilterPredLayoutSemanticKey(semKey, predIdx)) {
@@ -2613,7 +2545,7 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
                const llvm::SmallVector<std::string>& qKeys =
                   qIdx == 0 ? layout.query0SemanticKeys : layout.query1SemanticKeys;
                if (qKeys.size() == 1 && qKeys[0] == semKey && oldVals.size() == 1) {
-                  pendingProbeGatherRemapFrom = oldVals[0];
+                  probeGatherRemapFrom = oldVals[0];
                   reused = std::nullopt;
                   break;
                }
@@ -2621,11 +2553,10 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
          }
       }
       subop::Member consumerMem = ensureConsumerMember(reused, producerSlotTy);
-      if (pendingProbeGatherRemapFrom) {
-         outConsumerLayout.probeGatherMemberRemap[*pendingProbeGatherRemapFrom] = consumerMem;
-         pendingProbeGatherRemapFrom = std::nullopt;
+      if (probeGatherRemapFrom) {
+         probeGatherMemberRemap[*probeGatherRemapFrom] = consumerMem;
       } else if (reused && consumerHivBeforeAlign && *reused != consumerMem) {
-         outConsumerLayout.probeGatherMemberRemap[*reused] = consumerMem;
+         probeGatherMemberRemap[*reused] = consumerMem;
       }
       assignedBySemantic[semKey] = consumerMem;
       producerPayloadToConsumer[layout.payloadMembers[i]] = consumerMem;
@@ -2658,6 +2589,7 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
       producerHiv.getCompareHashForLookup());
 
    outConsumerLayout = layout;
+   outConsumerLayout.probeGatherMemberRemap = std::move(probeGatherMemberRemap);
    outConsumerLayout.producerHiv = consumerHiv;
    outConsumerLayout.payloadMembers.clear();
    outConsumerLayout.payloadColumnTypes.clear();
@@ -2726,17 +2658,6 @@ ClonedJoinBufferBuildSitesByKey recordClonedJoinBufferBuildSites(mlir::ModuleOp 
       out[t.cacheKey] = site;
    }
    return out;
-}
-
-static subop::ExecutionStepOp findJoinBufferBuildStepForHiv(mlir::ModuleOp module, mlir::Value hiv,
-                                                            const ModuleReuseInfo& reuse) {
-   mlir::Value canon = resolveCacheTargetStateForReuse(hiv, reuse);
-   mlir::Value buf = canon;
-   if (auto it = reuse.mergedFromShadowState.find(canon); it != reuse.mergedFromShadowState.end()) {
-      buf = it->second;
-   }
-   if (subop::ExecutionStepOp step = findBufferBuildStepWithTableMaterialize(buf, reuse)) return step;
-   return findBufferBuildStepWithTableScan(module);
 }
 
 void insertSyntheticFilterPredsAfterColumnUnion(
@@ -2864,14 +2785,14 @@ void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const Cache
                                               &probe.probeLookupScopes, &remapDbg);
    }
 
-   syncExecutionStepPortsForModule(consumer, &unionClosure);
+   synchronizeExecutionStepPortTypes(consumer, &unionClosure);
 
    for (ConsumerCacheGetProbeClosure& probe : perCacheGet) {
       alignScanListForProbeClosure(consumer, probe, "align-post-sync");
    }
 
    syncProbeListCarriersInClosure(consumer, &unionClosure);
-   syncExecutionStepPortsForModule(consumer, nullptr);
+   synchronizeExecutionStepPortTypes(consumer, nullptr);
 
    if (outProbeClosures) {
       const size_t appendStart = outProbeClosures->size();
@@ -2886,22 +2807,7 @@ void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const Cache
 
 static void refreshProbeClosureFromCacheGetRoot(mlir::ModuleOp consumer, ConsumerCacheGetProbeClosure& probe) {
    if (!probe.cacheGetRoot || !probe.alignedHiv) return;
-   ConsumerCachedHivSites sites;
-   sites.consumerHivBeforeAlign = probe.consumerHivBeforeAlign;
-   ProbeAlignDebugCtx traverseDbg;
-   traverseDbg.cacheKey = probe.cacheKey;
-   traverseDbg.passName = "probe_pred_retraverse";
-   traverseConsumerHivUsesFromRoot(probe.cacheGetRoot, probe.alignedHiv, probe.consumerHivBeforeAlign,
-                                   probe.consumerLayout, sites, &traverseDbg);
-   probe.ssaClosure = std::move(sites.ssaClosure);
-   probe.probeLookupScopes = std::move(sites.probeLookupScopes);
-   probe.scanListsFromTraverse = std::move(sites.scanListsFromTraverse);
-   for (;;) {
-      size_t before = probe.ssaClosure.size();
-      expandClosureThroughExecutionStepPorts(consumer, probe.ssaClosure);
-      expandClosureThroughNestedExecutionGroupPorts(consumer, probe.ssaClosure);
-      if (probe.ssaClosure.size() == before) break;
-   }
+   refreshConsumerCacheGetProbeClosure(consumer, probe, "probe_pred_retraverse");
 }
 
 static std::optional<subop::HashIndexedViewType> hashIndexedViewFromScanListCarrier(
@@ -3048,10 +2954,10 @@ void resyncConsumerCachedHivCarrierTypesFromCacheGet(mlir::ModuleOp consumer,
       // Only rewrite carriers that already embed this cache_get HIV (not other local join buffers).
       traverseConsumerHivUsesFromRoot(get.getResult(), canonicalHiv, canonicalHiv, consumerLayout, sites,
                                       /*dbg=*/nullptr);
-      expandClosureThroughExecutionStepPorts(consumer, sites.ssaClosure);
-      syncExecutionStepPortsForModule(consumer, &sites.ssaClosure);
+      expandConsumerProbeClosureThroughPorts(consumer, sites.ssaClosure);
+      synchronizeExecutionStepPortTypes(consumer, &sites.ssaClosure);
       propagateJoinSupersetColumnAttrsForClosure(consumer, sites.ssaClosure);
-      syncExecutionStepPortsForModule(consumer, nullptr);
+      synchronizeExecutionStepPortTypes(consumer, nullptr);
    });
 }
 
