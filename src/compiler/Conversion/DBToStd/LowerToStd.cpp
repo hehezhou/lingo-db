@@ -471,6 +471,7 @@ class AndOpLowering : public OpConversionPattern<db::AndOp> {
       Value result;
       Value isNull;
       auto loc = andOp->getLoc();
+      Value falseValue = rewriter.create<arith::ConstantOp>(loc, rewriter.getBoolAttr(false));
 
       for (size_t i = 0; i < adaptor.getVals().size(); i++) {
          auto currType = andOp.getVals()[i].getType();
@@ -502,7 +503,7 @@ class AndOpLowering : public OpConversionPattern<db::AndOp> {
             if (currNullable) {
                result = rewriter.create<arith::SelectOp>(loc, currNull, result, rewriter.create<arith::AndIOp>(loc, currVal, result));
             } else {
-               result = rewriter.create<arith::AndIOp>(loc, currVal, result);
+               result = rewriter.create<arith::SelectOp>(loc, currVal, result, falseValue);
             }
          }
       }
@@ -511,7 +512,8 @@ class AndOpLowering : public OpConversionPattern<db::AndOp> {
          Value combined = packNullable(rewriter, loc, isNull, result);
          rewriter.replaceOp(andOp, combined);
       } else {
-         rewriter.replaceOp(andOp, result);
+         andOp.getResult().replaceAllUsesWith(result);
+         rewriter.eraseOp(andOp);
       }
       return success();
    }
@@ -564,7 +566,8 @@ class OrOpLowering : public OpConversionPattern<db::OrOp> {
          Value combined = packNullable(rewriter, loc, isNull, result);
          rewriter.replaceOp(orOp, combined);
       } else {
-         rewriter.replaceOp(orOp, result);
+         orOp.getResult().replaceAllUsesWith(result);
+         rewriter.eraseOp(orOp);
       }
       return success();
    }
@@ -679,6 +682,23 @@ class NullableGetValOpLowering : public OpConversionPattern<db::NullableGetVal> 
    LogicalResult matchAndRewrite(db::NullableGetVal op, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       auto unpacked = unpackNullable(rewriter, op->getLoc(), adaptor.getVal());
       rewriter.replaceOp(op, unpacked.second);
+      return success();
+   }
+};
+class DeriveTruthOpLowering : public OpConversionPattern<db::DeriveTruth> {
+   public:
+   using OpConversionPattern<db::DeriveTruth>::OpConversionPattern;
+   LogicalResult matchAndRewrite(db::DeriveTruth op, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
+      if (mlir::isa<db::NullableType>(op.getVal().getType())) {
+         auto unpacked = unpackNullable(rewriter, op->getLoc(), adaptor.getVal());
+         auto notNull = rewriter.create<arith::XOrIOp>(
+            op->getLoc(), unpacked.first,
+            rewriter.create<arith::ConstantOp>(op->getLoc(), rewriter.getBoolAttr(true)));
+         rewriter.replaceOpWithNewOp<arith::AndIOp>(op, notNull, unpacked.second);
+      } else {
+         op.getResult().replaceAllUsesWith(adaptor.getVal());
+         rewriter.eraseOp(op);
+      }
       return success();
    }
 };
@@ -988,7 +1008,8 @@ class BetweenLowering : public OpConversionPattern<db::BetweenOp> {
       auto isGteLower = rewriter.create<db::CmpOp>(betweenOp->getLoc(), betweenOp.getLowerInclusive() ? db::DBCmpPredicate::gte : db::DBCmpPredicate::gt, betweenOp.getVal(), betweenOp.getLower());
       auto isLteUpper = rewriter.create<db::CmpOp>(betweenOp->getLoc(), betweenOp.getUpperInclusive() ? db::DBCmpPredicate::lte : db::DBCmpPredicate::lt, betweenOp.getVal(), betweenOp.getUpper());
       auto isInRange = rewriter.create<db::AndOp>(betweenOp->getLoc(), ValueRange({isGteLower, isLteUpper}));
-      rewriter.replaceOp(betweenOp, isInRange.getRes());
+      betweenOp.getResult().replaceAllUsesWith(isInRange.getRes());
+      rewriter.eraseOp(betweenOp);
       return success();
    }
 };
@@ -1001,7 +1022,8 @@ class OneOfLowering : public OpConversionPattern<db::OneOfOp> {
          compared.push_back(rewriter.create<db::CmpOp>(oneOfOp->getLoc(), db::DBCmpPredicate::eq, oneOfOp.getVal(), ele));
       }
       auto isInRange = rewriter.create<db::OrOp>(oneOfOp->getLoc(), compared);
-      rewriter.replaceOp(oneOfOp, isInRange.getRes());
+      oneOfOp.getResult().replaceAllUsesWith(isInRange.getRes());
+      rewriter.eraseOp(oneOfOp);
       return success();
    }
 };
@@ -1502,6 +1524,7 @@ void DBToStdLoweringPass::runOnOperation() {
    patterns.insert<IsNullOpLowering>(typeConverter, ctxt);
    patterns.insert<AsNullableOpLowering>(typeConverter, ctxt);
    patterns.insert<NullableGetValOpLowering>(typeConverter, ctxt);
+   patterns.insert<DeriveTruthOpLowering>(typeConverter, ctxt);
 
    patterns.insert<ConstantLowering>(typeConverter, ctxt);
    patterns.insert<CastOpLowering>(typeConverter, ctxt);

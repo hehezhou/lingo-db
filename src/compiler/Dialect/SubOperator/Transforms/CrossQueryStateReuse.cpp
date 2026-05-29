@@ -22,6 +22,7 @@
 #include "llvm/ADT/StringMap.h"
 
 #include <cassert>
+#include <optional>
 
 namespace lingodb::compiler::dialect::subop {
 namespace {
@@ -276,6 +277,157 @@ void maybeFinalizeModuleAfterJoinBufferFilterPredLayout(mlir::ModuleOp module) {
 llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>>
 maybeDecodeFiltersByCacheTargets(llvm::ArrayRef<CacheTarget> targets, const ModuleReuseInfo& reuse) {
    return decodeFiltersByCacheTargets(cacheTargetsWithFilterPredReuse(targets), reuse);
+}
+
+struct SimpleNumericFilterRange {
+   bool hasLower = false;
+   double lower = 0.0;
+   bool lowerInclusive = true;
+   bool hasUpper = false;
+   double upper = 0.0;
+   bool upperInclusive = true;
+   std::optional<double> eq;
+};
+
+static std::optional<double> getNumericFilterValue(const runtime::FilterDescription& f) {
+   if (const auto* v = std::get_if<int64_t>(&f.value)) return static_cast<double>(*v);
+   if (const auto* v = std::get_if<double>(&f.value)) return *v;
+   return std::nullopt;
+}
+
+static bool isSupportedRangeFilterOp(runtime::FilterOp op) {
+   switch (op) {
+      case runtime::FilterOp::EQ:
+      case runtime::FilterOp::LT:
+      case runtime::FilterOp::LTE:
+      case runtime::FilterOp::GT:
+      case runtime::FilterOp::GTE:
+         return true;
+      default:
+         return false;
+   }
+}
+
+static void addRangeConstraint(SimpleNumericFilterRange& range, runtime::FilterOp op, double value) {
+   switch (op) {
+      case runtime::FilterOp::EQ:
+         range.eq = value;
+         break;
+      case runtime::FilterOp::GT:
+      case runtime::FilterOp::GTE: {
+         bool inclusive = op == runtime::FilterOp::GTE;
+         if (!range.hasLower || value > range.lower) {
+            range.hasLower = true;
+            range.lower = value;
+            range.lowerInclusive = inclusive;
+         } else if (value == range.lower) {
+            range.lowerInclusive = range.lowerInclusive && inclusive;
+         }
+         break;
+      }
+      case runtime::FilterOp::LT:
+      case runtime::FilterOp::LTE: {
+         bool inclusive = op == runtime::FilterOp::LTE;
+         if (!range.hasUpper || value < range.upper) {
+            range.hasUpper = true;
+            range.upper = value;
+            range.upperInclusive = inclusive;
+         } else if (value == range.upper) {
+            range.upperInclusive = range.upperInclusive && inclusive;
+         }
+         break;
+      }
+      default:
+         break;
+   }
+}
+
+static bool rangeAllowsValue(const SimpleNumericFilterRange& range, double value) {
+   if (range.hasLower) {
+      if (value < range.lower) return false;
+      if (value == range.lower && !range.lowerInclusive) return false;
+   }
+   if (range.hasUpper) {
+      if (value > range.upper) return false;
+      if (value == range.upper && !range.upperInclusive) return false;
+   }
+   return true;
+}
+
+static bool rangeIsEmpty(const SimpleNumericFilterRange& range) {
+   if (range.eq && !rangeAllowsValue(range, *range.eq)) return true;
+   if (!range.hasLower || !range.hasUpper) return false;
+   if (range.lower > range.upper) return true;
+   return range.lower == range.upper && !(range.lowerInclusive && range.upperInclusive);
+}
+
+static bool rangesAreDisjoint(const SimpleNumericFilterRange& a, const SimpleNumericFilterRange& b) {
+   if (rangeIsEmpty(a) || rangeIsEmpty(b)) return true;
+   if (a.eq && b.eq) return *a.eq != *b.eq;
+   if (a.eq) return !rangeAllowsValue(b, *a.eq);
+   if (b.eq) return !rangeAllowsValue(a, *b.eq);
+
+   if (a.hasUpper && b.hasLower) {
+      if (a.upper < b.lower) return true;
+      if (a.upper == b.lower && !(a.upperInclusive && b.lowerInclusive)) return true;
+   }
+   if (b.hasUpper && a.hasLower) {
+      if (b.upper < a.lower) return true;
+      if (b.upper == a.lower && !(b.upperInclusive && a.lowerInclusive)) return true;
+   }
+   return false;
+}
+
+static llvm::StringMap<SimpleNumericFilterRange>
+buildSimpleRangeConstraints(llvm::ArrayRef<runtime::FilterDescription> filters) {
+   llvm::StringMap<SimpleNumericFilterRange> byColumn;
+   for (const runtime::FilterDescription& f : filters) {
+      if (!isSupportedRangeFilterOp(f.op)) continue;
+      std::optional<double> value = getNumericFilterValue(f);
+      if (!value) continue;
+      addRangeConstraint(byColumn[f.columnName], f.op, *value);
+   }
+   return byColumn;
+}
+
+static bool filtersAreDefinitelyDisjoint(llvm::ArrayRef<runtime::FilterDescription> filtersA,
+                                         llvm::ArrayRef<runtime::FilterDescription> filtersB) {
+   llvm::StringMap<SimpleNumericFilterRange> rangesA = buildSimpleRangeConstraints(filtersA);
+   llvm::StringMap<SimpleNumericFilterRange> rangesB = buildSimpleRangeConstraints(filtersB);
+   for (auto& entryA : rangesA) {
+      auto entryB = rangesB.find(entryA.getKey());
+      if (entryB == rangesB.end()) continue;
+      if (rangesAreDisjoint(entryA.getValue(), entryB->getValue())) return true;
+   }
+   return false;
+}
+
+static llvm::SmallVector<runtime::FilterDescription, 8>
+decodeFiltersForPotentialReuseState(mlir::Value state, const ModuleReuseInfo& reuse) {
+   llvm::SmallVector<runtime::FilterDescription, 8> filters =
+      decodeFiltersForStateFromWriterSteps(state, reuse);
+   mlir::Value resolved = resolveCacheTargetStateForReuse(state, reuse);
+   if (filters.empty() && resolved && resolved != state) {
+      filters = decodeFiltersForStateFromWriterSteps(resolved, reuse);
+   }
+   if (filters.empty() && resolved) {
+      forEachShadowChainPredecessor(resolved, reuse, [&](mlir::Value shadow) {
+         if (!filters.empty()) return;
+         filters = decodeFiltersForStateFromWriterSteps(shadow, reuse);
+      });
+   }
+   return filters;
+}
+
+static bool reuseMatchFiltersDefinitelyDisjoint(mlir::Value stateA, mlir::Value stateB,
+                                                const ModuleReuseInfo& reuseA,
+                                                const ModuleReuseInfo& reuseB) {
+   llvm::SmallVector<runtime::FilterDescription, 8> filtersA =
+      decodeFiltersForPotentialReuseState(stateA, reuseA);
+   llvm::SmallVector<runtime::FilterDescription, 8> filtersB =
+      decodeFiltersForPotentialReuseState(stateB, reuseB);
+   if (filtersA.empty() || filtersB.empty()) return false;
+   return filtersAreDefinitelyDisjoint(filtersA, filtersB);
 }
 
 void maybeApplyWriteSideFilterPredOnProducerHashmap(
@@ -627,32 +779,42 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    auto reuse0Early = collectModuleReuseInfo(query0);
    auto reuse1Early = collectModuleReuseInfo(query1);
 
+   llvm::SmallVector<CrossQueryStateMatchPair, 64> keptMatches;
+   keptMatches.reserve(matchesLocal.size());
    for (auto& m : matchesLocal) {
       bool enableFilterPredReuse = true;
+      mlir::Value ta;
+      mlir::Value tb;
       if (m.stateA && m.stateB) {
-         mlir::Value hivA = resolveCacheTargetStateForReuse(m.stateA, reuse0Early);
-         mlir::Value hivB = resolveCacheTargetStateForReuse(m.stateB, reuse1Early);
-         if (mlir::isa<subop::HashIndexedViewType>(hivA.getType()) &&
-             mlir::isa<subop::HashIndexedViewType>(hivB.getType()) &&
+         ta = resolveCacheTargetStateForReuse(m.stateA, reuse0Early);
+         tb = resolveCacheTargetStateForReuse(m.stateB, reuse1Early);
+         bool bothHiv = mlir::isa<subop::HashIndexedViewType>(ta.getType()) &&
+            mlir::isa<subop::HashIndexedViewType>(tb.getType());
+         if (reuseMatchFiltersDefinitelyDisjoint(m.stateA, m.stateB, reuse0Early, reuse1Early)) {
+            continue;
+         }
+         if (bothHiv &&
              joinMatchPeerExternalFiltersIdentical(query0, query1, m.stateA, m.stateB, reuse0Early, reuse1Early)) {
             enableFilterPredReuse = false;
          }
       }
       m.enableFilterPredReuse = enableFilterPredReuse;
+      keptMatches.push_back(m);
 
       if (m.stateA) {
-         mlir::Value ta = resolveCacheTargetStateForReuse(m.stateA, reuse0Early);
+         if (!ta) ta = resolveCacheTargetStateForReuse(m.stateA, reuse0Early);
          assert(!mlir::isa<ThreadLocalType>(ta.getType()) &&
                 "match pairs must never target thread_local-wrapped states");
          targets0.push_back(CacheTarget{ta, m.cacheKey, enableFilterPredReuse});
       }
       if (m.stateB) {
-         mlir::Value tb = resolveCacheTargetStateForReuse(m.stateB, reuse1Early);
+         if (!tb) tb = resolveCacheTargetStateForReuse(m.stateB, reuse1Early);
          assert(!mlir::isa<ThreadLocalType>(tb.getType()) &&
                 "match pairs must never target thread_local-wrapped states");
          targets1.push_back(CacheTarget{tb, m.cacheKey, enableFilterPredReuse});
       }
    }
+   matchesLocal = std::move(keptMatches);
 
    res.numTargetsQuery0 = targets0.size();
    res.numTargetsQuery1 = targets1.size();
@@ -781,9 +943,10 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    for (ConsumerCacheGetProbeClosure& probe : probeClosuresQ1) {
       finalizeConsumerCachedJoinProbeColumnAttrs(query1, probe);
    }
+   syncProbeGatherMappingsInModule(query0);
+   syncProbeGatherMappingsInModule(query1);
 
    return res;
 }
 
 } // namespace lingodb::compiler::dialect::subop
-

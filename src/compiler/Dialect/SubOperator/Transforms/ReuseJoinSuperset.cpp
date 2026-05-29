@@ -1080,20 +1080,6 @@ static llvm::StringRef semanticKeyLeaf(llvm::StringRef semanticKey) {
    return semanticKey.split('\x1f').second;
 }
 
-static subop::GatherOp findPeerGatherForSemanticKey(subop::ExecutionStepOp peerBuild, llvm::StringRef semanticKey,
-                                                    tuples::ColumnManager& peerCm) {
-   llvm::StringRef wantLeaf = normalizeColumnIdentifier(semanticKeyLeaf(semanticKey));
-   subop::GatherOp found;
-   peerBuild->walk([&](subop::GatherOp g) {
-      for (auto& [mem, def] : g.getMapping().getMapping()) {
-         auto [scope, leaf] = peerCm.getName(&def.getColumn());
-         (void)scope;
-         if (normalizeColumnIdentifier(leaf) == wantLeaf) found = g;
-      }
-   });
-   return found;
-}
-
 /// Propagate a widened \c !subop.table type along SSA values and \c execution_step operand/block-arg ports.
 static void refreshTableStateTypesInModule(mlir::ModuleOp module, mlir::Value tableStateRoot, subop::TableType newTy) {
    if (!tableStateRoot || !newTy) return;
@@ -1367,10 +1353,11 @@ static void propagateJoinSupersetColumnAttrsForClosure(mlir::ModuleOp module,
 }
 
 static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::ExecutionStepOp buildStep,
-                                         const JoinBufferUnionPlan& plan, subop::BufferType targetBufTy,
+                                         const JoinBufferUnionPlan& plan,
                                          const ModuleReuseInfo& reuseSynthetic,
                                          llvm::ArrayRef<std::pair<mlir::ModuleOp, mlir::Value>> peerHivs,
                                          llvm::ArrayRef<const ModuleReuseInfo*> peerReuses) {
+   assert(peerHivs.size() == peerReuses.size() && "join superset: peer HIVs and reuse metadata must align");
    mlir::Block& body = buildStep.getSubOps().front();
    auto* ctx = synthetic.getContext();
    auto* subDialect = ctx->getLoadedDialect<subop::SubOperatorDialect>();
@@ -1389,73 +1376,72 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    }
    if (!scanOp) return;
 
-   mlir::Value tableState = scanOp.getState();
-   subop::TableType mergedSupplierTableTy;
-   ExternalDatasourceProperty mergedDs;
-   bool haveDs = false;
-   llvm::StringRef donorTableName;
-   subop::TableType donorTableTy;
-   const bool haveDonorExternal = resolveScannedTableExternal(buildStep, tableState, reuseSynthetic, donorTableName,
-                                                             mergedDs, haveDs, donorTableTy) &&
-                                  haveDs &&
-                                  countUnionPayloadLeavesOnTable(plan.payloadColumns, donorTableTy, mm) > 0;
+   auto rewriteDonorExternalTableForUnion = [&]() {
+      mlir::Value tableState = scanOp.getState();
+      ExternalDatasourceProperty mergedDs;
+      bool haveDs = false;
+      llvm::StringRef donorTableName;
+      subop::TableType donorTableTy;
+      bool haveDonorExternal = resolveScannedTableExternal(buildStep, tableState, reuseSynthetic, donorTableName,
+                                                           mergedDs, haveDs, donorTableTy) &&
+                               haveDs &&
+                               countUnionPayloadLeavesOnTable(plan.payloadColumns, donorTableTy, mm) > 0;
+      if (!haveDonorExternal) return;
 
-   if (haveDonorExternal) {
-   llvm::SmallVector<ExternalDatasourceProperty, 4> filterSources;
-   filterSources.push_back(mergedDs);
-   for (size_t pi = 0; pi < peerHivs.size(); ++pi) {
-      auto [peerMod, peerHiv] = peerHivs[pi];
-      if (!peerMod || !peerHiv) continue;
-      const ModuleReuseInfo& reusePeer = *peerReuses[pi];
-      subop::ExecutionStepOp peerBuild = findJoinBufferBuildStepForHiv(peerMod, peerHiv, reusePeer);
-      if (peerBuild) {
-         if (auto resolved = resolveExternalTableScanForDonor(peerBuild, reusePeer, donorTableName))
-            filterSources.push_back(std::move(resolved->datasource));
-         mergePeerExternalFromBuildStepScan(mergedDs, haveDs, peerBuild, reusePeer, donorTableName);
-      }
-   }
-   assert(haveDs && "join superset: merged external datasource required for donor table");
-   mergeExternalFiltersForOrReuse(mergedDs, filterSources);
-
-   auto lookupPeerColumnType = [&](llvm::StringRef identifier) -> mlir::Type {
+      llvm::SmallVector<ExternalDatasourceProperty, 4> filterSources;
+      filterSources.push_back(mergedDs);
       for (size_t pi = 0; pi < peerHivs.size(); ++pi) {
          auto [peerMod, peerHiv] = peerHivs[pi];
          if (!peerMod || !peerHiv) continue;
          const ModuleReuseInfo& reusePeer = *peerReuses[pi];
          subop::ExecutionStepOp peerBuild = findJoinBufferBuildStepForHiv(peerMod, peerHiv, reusePeer);
          if (!peerBuild) continue;
-         if (mlir::Type ty =
-                columnTypeForIdentifierFromPeerBuildScan(peerBuild, reusePeer, donorTableName, identifier)) {
-            return ty;
-         }
+         if (auto resolved = resolveExternalTableScanForDonor(peerBuild, reusePeer, donorTableName))
+            filterSources.push_back(std::move(resolved->datasource));
+         mergePeerExternalFromBuildStepScan(mergedDs, haveDs, peerBuild, reusePeer, donorTableName);
       }
-      return {};
+      assert(haveDs && "join superset: merged external datasource required for donor table");
+      mergeExternalFiltersForOrReuse(mergedDs, filterSources);
+
+      auto lookupPeerColumnType = [&](llvm::StringRef identifier) -> mlir::Type {
+         for (size_t pi = 0; pi < peerHivs.size(); ++pi) {
+            auto [peerMod, peerHiv] = peerHivs[pi];
+            if (!peerMod || !peerHiv) continue;
+            const ModuleReuseInfo& reusePeer = *peerReuses[pi];
+            subop::ExecutionStepOp peerBuild = findJoinBufferBuildStepForHiv(peerMod, peerHiv, reusePeer);
+            if (!peerBuild) continue;
+            if (mlir::Type ty =
+                   columnTypeForIdentifierFromPeerBuildScan(peerBuild, reusePeer, donorTableName, identifier)) {
+               return ty;
+            }
+         }
+         return {};
+      };
+
+      assert(donorTableTy && "join superset: resolveScannedTableExternal must provide donor table type");
+      auto newTableTy = tableTypeFromMergedExternal(ctx, mm, mergedDs, donorTableTy, lookupPeerColumnType);
+      for (auto& map : mergedDs.mapping) {
+         if (subop::Member m = tableMemberForIdentifier(newTableTy, mm, map.identifier))
+            map.memberName = mm.getName(m);
+      }
+      llvm::sort(mergedDs.mapping, [](const auto& x, const auto& y) { return x.memberName < y.memberName; });
+      std::string hex = lingodb::utility::serializeToHexString(mergedDs);
+      subop::ExecutionGroupOp eg = buildStep->getParentOfType<subop::ExecutionGroupOp>();
+      assert(eg && "join superset: buffer build step must live in an execution_group");
+      mlir::OpBuilder gb = mlir::OpBuilder::atBlockBegin(&eg.getSubOps().front());
+      gb.setInsertionPoint(buildStep);
+      subop::ExecutionStepOp mergedTableRefStep =
+         createMergedExternalTableRefStep(gb, buildStep.getLoc(), newTableTy, hex);
+      mlir::Value mergedTableState = mergedTableRefStep.getResult(0);
+      rewireBuildStepScannedTable(buildStep, scanOp, tableState, mergedTableState, newTableTy);
+      refreshTableStateTypesInModule(synthetic, mergedTableState, newTableTy);
    };
-   subop::TableType hintTy = donorTableTy;
-   assert(hintTy && "join superset: resolveScannedTableExternal must provide donor table type");
-   auto newTableTy = tableTypeFromMergedExternal(ctx, mm, mergedDs, hintTy, lookupPeerColumnType);
-   for (auto& map : mergedDs.mapping) {
-      if (subop::Member m = tableMemberForIdentifier(newTableTy, mm, map.identifier))
-         map.memberName = mm.getName(m);
-   }
-   llvm::sort(mergedDs.mapping, [](const auto& x, const auto& y) { return x.memberName < y.memberName; });
-   std::string hex = lingodb::utility::serializeToHexString(mergedDs);
-   subop::ExecutionGroupOp eg = buildStep->getParentOfType<subop::ExecutionGroupOp>();
-   assert(eg && "join superset: buffer build step must live in an execution_group");
-   mlir::OpBuilder gb = mlir::OpBuilder::atBlockBegin(&eg.getSubOps().front());
-   gb.setInsertionPoint(buildStep);
-   subop::ExecutionStepOp mergedTableRefStep =
-      createMergedExternalTableRefStep(gb, buildStep.getLoc(), newTableTy, hex);
-   mlir::Value mergedTableState = mergedTableRefStep.getResult(0);
-   rewireBuildStepScannedTable(buildStep, scanOp, tableState, mergedTableState, newTableTy);
-   refreshTableStateTypesInModule(synthetic, mergedTableState, newTableTy);
-   mergedSupplierTableTy = newTableTy;
-   }
+   rewriteDonorExternalTableForUnion();
 
    subop::MaterializeOp matOp = findJoinBufferMaterializeInStep(buildStep);
    assert(matOp && "join superset: buffer build step must materialize into join buffer");
 
-   auto collectMaterializedKeys = [&]() {
+   auto collectMaterializedPayloadKeys = [&]() {
       std::unordered_set<std::string> keys;
       for (auto& [member, colRef] : matOp.getMapping().getMapping()) {
          if (member == plan.linkMember || member == plan.hashMember) continue;
@@ -1464,12 +1450,12 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
       }
       return keys;
    };
-   std::unordered_set<std::string> materializedKeys = collectMaterializedKeys();
+   std::unordered_set<std::string> materializedKeys = collectMaterializedPayloadKeys();
 
    subop::MapOp hashMapOp = findJoinHashMapBeforeMaterialize(body, matOp);
    assert(hashMapOp);
 
-   auto appendMaterializeMember = [&](subop::Member bufMem, tuples::ColumnDefAttr colDef) {
+   auto appendMaterializeMapping = [&](subop::Member bufMem, tuples::ColumnDefAttr colDef) {
       llvm::SmallVector<subop::RefMappingPairT> matPairs;
       for (auto pr : matOp.getMapping().getMapping()) matPairs.push_back(pr);
       matPairs.push_back({bufMem, cm.createRef(&colDef.getColumn())});
@@ -1485,56 +1471,18 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
       return false;
    };
 
-   int payloadSlotInPlan = 0;
-   for (const PayloadColumnSpec& spec : plan.payloadColumns) {
-      unsigned reusePredQueryIdx = 0;
-      if (parseReuseFilterPredSemanticKey(spec.semanticKey, reusePredQueryIdx)) {
-         ++payloadSlotInPlan;
-         continue;
-      }
-      if (isPayloadMaterialized(spec)) {
-         ++payloadSlotInPlan;
-         continue;
-      }
+   auto appendUnionPayloadGather = [&](const PayloadColumnSpec& spec, subop::Member bufMem) {
+      assert(!spec.scope.empty() && "join superset: payload column scope required");
 
-      subop::GatherOp templateGather;
-      tuples::ColumnManager* templateCm = nullptr;
-      for (size_t pi = 0; pi < peerHivs.size(); ++pi) {
-         auto [peerMod, peerHiv] = peerHivs[pi];
-         if (!peerMod || !peerHiv) continue;
-         const ModuleReuseInfo& reusePeer = *peerReuses[pi];
-         subop::ExecutionStepOp peerBuild = findJoinBufferBuildStepForHiv(peerMod, peerHiv, reusePeer);
-         if (!peerBuild) continue;
-         auto& peerCm = peerMod.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
-         templateGather = findPeerGatherForSemanticKey(peerBuild, spec.semanticKey, peerCm);
-         if (templateGather) {
-            templateCm = &peerCm;
-            break;
-         }
-      }
       subop::ScanRefsOp specScan = findTableScanForPayloadLeaf(buildStep, spec.leaf, mm);
       if (!specScan) specScan = scanOp;
       subop::TableType tableTy = mlir::dyn_cast<subop::TableType>(specScan.getState().getType());
       assert(tableTy && "join superset: table type required for payload column gather");
       subop::Member tableMem = tableMemberForIdentifier(tableTy, mm, spec.leaf);
-      if (!tableMem) {
-         ++payloadSlotInPlan;
-         continue;
-      }
+      if (!tableMem) return false;
 
-      llvm::StringRef scope = spec.scope;
-      if (scope.empty() && templateGather && templateCm) {
-         auto def0 = templateGather.getMapping().getMapping().begin()->second;
-         auto [scope0, leaf0] = templateCm->getName(&def0.getColumn());
-         (void)leaf0;
-         scope = scope0;
-      }
-      assert(!scope.empty() && "join superset: payload column scope required");
       tuples::ColumnDefAttr colDef = cm.createDef(spec.scope, spec.leaf);
       colDef.getColumn().type = spec.colType;
-      assert(static_cast<size_t>(payloadSlotInPlan) < plan.payloadMembers.size() &&
-             "join superset: payload slot out of range");
-      subop::Member bufMem = plan.payloadMembers[payloadSlotInPlan];
 
       // Chain union-only gathers on the current materialize stream (clone build chain + prior
       // union-only gathers), not from hashMapOp each time.
@@ -1548,13 +1496,24 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
       auto gatherTy = mapStream.getType();
       auto refDef = specScan.getRef();
       auto gatherRef = cm.createRef(&refDef.getColumn());
-      auto newGather = gb.create<subop::GatherOp>(mlir::UnknownLoc::get(ctx), gatherTy, mapStream,
-                                                   gatherRef, mapping);
+      auto newGather =
+         gb.create<subop::GatherOp>(mlir::UnknownLoc::get(ctx), gatherTy, mapStream, gatherRef, mapping);
       matOp->setOperand(0, newGather.getRes());
-      appendMaterializeMember(bufMem, colDef);
-
+      appendMaterializeMapping(bufMem, colDef);
       materializedKeys.insert(spec.semanticKey);
-      ++payloadSlotInPlan;
+      return true;
+   };
+
+   for (size_t i = 0; i < plan.payloadColumns.size(); ++i) {
+      const PayloadColumnSpec& spec = plan.payloadColumns[i];
+      unsigned reusePredQueryIdx = 0;
+      if (parseReuseFilterPredSemanticKey(spec.semanticKey, reusePredQueryIdx)) {
+         continue;
+      }
+      if (isPayloadMaterialized(spec)) continue;
+
+      assert(i < plan.payloadMembers.size() && "join superset: payload slot out of range");
+      (void)appendUnionPayloadGather(spec, plan.payloadMembers[i]);
    }
 
    buildStep.walk([&](subop::GatherOp gather) { syncMapInputColsFromGather(gather, cm); });
@@ -1568,6 +1527,64 @@ static void remapClosureGathersToAlignedConsumerHiv(mlir::ModuleOp consumer, con
                                                     const CachedJoinBufferLayout& consumerLayout,
                                                     const llvm::StringSet<>* probeLookupScopes,
                                                     const ProbeAlignDebugCtx* dbg);
+static void remapAlignedHivClosureGathers(mlir::ModuleOp module, const llvm::DenseSet<void*>* ssaClosure,
+                                          subop::HashIndexedViewType alignedHiv,
+                                          const CachedJoinBufferLayout& layout,
+                                          const llvm::StringSet<>* probeLookupScopes,
+                                          std::optional<uint64_t> cacheKey,
+                                          llvm::StringRef passName);
+
+struct SyntheticJoinBuildSite {
+   mlir::Value mergedBuffer;
+   subop::ExecutionStepOp buildStep;
+   subop::MaterializeOp materialize;
+};
+
+static SyntheticJoinBuildSite findSyntheticJoinBuildSite(mlir::ModuleOp synthetic, mlir::Value syntheticHiv,
+                                                         const ModuleReuseInfo& reuseSynthetic) {
+   SyntheticJoinBuildSite site;
+   site.mergedBuffer = resolveJoinMergedBuffer(syntheticHiv, synthetic, reuseSynthetic);
+   site.buildStep = findBufferBuildStepWithTableMaterialize(site.mergedBuffer, reuseSynthetic);
+   if (!site.buildStep) site.buildStep = findBufferBuildStepWithTableScan(synthetic);
+   if (!site.buildStep) return site;
+
+   site.buildStep.walk([&](subop::MaterializeOp mat) {
+      if (site.materialize) return;
+      if (!materializeTargetsJoinBuffer(mat, site.mergedBuffer, reuseSynthetic)) return;
+      site.materialize = mat;
+   });
+   if (!site.materialize) site.materialize = findJoinBufferMaterializeInStep(site.buildStep);
+   return site;
+}
+
+static subop::HashIndexedViewType findSyntheticProducerHivForMergedBuffer(mlir::ModuleOp synthetic,
+                                                                          mlir::Value mergedBuffer) {
+   subop::HashIndexedViewType producerHiv;
+   mlir::Value canonMergedBuf = canonicalizeStateValueForReuse(mergedBuffer);
+   synthetic.walk([&](subop::CreateHashIndexedView chiv) {
+      if (producerHiv) return;
+      if (canonicalizeStateValueForReuse(chiv.getSource()) != canonMergedBuf) return;
+      producerHiv = mlir::dyn_cast<subop::HashIndexedViewType>(chiv.getResult().getType());
+   });
+   return producerHiv;
+}
+
+static void finalizeSyntheticJoinProducerClosure(mlir::ModuleOp synthetic, llvm::ArrayRef<mlir::Value> roots,
+                                                 const JoinBufferUnionPlan& plan,
+                                                 const ModuleReuseInfo& reuseSynthetic) {
+   JoinBufferHivSsaClosure joinClosure = computeJoinBufferHivSsaClosure(roots, reuseSynthetic);
+   alignBufferMergeThreadLocalsWithMergeResult(synthetic, &joinClosure.opaque);
+
+   subop::HashIndexedViewType producerHiv = findSyntheticProducerHivForMergedBuffer(synthetic, roots.front());
+   assert(producerHiv && "join superset: synthetic must create hash_indexed_view on merged buffer");
+
+   expandClosureThroughExecutionStepPorts(synthetic, joinClosure.opaque);
+   remapAlignedHivClosureGathers(synthetic, &joinClosure.opaque, producerHiv, layoutFromUnionPlan(producerHiv, plan),
+                                 /*probeLookupScopes=*/nullptr, /*cacheKey=*/std::nullopt,
+                                 /*passName=*/"");
+   propagateJoinSupersetColumnAttrsForClosure(synthetic, joinClosure.opaque);
+   synchronizeExecutionStepPortTypes(synthetic, nullptr);
+}
 
 static void applyUnionPlanToSyntheticHiv(mlir::ModuleOp synthetic, mlir::Value syntheticHiv, JoinBufferUnionPlan& plan,
                                          const ModuleReuseInfo& reuseSynthetic,
@@ -1577,53 +1594,26 @@ static void applyUnionPlanToSyntheticHiv(mlir::ModuleOp synthetic, mlir::Value s
    auto* ctx = synthetic.getContext();
    auto* subDialect = ctx->getLoadedDialect<subop::SubOperatorDialect>();
    auto& mm = subDialect->getMemberManager();
-
-   mlir::Value mergedBuf = resolveJoinMergedBuffer(syntheticHiv, synthetic, reuseSynthetic);
-
-   subop::ExecutionStepOp buildStep = findBufferBuildStepWithTableMaterialize(mergedBuf, reuseSynthetic);
-   if (!buildStep) buildStep = findBufferBuildStepWithTableScan(synthetic);
-   subop::MaterializeOp matOp;
-   if (buildStep) {
-      buildStep.walk([&](subop::MaterializeOp m) {
-         if (!materializeTargetsJoinBuffer(m, mergedBuf, reuseSynthetic)) return;
-         matOp = m;
-      });
-      if (!matOp) matOp = findJoinBufferMaterializeInStep(buildStep);
-   }
-   assert(matOp && "join superset: synthetic build step must materialize into merged join buffer");
+   SyntheticJoinBuildSite site = findSyntheticJoinBuildSite(synthetic, syntheticHiv, reuseSynthetic);
+   assert(site.materialize && "join superset: synthetic build step must materialize into merged join buffer");
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
-   assignPayloadMembersForPlan(mm, cm, matOp, plan);
+   assignPayloadMembersForPlan(mm, cm, site.materialize, plan);
    auto targetMembers = bufferMembersForPlan(ctx, plan);
-   auto targetBufTy = subop::BufferType::get(ctx, targetMembers);
-   llvm::SmallVector<mlir::Value, 4> roots = {mergedBuf};
+   llvm::SmallVector<mlir::Value, 4> roots = {site.mergedBuffer};
 
    applyBufferLayoutToSsaClosure(synthetic, roots, targetMembers, reuseSynthetic);
 
-   if (buildStep) {
+   if (site.buildStep) {
       llvm::SmallVector<std::pair<mlir::ModuleOp, mlir::Value>, 2> peerHivs = {
          {query1Module, hivB},
          {query0Module, hivA},
       };
       const ModuleReuseInfo* peerReuses[] = {&reuseB, &reuseA};
-      patchBufferBuildStepForUnion(synthetic, buildStep, plan, targetBufTy, reuseSynthetic, peerHivs, peerReuses);
+      patchBufferBuildStepForUnion(synthetic, site.buildStep, plan, reuseSynthetic, peerHivs, peerReuses);
    }
 
    applyBufferLayoutToSsaClosure(synthetic, roots, targetMembers, reuseSynthetic);
-   JoinBufferHivSsaClosure joinClosure = computeJoinBufferHivSsaClosure(roots, reuseSynthetic);
-   alignBufferMergeThreadLocalsWithMergeResult(synthetic, &joinClosure.opaque);
-   subop::HashIndexedViewType prodHiv;
-   mlir::Value canonMergedBuf = canonicalizeStateValueForReuse(mergedBuf);
-   synthetic.walk([&](subop::CreateHashIndexedView chiv) {
-      if (prodHiv) return;
-      if (canonicalizeStateValueForReuse(chiv.getSource()) != canonMergedBuf) return;
-      prodHiv = mlir::dyn_cast<subop::HashIndexedViewType>(chiv.getResult().getType());
-   });
-   assert(prodHiv && "join superset: synthetic must create hash_indexed_view on merged buffer");
-   expandClosureThroughExecutionStepPorts(synthetic, joinClosure.opaque);
-   remapClosureGathersToAlignedConsumerHiv(synthetic, &joinClosure.opaque, prodHiv, layoutFromUnionPlan(prodHiv, plan),
-                                           /*probeLookupScopes=*/nullptr, /*dbg=*/nullptr);
-   propagateJoinSupersetColumnAttrsForClosure(synthetic, joinClosure.opaque);
-   synchronizeExecutionStepPortTypes(synthetic, nullptr);
+   finalizeSyntheticJoinProducerClosure(synthetic, roots, plan, reuseSynthetic);
 }
 
 static bool typeEmbedsHashIndexedView(mlir::Type t) {
@@ -1731,6 +1721,22 @@ static void debugProbeAlign(const ProbeAlignDebugCtx* dbg, llvm::function_ref<vo
    llvm::errs() << ' ';
    fn(llvm::errs());
    llvm::errs() << '\n';
+}
+
+static void remapAlignedHivClosureGathers(mlir::ModuleOp module, const llvm::DenseSet<void*>* ssaClosure,
+                                          subop::HashIndexedViewType alignedHiv,
+                                          const CachedJoinBufferLayout& layout,
+                                          const llvm::StringSet<>* probeLookupScopes,
+                                          std::optional<uint64_t> cacheKey,
+                                          llvm::StringRef passName) {
+   std::optional<ProbeAlignDebugCtx> dbg;
+   if (!passName.empty()) {
+      dbg.emplace();
+      dbg->cacheKey = cacheKey;
+      dbg->passName = passName;
+   }
+   remapClosureGathersToAlignedConsumerHiv(module, ssaClosure, alignedHiv, layout, probeLookupScopes,
+                                           dbg ? &*dbg : nullptr);
 }
 
 static std::string mlirTypeToString(mlir::Type t) {
@@ -2587,6 +2593,13 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    auto consumerHiv = subop::HashIndexedViewType::get(
       ctx, subop::StateMembersAttr::get(ctx, keyMembers), subop::StateMembersAttr::get(ctx, valueMembers),
       producerHiv.getCompareHashForLookup());
+   if (consumerHivBeforeAlign) {
+      llvm::ArrayRef<subop::Member> oldVals = consumerHivBeforeAlign.getValueMembers().getMembers();
+      llvm::ArrayRef<subop::Member> newVals = consumerHiv.getValueMembers().getMembers();
+      if (oldVals.size() == 1 && !newVals.empty() && oldVals[0] != newVals[0]) {
+         probeGatherMemberRemap[oldVals[0]] = newVals[0];
+      }
+   }
 
    outConsumerLayout = layout;
    outConsumerLayout.probeGatherMemberRemap = std::move(probeGatherMemberRemap);
@@ -2778,11 +2791,8 @@ void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const Cache
       for (void* p : probe.ssaClosure) unionClosure.insert(p);
 
       alignScanListForProbeClosure(consumer, probe, "align");
-      ProbeAlignDebugCtx remapDbg;
-      remapDbg.cacheKey = probe.cacheKey;
-      remapDbg.passName = "remap";
-      remapClosureGathersToAlignedConsumerHiv(consumer, &probe.ssaClosure, probe.alignedHiv, probe.consumerLayout,
-                                              &probe.probeLookupScopes, &remapDbg);
+      remapAlignedHivClosureGathers(consumer, &probe.ssaClosure, probe.alignedHiv, probe.consumerLayout,
+                                    &probe.probeLookupScopes, probe.cacheKey, "remap");
    }
 
    synchronizeExecutionStepPortTypes(consumer, &unionClosure);
@@ -2926,11 +2936,8 @@ void finalizeConsumerCachedJoinProbeColumnAttrs(mlir::ModuleOp consumer, Consume
    if (!probe.alignedHiv) return;
 
    alignScanListForProbeClosure(consumer, probe, "finalize");
-   ProbeAlignDebugCtx remapDbg;
-   remapDbg.cacheKey = probe.cacheKey;
-   remapDbg.passName = "finalize-remap";
-   remapClosureGathersToAlignedConsumerHiv(consumer, &probe.ssaClosure, probe.alignedHiv, probe.consumerLayout,
-                                           &probe.probeLookupScopes, &remapDbg);
+   remapAlignedHivClosureGathers(consumer, &probe.ssaClosure, probe.alignedHiv, probe.consumerLayout,
+                                 &probe.probeLookupScopes, probe.cacheKey, "finalize-remap");
    syncProbeListCarriersInClosure(consumer, &probe.ssaClosure);
 }
 

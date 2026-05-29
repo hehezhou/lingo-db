@@ -1031,8 +1031,7 @@ decodeFiltersFromTableScanInExecutionStep(ExecutionStepOp step) {
    return decodeExternalFiltersForTableState(tableState);
 }
 
-static mlir::Value deriveFilterTruthValue(mlir::OpBuilder& rb, mlir::Location loc, mlir::Value v) {
-   if (mlir::isa<mlir::IntegerType>(v.getType()) && v.getType().getIntOrFloatBitWidth() == 1) return v;
+static mlir::Value deriveDbPredicateTruthValue(mlir::OpBuilder& rb, mlir::Location loc, mlir::Value v) {
    return rb.create<lingodb::compiler::dialect::db::DeriveTruth>(loc, v);
 }
 
@@ -1042,6 +1041,11 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
                                                    tuples::ColumnRefAttr colRef,
                                                    const runtime::FilterDescription& f) {
    mlir::Value colV = helper.access(colRef, loc);
+   auto emitArithIntConstant = [&](int64_t v) -> mlir::Value {
+      auto itTy = mlir::dyn_cast<mlir::IntegerType>(colV.getType());
+      assert(itTy && "runtime filter IR: int64 literal requires integer column type");
+      return rb.create<mlir::arith::ConstantOp>(loc, rb.getIntegerAttr(itTy, v));
+   };
    if (f.op == runtime::FilterOp::NOTNULL) {
       return rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
    }
@@ -1049,11 +1053,9 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
       if (std::holds_alternative<std::vector<int64_t>>(f.values)) {
          const auto& vals = std::get<std::vector<int64_t>>(f.values);
          assert(!vals.empty() && "runtime filter IR: IN requires a non-empty value list");
-         auto itTy = mlir::dyn_cast<mlir::IntegerType>(colV.getType());
-         assert(itTy && "runtime filter IR: IN int64 values require integer column type");
          mlir::Value acc;
          for (int64_t v : vals) {
-            mlir::Value c = rb.create<mlir::arith::ConstantIntOp>(loc, v, itTy.getWidth());
+            mlir::Value c = emitArithIntConstant(v);
             mlir::Value eq = rb.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, colV, c);
             acc = acc ? rb.create<mlir::arith::OrIOp>(loc, acc, eq) : eq;
          }
@@ -1062,7 +1064,7 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
       if (std::holds_alternative<std::vector<std::string>>(f.values)) {
          const auto& vals = std::get<std::vector<std::string>>(f.values);
          assert(!vals.empty() && "runtime filter IR: IN requires a non-empty value list");
-         mlir::Type colTy = getBaseType(colV.getType());
+         [[maybe_unused]] mlir::Type colTy = getBaseType(colV.getType());
          assert((mlir::isa<lingodb::compiler::dialect::db::DateType>(colTy) ||
                  mlir::isa<lingodb::compiler::dialect::db::CharType>(colTy) ||
                  mlir::isa<lingodb::compiler::dialect::db::StringType>(colTy)) &&
@@ -1074,7 +1076,7 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
                rb.create<lingodb::compiler::dialect::db::ConstantOp>(loc, colV.getType(), rb.getStringAttr(s)));
          }
          auto oneOf = rb.create<lingodb::compiler::dialect::db::OneOfOp>(loc, colV, candidates);
-         return deriveFilterTruthValue(rb, loc, oneOf);
+         return deriveDbPredicateTruthValue(rb, loc, oneOf);
       }
       if (std::holds_alternative<std::vector<double>>(f.values)) {
          const auto& vals = std::get<std::vector<double>>(f.values);
@@ -1093,11 +1095,9 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
    }
    if (std::holds_alternative<int64_t>(f.value)) {
       int64_t v = std::get<int64_t>(f.value);
-      auto itTy = mlir::dyn_cast<mlir::IntegerType>(colV.getType());
-      assert(itTy && "runtime filter IR: int64 literal requires integer column type");
-      mlir::Value c = rb.create<mlir::arith::ConstantIntOp>(loc, v, itTy.getWidth());
+      mlir::Value c = emitArithIntConstant(v);
       using P = mlir::arith::CmpIPredicate;
-      P p;
+      P p = P::eq;
       switch (f.op) {
          case runtime::FilterOp::EQ: p = P::eq; break;
          case runtime::FilterOp::NEQ: p = P::ne; break;
@@ -1111,7 +1111,7 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
    }
    if (std::holds_alternative<std::string>(f.value)) {
       auto s = std::get<std::string>(f.value);
-      mlir::Type colTy = getBaseType(colV.getType());
+      [[maybe_unused]] mlir::Type colTy = getBaseType(colV.getType());
       assert((mlir::isa<lingodb::compiler::dialect::db::DateType>(colTy) ||
               mlir::isa<lingodb::compiler::dialect::db::CharType>(colTy) ||
               mlir::isa<lingodb::compiler::dialect::db::StringType>(colTy)) &&
@@ -1129,7 +1129,7 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
          default: assert(false && "runtime filter IR: unsupported filter op");
       }
       auto cmp = rb.create<lingodb::compiler::dialect::db::CmpOp>(loc, p, colV, rhs);
-      return deriveFilterTruthValue(rb, loc, cmp);
+      return deriveDbPredicateTruthValue(rb, loc, cmp);
    }
    if (std::holds_alternative<double>(f.value)) {
       double v = std::get<double>(f.value);
@@ -1178,9 +1178,10 @@ mlir::Value materializeRuntimeFiltersAsSubopFilter(mlir::OpBuilder& b,
          auto it = colByName.find(f.columnName);
          assert(it != colByName.end() && "delay_filter: missing filter column in gathered columns");
          mlir::Value pred = emitRuntimeFilterPredicateValue(rb, loc, helper, it->second, f);
-         acc = acc ? rb.create<mlir::arith::AndIOp>(loc, acc, pred) : pred;
+         acc = acc ? rb.create<lingodb::compiler::dialect::db::AndOp>(loc, mlir::ValueRange{acc, pred}) : pred;
       }
       if (!acc) acc = rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+      acc = deriveDbPredicateTruthValue(rb, loc, acc);
       rb.create<tuples::ReturnOp>(loc, mlir::ValueRange{acc});
    });
 
@@ -1224,9 +1225,10 @@ materializeRuntimeFiltersAsPredicateColumn(mlir::OpBuilder& b,
          auto it = colByName.find(f.columnName);
          assert(it != colByName.end() && "delay_filter_pred: missing filter column in gathered columns");
          mlir::Value pred = emitRuntimeFilterPredicateValue(rb, loc, helper, it->second, f);
-         acc = acc ? rb.create<mlir::arith::AndIOp>(loc, acc, pred) : pred;
+         acc = acc ? rb.create<lingodb::compiler::dialect::db::AndOp>(loc, mlir::ValueRange{acc, pred}) : pred;
       }
       if (!acc) acc = rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+      acc = deriveDbPredicateTruthValue(rb, loc, acc);
       rb.create<tuples::ReturnOp>(loc, mlir::ValueRange{acc});
    });
 

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -439,6 +440,12 @@ static bool isTransparentStateValue(mlir::Value v, const llvm::DenseSet<mlir::Va
    return transparentStates.contains(canonicalizeStateValueDeep(v));
 }
 
+static bool isSpecialNonReuseStateValue(mlir::Value v, const llvm::DenseSet<mlir::Value>& transparentStates) {
+   if (!v) return false;
+   if (mlir::isa<subop::TableType>(v.getType())) return true;
+   return isTransparentStateValue(v, transparentStates);
+}
+
 /// Compute "transparent" states (a) type is buffer/thread_local/sorted_view AND
 /// (b) it has exactly one successor step: used as pure read in exactly one step, and that step has
 ///     exactly one write state.
@@ -610,7 +617,7 @@ static StateDepEligibility evaluateStateDepEligibility(
    const llvm::DenseSet<mlir::Value>& transparentStates,
    const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState) {
    mlir::Value canon = canonicalizeStateValueDeep(reuseTarget);
-   assert(!isTransparentStateValue(canon, transparentStates) && "transparent states are not reuse targets");
+   assert(!isSpecialNonReuseStateValue(canon, transparentStates) && "special states are not reuse targets");
    llvm::DenseSet<mlir::Value> visiting;
    return resolveDepEligibilityRec(canon, dag, transparentStates, tableDescrByTableState, visiting);
 }
@@ -1786,6 +1793,15 @@ static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp 
    return a;
 }
 
+static void assertTableStatesHaveNoStateDependencies(const ModuleMatchAndReuseAnalysis& module,
+                                                     const StateDependencyGraph& depGraph) {
+   for (mlir::Value state : module.statesSorted) {
+      if (!mlir::isa<subop::TableType>(state.getType())) continue;
+      assert(directPredecessorsInDepGraph(state, depGraph).empty() &&
+             "table states are special match-only leaves and must not depend on other states");
+   }
+}
+
 static llvm::SmallVector<mlir::Value, 64> collectReuseCandidateStates(mlir::ModuleOp moduleOp,
                                                                     const ModuleMatchAndReuseAnalysis& a) {
    llvm::SmallVector<mlir::Value, 64> candidates;
@@ -1800,10 +1816,10 @@ static llvm::SmallVector<mlir::Value, 64> collectReuseCandidateStates(mlir::Modu
          auto itCreated = a.createdAtByState.find(key);
          assert(itCreated != a.createdAtByState.end() && "execution_step state result must be tracked");
          if (itCreated->second < 0) continue;
-         // Carrier states (buffers, sorted views, thread_local<state>) are never reuse match targets.
-         // "Transparent" is an eligibility/dep property; matching still only supports concrete state types.
+         // Special states are only folded into dependency equality; they are never reused directly.
+         if (isSpecialNonReuseStateValue(key, a.transparentStates)) continue;
+         // Carrier states that are not transparent are also not concrete reuse targets.
          if (isTransparentDepCarrierType(key.getType())) continue;
-         if (isTransparentStateValue(key, a.transparentStates)) continue;
          candidates.push_back(key);
       }
    }
@@ -1835,7 +1851,7 @@ static bool determineStateReuseEligibility(
    const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState,
    StateDepEligibility& outDep) {
    mlir::Value stateCanon = canonicalizeStateValueDeep(state);
-   assert(!isTransparentStateValue(stateCanon, module.transparentStates) && "transparent states are never reuse targets");
+   assert(!isSpecialNonReuseStateValue(stateCanon, module.transparentStates) && "special states are never reuse targets");
    assert(!isTransparentDepCarrierType(stateCanon.getType()) && "carrier states are never reuse match targets");
    assert(!module.writesByState.lookup(stateCanon).empty() &&
           "reuse candidate must be constructed in at least one execution_step");
@@ -1913,6 +1929,7 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
 
    // Phase 2: same-step RW → state dependency DAG.
    StateDependencyGraph depGraph = buildStateDependencyGraphFromStepRw(stepRw.rwByStep);
+   assertTableStatesHaveNoStateDependencies(module, depGraph);
 
    llvm::SmallVector<mlir::Value, 64> candidates = collectReuseCandidateStates(moduleOp, module);
 
@@ -1960,6 +1977,188 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
    }
 
    return profiles;
+}
+
+static llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*>
+buildReuseRwByStepOpMap(const ModuleReuseInfo& reuse) {
+   llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*> byOp;
+   for (const auto& e : reuse.steps) {
+      byOp[const_cast<subop::ExecutionStepOp&>(e.step).getOperation()] = &e;
+   }
+   return byOp;
+}
+
+static llvm::SmallVector<lingodb::runtime::FilterDescription, 8>
+decodeSimpleMatchFiltersForState(
+   mlir::Value state, const ModuleReuseInfo& reuse,
+   const llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*>& rwByStepOp) {
+   llvm::SmallVector<lingodb::runtime::FilterDescription, 8> decoded;
+   auto itW = reuse.writerStepsByState.find(canonicalizeStateValueForReuse(state));
+   if (itW == reuse.writerStepsByState.end()) itW = reuse.writerStepsByState.find(state);
+   if (itW == reuse.writerStepsByState.end()) return decoded;
+   for (ExecutionStepOp ws : itW->second) {
+      const ModuleReuseInfo::StepRW* rw = rwByStepOp.lookup(ws.getOperation());
+      if (!rw) continue;
+      for (mlir::Value r : rw->reads) {
+         if (!mlir::isa<subop::TableType>(r.getType())) continue;
+         mlir::Value tableV = r;
+         if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(r)) {
+            if (ba.getOwner() == &ws.getSubOps().front()) {
+               auto inputs = ws.getInputs();
+               assert(static_cast<unsigned>(ba.getArgNumber()) < inputs.size());
+               tableV = inputs[ba.getArgNumber()];
+            }
+         }
+         mlir::Value key = canonicalizeStateValueForReuse(tableV);
+         auto it = reuse.externalDatasourceByTableState.find(key);
+         if (it == reuse.externalDatasourceByTableState.end()) it = reuse.externalDatasourceByTableState.find(tableV);
+         if (it == reuse.externalDatasourceByTableState.end()) continue;
+         for (const auto& f : it->second.filterDescriptions) decoded.push_back(f);
+      }
+   }
+   return decoded;
+}
+
+static llvm::SmallVector<lingodb::runtime::FilterDescription, 8>
+decodeSimpleMatchFiltersAlongShadowChain(mlir::Value state, const ModuleReuseInfo& reuse) {
+   llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*> rwByStepOp =
+      buildReuseRwByStepOpMap(reuse);
+   llvm::SmallVector<lingodb::runtime::FilterDescription, 8> filters =
+      decodeSimpleMatchFiltersForState(state, reuse, rwByStepOp);
+   if (!filters.empty()) return filters;
+   forEachShadowChainPredecessorValue(canonicalizeStateValueForReuse(state), reuse.mergedFromShadowState,
+                                      [&](mlir::Value shadow) {
+                                         if (!filters.empty()) return;
+                                         filters = decodeSimpleMatchFiltersForState(shadow, reuse, rwByStepOp);
+                                      });
+   return filters;
+}
+
+struct MatchNumericFilterRange {
+   bool hasLower = false;
+   double lower = 0.0;
+   bool lowerInclusive = true;
+   bool hasUpper = false;
+   double upper = 0.0;
+   bool upperInclusive = true;
+   std::optional<double> eq;
+};
+
+static std::optional<double> getMatchNumericFilterValue(const lingodb::runtime::FilterDescription& f) {
+   if (const auto* v = std::get_if<int64_t>(&f.value)) return static_cast<double>(*v);
+   if (const auto* v = std::get_if<double>(&f.value)) return *v;
+   return std::nullopt;
+}
+
+static bool isMatchRangeFilterOp(lingodb::runtime::FilterOp op) {
+   switch (op) {
+      case lingodb::runtime::FilterOp::EQ:
+      case lingodb::runtime::FilterOp::LT:
+      case lingodb::runtime::FilterOp::LTE:
+      case lingodb::runtime::FilterOp::GT:
+      case lingodb::runtime::FilterOp::GTE:
+         return true;
+      default:
+         return false;
+   }
+}
+
+static void addMatchRangeConstraint(MatchNumericFilterRange& range, lingodb::runtime::FilterOp op, double value) {
+   switch (op) {
+      case lingodb::runtime::FilterOp::EQ:
+         range.eq = value;
+         break;
+      case lingodb::runtime::FilterOp::GT:
+      case lingodb::runtime::FilterOp::GTE: {
+         bool inclusive = op == lingodb::runtime::FilterOp::GTE;
+         if (!range.hasLower || value > range.lower) {
+            range.hasLower = true;
+            range.lower = value;
+            range.lowerInclusive = inclusive;
+         } else if (value == range.lower) {
+            range.lowerInclusive = range.lowerInclusive && inclusive;
+         }
+         break;
+      }
+      case lingodb::runtime::FilterOp::LT:
+      case lingodb::runtime::FilterOp::LTE: {
+         bool inclusive = op == lingodb::runtime::FilterOp::LTE;
+         if (!range.hasUpper || value < range.upper) {
+            range.hasUpper = true;
+            range.upper = value;
+            range.upperInclusive = inclusive;
+         } else if (value == range.upper) {
+            range.upperInclusive = range.upperInclusive && inclusive;
+         }
+         break;
+      }
+      default:
+         break;
+   }
+}
+
+static bool matchRangeAllowsValue(const MatchNumericFilterRange& range, double value) {
+   if (range.hasLower && (value < range.lower || (value == range.lower && !range.lowerInclusive))) return false;
+   if (range.hasUpper && (value > range.upper || (value == range.upper && !range.upperInclusive))) return false;
+   return true;
+}
+
+static bool matchRangeIsEmpty(const MatchNumericFilterRange& range) {
+   if (range.eq && !matchRangeAllowsValue(range, *range.eq)) return true;
+   if (!range.hasLower || !range.hasUpper) return false;
+   if (range.lower > range.upper) return true;
+   return range.lower == range.upper && !(range.lowerInclusive && range.upperInclusive);
+}
+
+static bool matchRangesAreDisjoint(const MatchNumericFilterRange& a, const MatchNumericFilterRange& b) {
+   if (matchRangeIsEmpty(a) || matchRangeIsEmpty(b)) return true;
+   if (a.eq && b.eq) return *a.eq != *b.eq;
+   if (a.eq) return !matchRangeAllowsValue(b, *a.eq);
+   if (b.eq) return !matchRangeAllowsValue(a, *b.eq);
+   if (a.hasUpper && b.hasLower) {
+      if (a.upper < b.lower) return true;
+      if (a.upper == b.lower && !(a.upperInclusive && b.lowerInclusive)) return true;
+   }
+   if (b.hasUpper && a.hasLower) {
+      if (b.upper < a.lower) return true;
+      if (b.upper == a.lower && !(b.upperInclusive && a.lowerInclusive)) return true;
+   }
+   return false;
+}
+
+static bool matchFiltersDefinitelyDisjoint(
+   llvm::ArrayRef<lingodb::runtime::FilterDescription> filtersA,
+   llvm::ArrayRef<lingodb::runtime::FilterDescription> filtersB) {
+   llvm::StringMap<MatchNumericFilterRange> rangesA;
+   llvm::StringMap<MatchNumericFilterRange> rangesB;
+   auto addAll = [](llvm::StringMap<MatchNumericFilterRange>& ranges,
+                    llvm::ArrayRef<lingodb::runtime::FilterDescription> filters) {
+      for (const auto& f : filters) {
+         if (!isMatchRangeFilterOp(f.op)) continue;
+         std::optional<double> value = getMatchNumericFilterValue(f);
+         if (!value) continue;
+         addMatchRangeConstraint(ranges[f.columnName], f.op, *value);
+      }
+   };
+   addAll(rangesA, filtersA);
+   addAll(rangesB, filtersB);
+   for (auto& a : rangesA) {
+      auto b = rangesB.find(a.getKey());
+      if (b == rangesB.end()) continue;
+      if (matchRangesAreDisjoint(a.getValue(), b->getValue())) return true;
+   }
+   return false;
+}
+
+static bool profilesDefinitelyDisjointByFilters(
+   const StateMatchProfile& a, const ModuleReuseInfo& reuseA,
+   const StateMatchProfile& b, const ModuleReuseInfo& reuseB) {
+   llvm::SmallVector<lingodb::runtime::FilterDescription, 8> filtersA =
+      decodeSimpleMatchFiltersAlongShadowChain(a.value, reuseA);
+   llvm::SmallVector<lingodb::runtime::FilterDescription, 8> filtersB =
+      decodeSimpleMatchFiltersAlongShadowChain(b.value, reuseB);
+   if (filtersA.empty() || filtersB.empty()) return false;
+   return matchFiltersDefinitelyDisjoint(filtersA, filtersB);
 }
 
 } // anonymous
@@ -2334,6 +2533,7 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       mlir::ModuleOp module;
       llvm::DenseMap<mlir::Value, std::string> tableDescr;
       llvm::SmallVector<StateMatchProfile, 128> profiles;
+      ModuleReuseInfo reuse;
    };
 
    llvm::SmallVector<QueryModel, 4> models;
@@ -2344,6 +2544,7 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       m.module = q.second;
       m.tableDescr = buildTableDescrByTableState(m.module);
       m.profiles = buildStateMatchProfiles(m.id, m.module, m.tableDescr);
+      m.reuse = collectModuleReuseInfo(m.module);
       models.push_back(std::move(m));
    }
 
@@ -2411,7 +2612,9 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
 
    // O(n^2) pair enumeration. Time is not important; avoids building giant string keys.
    llvm::SmallVector<const StateMatchProfile*, 256> all;
+   llvm::DenseMap<int, const QueryModel*> modelByQueryId;
    for (auto& m : models) {
+      modelByQueryId[m.id] = &m;
       for (auto& p : m.profiles) {
          if (!p.eligible) continue;
          all.push_back(&p);
@@ -2428,6 +2631,12 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
          if (a->constructionHash != b->constructionHash) continue;
          if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
          if (a->depTokensSorted != b->depTokensSorted) continue;
+         const QueryModel* modelA = modelByQueryId.lookup(a->queryId);
+         const QueryModel* modelB = modelByQueryId.lookup(b->queryId);
+         assert(modelA && modelB && "missing query model for profile");
+         if (profilesDefinitelyDisjointByFilters(*a, modelA->reuse, *b, modelB->reuse)) {
+            continue;
+         }
 
          os << "\n// -- match_pair --\n";
          os << "//   query[" << a->queryId << "] ";
@@ -2459,6 +2668,7 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       mlir::ModuleOp module;
       llvm::DenseMap<mlir::Value, std::string> tableDescr;
       llvm::SmallVector<StateMatchProfile, 128> profiles;
+      ModuleReuseInfo reuse;
    };
 
    llvm::SmallVector<QueryModel, 4> models;
@@ -2469,11 +2679,14 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       m.module = q.second;
       m.tableDescr = buildTableDescrByTableState(m.module);
       m.profiles = buildStateMatchProfiles(m.id, m.module, m.tableDescr);
+      m.reuse = collectModuleReuseInfo(m.module);
       models.push_back(std::move(m));
    }
 
    llvm::SmallVector<const StateMatchProfile*, 256> all;
+   llvm::DenseMap<int, const QueryModel*> modelByQueryId;
    for (auto& m : models) {
+      modelByQueryId[m.id] = &m;
       for (auto& p : m.profiles) {
          if (!p.eligible) continue;
          all.push_back(&p);
@@ -2490,14 +2703,22 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
    };
 
    llvm::SmallVector<CrossQueryStateMatchPair, 64> out;
+   llvm::DenseSet<mlir::Value> matchedStates;
    for (size_t i = 0; i < all.size(); i++) {
       for (size_t j = i + 1; j < all.size(); j++) {
          auto* a = all[i];
          auto* b = all[j];
          if (a->queryId == b->queryId) continue;
+         if (matchedStates.contains(a->value) || matchedStates.contains(b->value)) continue;
          if (a->constructionHash != b->constructionHash) continue;
          if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
          if (a->depTokensSorted != b->depTokensSorted) continue;
+         const QueryModel* modelA = modelByQueryId.lookup(a->queryId);
+         const QueryModel* modelB = modelByQueryId.lookup(b->queryId);
+         assert(modelA && modelB && "missing query model for profile");
+         if (profilesDefinitelyDisjointByFilters(*a, modelA->reuse, *b, modelB->reuse)) {
+            continue;
+         }
 
          std::string k = makeKeyStr(*a);
          uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
@@ -2509,6 +2730,9 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
          p.stateB = b->value;
          p.cacheKey = cacheKey;
          out.push_back(p);
+         matchedStates.insert(a->value);
+         matchedStates.insert(b->value);
+         break;
       }
    }
    return out;
@@ -2555,4 +2779,3 @@ void forEachBufferJoinChainPartner(mlir::Value chainRootBuffer, const ModuleReus
 }
 
 } // namespace lingodb::compiler::dialect::subop
-
