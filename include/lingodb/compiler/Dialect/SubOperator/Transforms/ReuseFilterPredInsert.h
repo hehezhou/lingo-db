@@ -61,7 +61,9 @@ std::optional<subop::Member> findFilterPredMemberOnHashIndexedView(subop::HashIn
 
 void insertScanRefsPredFilter(ExecutionStepOp step, subop::Member predMember);
 
-void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member predMember);
+/// Retag a hash-indexed-view probe to MixedHIV and make scan_list apply stored filter_pred$N.
+void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member predMember,
+                                            const llvm::DenseSet<void*>* closureFilter = nullptr);
 
 /// After a \c scan_list / \c scan_refs producer, \c gather filter_pred + \c filter(all_true).
 void insertProbePredFilterImmediatelyAfterScanProducer(mlir::Operation* anchorOp, mlir::Value scanStream,

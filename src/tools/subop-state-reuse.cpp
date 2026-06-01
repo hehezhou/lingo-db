@@ -324,7 +324,8 @@ static bool lowerFromSubOpLayer(mlir::ModuleOp subopModule, const char* snapshot
 }
 
 static SubOpExecuteTiming executeFromSubOpLayer(mlir::ModuleOp subopModule,
-                                                lingodb::runtime::ExecutionContext* executionContext) {
+                                                lingodb::runtime::ExecutionContext* executionContext,
+                                                std::optional<unsigned> resultQueryIndex = std::nullopt) {
    using namespace lingodb::compiler::dialect;
 
    auto wallStart = std::chrono::high_resolution_clock::now();
@@ -360,7 +361,14 @@ static SubOpExecuteTiming executeFromSubOpLayer(mlir::ModuleOp subopModule,
       // slot; do not tear down context between synthetic and consumers.
       lingodb::runtime::ExecutionContext::clearResult(0);
       backend->execute(subopModule, executionContext);
+      if (resultQueryIndex) {
+         std::cout << "// result_begin: query[" << *resultQueryIndex << "]\n";
+         std::cout.flush();
+      }
       printer->process(executionContext);
+      if (resultQueryIndex) {
+         std::cout << "// result_end: query[" << *resultQueryIndex << "]\n";
+      }
       std::cout.flush();
    }));
 
@@ -514,7 +522,7 @@ int main(int argc, char** argv) {
 
    auto tRewrite = std::chrono::high_resolution_clock::now();
    auto rewriteRes = lingodb::compiler::dialect::subop::rewritePlansWithSyntheticQuery0(
-      runs[0].module, runs[1].module, firstPair);
+      runs[0].module, runs[1].module, firstPair, catalog.get());
    const double rewriteMs = millisSince(tRewrite);
    optimizationMs += rewriteMs;
    llvm::outs() << "\n// reuse_targets: query[0]=" << rewriteRes.numTargetsQuery0
@@ -612,13 +620,14 @@ int main(int argc, char** argv) {
    {
       lingodb::runtime::ExecutionContext::clearAllCachedStates();
       auto sharedExecCtx = session->createExecutionContext();
-      auto runOne = [&](mlir::ModuleOp mod, const std::string& label, SubOpExecuteTiming& segment) {
+      auto runOne = [&](mlir::ModuleOp mod, const std::string& label, SubOpExecuteTiming& segment,
+                        std::optional<unsigned> resultQueryIndex) {
          llvm::outs() << "\n// ============================\n";
          llvm::outs() << label << "\n";
          llvm::outs() << "// ============================\n";
          llvm::outs().flush();
          mlir::OwningOpRef<mlir::ModuleOp> execModule = mlir::cast<mlir::ModuleOp>(mod->clone());
-         SubOpExecuteTiming one = executeFromSubOpLayer(*execModule, sharedExecCtx.get());
+         SubOpExecuteTiming one = executeFromSubOpLayer(*execModule, sharedExecCtx.get(), resultQueryIndex);
          segment = one;
          totalExec.add(one);
          timingPerRun.push_back(one);
@@ -632,13 +641,13 @@ int main(int argc, char** argv) {
       // When cross-query rewrite could not map any donor state into the synthetic module, it only
       // contains an empty execution_group shell — skip JIT for that shell.
       if (rewriteRes.numTargetsQuery0Mapped > 0) {
-         runOne(*rewriteRes.query0, "// query[0] (synthetic) execute", segmentSynthetic);
+         runOne(*rewriteRes.query0, "// query[0] (synthetic) execute", segmentSynthetic, std::nullopt);
       } else {
          llvm::outs() << "\n// (skip synthetic execute: reuse_targets_q0_mapped==0)\n";
       }
       for (size_t i = 0; i < runs.size(); i++) {
          SubOpExecuteTiming& seg = (i == 0) ? segmentConsumer0 : segmentConsumer1;
-         runOne(runs[i].module, "// query[" + std::to_string(i) + "] execute", seg);
+         runOne(runs[i].module, "// query[" + std::to_string(i) + "] execute", seg, static_cast<unsigned>(i));
       }
    }
    lingodb::runtime::ExecutionContext::clearAllCachedStates();

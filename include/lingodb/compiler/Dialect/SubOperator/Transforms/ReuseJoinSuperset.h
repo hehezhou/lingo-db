@@ -11,6 +11,10 @@
 
 #include <optional>
 
+namespace lingodb::catalog {
+class Catalog;
+} // namespace lingodb::catalog
+
 namespace lingodb::compiler::dialect::subop {
 
 /// Producer HIV layout after \c extendSyntheticJoinBuffersToColumnUnion (union slot order + semantics).
@@ -39,6 +43,13 @@ bool parseReuseFilterPredSemanticKey(llvm::StringRef semanticKey, unsigned& reus
 bool joinMatchPeerExternalFiltersIdentical(mlir::ModuleOp query0, mlir::ModuleOp query1, mlir::Value hivA,
                                            mlir::Value hivB, const ModuleReuseInfo& reuse0,
                                            const ModuleReuseInfo& reuse1);
+
+/// Estimate the row count of the OR-merged donor-table pushdown filters for a matched HIV pair.
+/// Experimental: assumes both HIVs resolve to the same external table and that catalog sample metadata exists.
+double estimateMergedHivExternalFilterRows(mlir::ModuleOp query0, mlir::ModuleOp query1, mlir::Value hivA,
+                                           mlir::Value hivB, const ModuleReuseInfo& reuse0,
+                                           const ModuleReuseInfo& reuse1,
+                                           lingodb::catalog::Catalog& catalog);
 
 /// Per \c cache_get: aligned HIV + SSA closure of probe-side uses (lookup → scan_list), same discovery as
 /// \c alignConsumerModulesToCachedJoinLayout.
@@ -88,7 +99,7 @@ void insertSyntheticFilterPredsAfterColumnUnion(
    llvm::ArrayRef<CrossQueryStateMatchPair> matches, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
    const CachedJoinBufferLayoutsByKey& layoutsByKey, const ClonedJoinBufferBuildSitesByKey& buildSites);
 
-/// Insert \c gather filter_pred + \c filter(all_true) on \c scan_list ops discovered via \c cache_get closure.
+/// Retag cached HIV probe closures to MixedHIV so scan_list applies the stored filter_pred$N slot directly.
 void applyProbePredFiltersForConsumerClosures(mlir::ModuleOp consumer,
                                               llvm::MutableArrayRef<ConsumerCacheGetProbeClosure> probeClosures);
 

@@ -46,6 +46,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <iostream>
@@ -2300,6 +2301,37 @@ class ScanPreAggregationHtListLowering : public SubOpConversionPattern<subop::Sc
    }
 };
 
+static bool isHashIndexedViewLike(mlir::Type type) {
+   return mlir::isa<subop::HashIndexedViewType, subop::MixedHashIndexedViewType>(type);
+}
+
+static subop::StateMembersAttr getHashIndexedViewLikeValueMembers(mlir::Type type) {
+   return llvm::TypeSwitch<mlir::Type, subop::StateMembersAttr>(type)
+      .Case<subop::HashIndexedViewType>([](auto type) { return type.getValueMembers(); })
+      .Case<subop::MixedHashIndexedViewType>([](auto type) { return type.getValueMembers(); })
+      .Default([](mlir::Type) { return subop::StateMembersAttr(); });
+}
+
+static bool getHashIndexedViewLikeCompareHashForLookup(mlir::Type type) {
+   return llvm::TypeSwitch<mlir::Type, bool>(type)
+      .Case<subop::HashIndexedViewType>([](auto type) { return type.getCompareHashForLookup(); })
+      .Case<subop::MixedHashIndexedViewType>([](auto type) { return type.getCompareHashForLookup(); })
+      .Default([](mlir::Type) { return false; });
+}
+
+static std::optional<size_t> getMixedHashIndexedViewFilterPredIndex(mlir::Type type) {
+   auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(type);
+   if (!mixed) return std::nullopt;
+   auto& memberManager = type.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   llvm::StringRef predMemberName = mixed.getFilterPredMemberName().getValue();
+   size_t idx = 0;
+   for (subop::Member member : mixed.getValueMembers().getMembers()) {
+      if (memberManager.getName(member) == predMemberName) return idx;
+      idx++;
+   }
+   return std::nullopt;
+}
+
 class ScanListLowering : public SubOpConversionPattern<subop::ScanListOp> {
    public:
    using SubOpConversionPattern<subop::ScanListOp>::SubOpConversionPattern;
@@ -2309,8 +2341,8 @@ class ScanListLowering : public SubOpConversionPattern<subop::ScanListOp> {
       if (!listType) return mlir::failure();
       auto lookupRefType = mlir::dyn_cast_or_null<subop::LookupEntryRefType>(listType.getT());
       if (!lookupRefType) return mlir::failure();
-      auto hashIndexedViewType = mlir::dyn_cast_or_null<subop::HashIndexedViewType>(lookupRefType.getState());
-      if (!hashIndexedViewType) return mlir::failure();
+      auto hashIndexedViewType = lookupRefType.getState();
+      if (!isHashIndexedViewLike(hashIndexedViewType)) return mlir::failure();
       ColumnMapping mapping;
       auto loc = scanOp->getLoc();
       llvm::SmallVector<mlir::Value> unpacked;
@@ -2318,8 +2350,10 @@ class ScanListLowering : public SubOpConversionPattern<subop::ScanListOp> {
       auto ptr = unpacked[0];
       auto hash = unpacked[1];
       auto initialValid = unpacked[2];
+      mlir::Value lookupPred = mlir::isa<subop::MixedHashIndexedViewType>(hashIndexedViewType) && unpacked.size() > 3
+                                  ? unpacked[3]
+                                  : rewriter.create<arith::ConstantIntOp>(loc, 1, 1);
       auto iteratorType = ptr.getType();
-      auto referenceType = mlir::cast<subop::ListType>(scanOp.getList().getType()).getT();
       rewriter.create<mlir::scf::IfOp>(
          loc, initialValid, [&](mlir::OpBuilder& builder1, mlir::Location loc) {
             auto whileOp = rewriter.create<mlir::scf::WhileOp>(loc, iteratorType, ptr);
@@ -2331,15 +2365,23 @@ class ScanListLowering : public SubOpConversionPattern<subop::ScanListOp> {
             mlir::Value beforePtr = before->addArgument(iteratorType, loc);
             mlir::Value afterPtr = after->addArgument(iteratorType, loc);
             rewriter.atStartOf(before, [&](SubOpRewriter& rewriter) {
-               auto tupleType = mlir::TupleType::get(getContext(), unpackTypes(referenceType.getMembers()));
+               auto tupleType = mlir::TupleType::get(getContext(), unpackTypes(getHashIndexedViewLikeValueMembers(hashIndexedViewType)));
                auto i8PtrType = rewriter.getPtrType();
                Value castedPtr = rewriter.create<util::GenericMemrefCastOp>(loc, util::RefType::get(getContext(), mlir::TupleType::get(getContext(), {i8PtrType, rewriter.getIndexType(), tupleType})), beforePtr);
                Value valuePtr = rewriter.create<util::TupleElementPtrOp>(loc, util::RefType::get(getContext(), tupleType), castedPtr, 2);
-               if (hashIndexedViewType.getCompareHashForLookup()) {
+               mlir::Value emitEntry = lookupPred;
+               if (auto predIdx = getMixedHashIndexedViewFilterPredIndex(hashIndexedViewType)) {
+                  mlir::Value storedPred = rewriter.create<util::LoadElementOp>(loc, rewriter.getI1Type(), valuePtr, *predIdx);
+                  emitEntry = rewriter.create<arith::AndIOp>(loc, emitEntry, storedPred);
+               }
+               if (getHashIndexedViewLikeCompareHashForLookup(hashIndexedViewType)) {
                   mlir::Value currHash = rewriter.create<util::LoadElementOp>(loc, rewriter.getIndexType(), castedPtr, 1);
                   mlir::Value hashEq = rewriter.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, currHash, hash);
+                  emitEntry = rewriter.create<arith::AndIOp>(loc, emitEntry, hashEq);
+               }
+               if (mlir::isa<subop::MixedHashIndexedViewType>(hashIndexedViewType) || getHashIndexedViewLikeCompareHashForLookup(hashIndexedViewType)) {
                   rewriter.create<mlir::scf::IfOp>(
-                     loc, hashEq, [&](mlir::OpBuilder& builder1, mlir::Location loc) {
+                     loc, emitEntry, [&](mlir::OpBuilder& builder1, mlir::Location loc) {
                         mapping.define(scanOp.getElem(), valuePtr);
                         rewriter.replaceTupleStream(scanOp, mapping);
                         builder1.create<mlir::scf::YieldOp>(loc);
@@ -2629,13 +2671,14 @@ class LookupHashIndexedViewLowering : public SubOpTupleStreamConsumerConversionP
    public:
    using SubOpTupleStreamConsumerConversionPattern<subop::LookupOp>::SubOpTupleStreamConsumerConversionPattern;
    LogicalResult match(subop::LookupOp lookupOp) const override {
-      if (!mlir::isa<subop::HashIndexedViewType>(lookupOp.getState().getType())) return failure();
+      if (!isHashIndexedViewLike(lookupOp.getState().getType())) return failure();
       return success();
    }
 
    void rewrite(subop::LookupOp lookupOp, OpAdaptor adaptor, SubOpRewriter& rewriter, ColumnMapping& mapping) const override {
       auto loc = lookupOp->getLoc();
-      mlir::Value hash = mapping.resolve(lookupOp, lookupOp.getKeys())[0];
+      auto lookupArgs = mapping.resolve(lookupOp, lookupOp.getKeys());
+      mlir::Value hash = lookupArgs[0];
       auto* context = getContext();
       auto indexType = rewriter.getIndexType();
       auto htType = util::RefType::get(context, rewriter.getPtrType());
@@ -2648,7 +2691,13 @@ class LookupHashIndexedViewLowering : public SubOpTupleStreamConsumerConversionP
       //optimization
       Value refValid = rewriter.create<util::PtrTagMatches>(loc, rewriter.getI1Type(), ptr, hash);
       ptr = rewriter.create<util::UnTagPtr>(loc, ptr.getType(), ptr);
-      Value matches = rewriter.create<util::PackOp>(loc, ValueRange{ptr, hash, refValid});
+      mlir::Value lookupPred = rewriter.create<arith::ConstantIntOp>(loc, 1, 1);
+      if (mlir::isa<subop::MixedHashIndexedViewType>(lookupOp.getState().getType()) && lookupArgs.size() > 1) {
+         lookupPred = lookupArgs[1];
+      }
+      Value matches = mlir::isa<subop::MixedHashIndexedViewType>(lookupOp.getState().getType())
+                         ? rewriter.create<util::PackOp>(loc, ValueRange{ptr, hash, refValid, lookupPred})
+                         : rewriter.create<util::PackOp>(loc, ValueRange{ptr, hash, refValid});
 
       mapping.define(lookupOp.getRef(), matches);
       rewriter.replaceTupleStream(lookupOp, mapping);
@@ -3856,6 +3905,7 @@ class ReduceOpLowering : public SubOpTupleStreamConsumerConversionPattern<subop:
 class CreateHashIndexedViewLowering : public SubOpConversionPattern<subop::CreateHashIndexedView> {
    using SubOpConversionPattern<subop::CreateHashIndexedView>::SubOpConversionPattern;
    LogicalResult matchAndRewrite(subop::CreateHashIndexedView createOp, OpAdaptor adaptor, SubOpRewriter& rewriter) const override {
+      if (!isHashIndexedViewLike(createOp.getType())) return failure();
       auto bufferType = mlir::dyn_cast<subop::BufferType>(createOp.getSource().getType());
       if (!bufferType) return failure();
       auto linkIsFirst = bufferType.getMembers().getMembers()[0] == createOp.getLinkMember().getMember();
@@ -4592,6 +4642,9 @@ void SubOpToControlFlowLoweringPass::runOnOperation() {
    typeConverter.addConversion([&](subop::HashIndexedViewType t) -> Type {
       return util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8));
    });
+   typeConverter.addConversion([&](subop::MixedHashIndexedViewType t) -> Type {
+      return util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8));
+   });
    typeConverter.addConversion([&](subop::HeapType t) -> Type {
       return util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8));
    });
@@ -4609,7 +4662,10 @@ void SubOpToControlFlowLoweringPass::runOnOperation() {
          if (auto externalHashIndexRefType = mlir::dyn_cast_or_null<subop::ExternalHashIndexType>(t.getT())) {
             return util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8));
          }
-         return mlir::TupleType::get(t.getContext(), {util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8)), mlir::IndexType::get(t.getContext())});
+         if (mlir::isa<subop::MixedHashIndexedViewType>(lookupEntryRefType.getState())) {
+            return mlir::TupleType::get(t.getContext(), {util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8)), mlir::IndexType::get(t.getContext()), mlir::IntegerType::get(ctxt, 1), mlir::IntegerType::get(ctxt, 1)});
+         }
+         return mlir::TupleType::get(t.getContext(), {util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8)), mlir::IndexType::get(t.getContext()), mlir::IntegerType::get(ctxt, 1)});
       }
       if (auto hashMapEntryRefType = mlir::dyn_cast_or_null<subop::HashMapEntryRefType>(t.getT())) {
          return util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8));
@@ -4640,7 +4696,10 @@ void SubOpToControlFlowLoweringPass::runOnOperation() {
       if (auto hashMultiMapType = mlir::dyn_cast_or_null<subop::HashMultiMapType>(t.getState())) {
          return util::RefType::get(t.getContext(), getHashMultiMapEntryType(hashMultiMapType, typeConverter));
       }
-      return mlir::TupleType::get(t.getContext(), {util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8)), mlir::IndexType::get(t.getContext())});
+      if (mlir::isa<subop::MixedHashIndexedViewType>(t.getState())) {
+         return mlir::TupleType::get(t.getContext(), {util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8)), mlir::IndexType::get(t.getContext()), mlir::IntegerType::get(ctxt, 1), mlir::IntegerType::get(ctxt, 1)});
+      }
+      return mlir::TupleType::get(t.getContext(), {util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8)), mlir::IndexType::get(t.getContext()), mlir::IntegerType::get(ctxt, 1)});
    });
 
    //basic tuple stream manipulation

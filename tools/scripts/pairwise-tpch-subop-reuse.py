@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import itertools
 import json
 import os
@@ -45,6 +46,10 @@ _RE_SUBOP_REUSE_MAPPED = re.compile(r"^//\s+reuse_targets_q0_mapped:\s+(\d+)\s*$
 _RE_SUBOP_REUSE_MAPPED_NO_TABLE = re.compile(r"^//\s+reuse_targets_q0_mapped_no_table:\s+(\d+)\s*$", re.M)
 _RE_SUBOP_TIMING_TOTAL = re.compile(r"^//\s+timing:\s+optimization_ms=.*\s+execution_time_ms=([0-9.eE+\-]+)\s*$", re.M)
 _RE_SUBOP_TIMING_PER_RUN = re.compile(r"^//\s+timing_execution_time_ms:\s+per_run=\[([^\]]*)\]\s+total=([0-9.eE+\-]+)\s*$", re.M)
+_RE_SUBOP_RESULT_BLOCK = re.compile(
+    r"^// result_begin: query\[(\d+)\]\s*$\n(.*?)^// result_end: query\[\1\]\s*$",
+    re.M | re.S,
+)
 
 
 def parse_run_sql_execution_time_ms(stdout: str) -> Optional[float]:
@@ -57,6 +62,60 @@ def parse_run_sql_execution_time_ms(stdout: str) -> Optional[float]:
         # m.group(2)=executionTime, m.group(3)=total
         return float(m.group(2))
     return None
+
+
+def normalize_result_block(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    lines = [line.rstrip() for line in text.splitlines()]
+    while lines and lines[0] == "":
+        lines.pop(0)
+    while lines and lines[-1] == "":
+        lines.pop()
+    if not lines:
+        return None
+    return "\n".join(lines)
+
+
+def hash_text(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def parse_run_sql_result_block(stdout: str) -> Optional[str]:
+    lines = stdout.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.startswith("|"):
+            start = i
+            break
+    if start is None:
+        return None
+
+    block: List[str] = []
+    for line in lines[start:]:
+        stripped = line.rstrip()
+        if stripped == "":
+            if block:
+                break
+            continue
+        if stripped.startswith("|") or set(stripped) == {"-"}:
+            block.append(stripped)
+            continue
+        if block:
+            break
+    return normalize_result_block("\n".join(block))
+
+
+def parse_subop_result_blocks(stdout: str) -> Dict[int, str]:
+    out: Dict[int, str] = {}
+    for m in _RE_SUBOP_RESULT_BLOCK.finditer(stdout):
+        q_idx = int(m.group(1))
+        block = normalize_result_block(m.group(2))
+        if block is not None:
+            out[q_idx] = block
+    return out
 
 
 def parse_subop_metrics(stdout: str) -> Dict[str, Any]:
@@ -118,15 +177,19 @@ def main() -> None:
 
     # Precompute run-sql execution times.
     singles: Dict[int, Dict[str, Any]] = {}
+    single_result_blocks: Dict[int, Optional[str]] = {}
     for q in range(1, 23):
         sql = os.path.join(args.sql_dir, f"{q}.sql")
         r = run_cmd([run_sql, sql, args.db], env=env, timeout_s=args.timeout_s)
         exec_ms = parse_run_sql_execution_time_ms(r.stdout) if r.returncode == 0 else None
+        result_block = parse_run_sql_result_block(r.stdout) if r.returncode == 0 else None
+        single_result_blocks[q] = result_block
         singles[q] = {
             "q": q,
             "sql": sql,
             "returncode": r.returncode,
             "execution_time_ms": exec_ms,
+            "result_sha256": hash_text(result_block),
             "wall_ms": r.wall_ms,
         }
 
@@ -155,6 +218,7 @@ def main() -> None:
 
         r = run_cmd([subop, args.db, sql_a, sql_b], env=env, timeout_s=args.timeout_s)
         metrics = parse_subop_metrics(r.stdout)
+        subop_results = parse_subop_result_blocks(r.stdout)
 
         row: Dict[str, Any] = {
             "pair_id": pair_id,
@@ -174,6 +238,38 @@ def main() -> None:
         q1 = singles[b]["execution_time_ms"]
         if q0 is not None and q1 is not None:
             row["run_sql"]["q0_plus_q1_execution_time_ms"] = q0 + q1
+
+        expected0 = single_result_blocks.get(a)
+        expected1 = single_result_blocks.get(b)
+        actual0 = subop_results.get(0)
+        actual1 = subop_results.get(1)
+        result_compare: Dict[str, Any] = {
+            "q0_expected_sha256": singles[a].get("result_sha256"),
+            "q1_expected_sha256": singles[b].get("result_sha256"),
+            "q0_actual_sha256": hash_text(actual0),
+            "q1_actual_sha256": hash_text(actual1),
+            "q0_match": None,
+            "q1_match": None,
+            "all_match": None,
+        }
+
+        q0_expected_hash = singles[a].get("result_sha256")
+        q1_expected_hash = singles[b].get("result_sha256")
+        q0_actual_hash = result_compare["q0_actual_sha256"]
+        q1_actual_hash = result_compare["q1_actual_sha256"]
+        if q0_expected_hash is not None and q0_actual_hash is not None:
+            result_compare["q0_match"] = q0_expected_hash == q0_actual_hash
+        if q1_expected_hash is not None and q1_actual_hash is not None:
+            result_compare["q1_match"] = q1_expected_hash == q1_actual_hash
+        if result_compare["q0_match"] is not None and result_compare["q1_match"] is not None:
+            result_compare["all_match"] = bool(result_compare["q0_match"] and result_compare["q1_match"])
+        if result_compare["q0_match"] is False:
+            result_compare["q0_expected_preview"] = "\n".join(expected0.splitlines()[:12]) if expected0 else None
+            result_compare["q0_actual_preview"] = "\n".join(actual0.splitlines()[:12]) if actual0 else None
+        if result_compare["q1_match"] is False:
+            result_compare["q1_expected_preview"] = "\n".join(expected1.splitlines()[:12]) if expected1 else None
+            result_compare["q1_actual_preview"] = "\n".join(actual1.splitlines()[:12]) if actual1 else None
+        row["result_compare"] = result_compare
 
         # Ratios (when data is available).
         if "execution_time_ms_total" in metrics and q0 is not None and q1 is not None:
@@ -213,4 +309,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

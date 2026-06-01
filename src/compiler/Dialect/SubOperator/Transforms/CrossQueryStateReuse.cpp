@@ -509,7 +509,7 @@ void applyFilterPredReapplyAfterCacheGetReplacement(
       }
    }
 
-   // HIV probe `filter_pred` filters are inserted after consumer layout align via
+   // HIV probe `filter_pred` checks are retagged to MixedHIV after consumer layout align via
    // `applyProbePredFiltersForConsumerClosures` (see `rewritePlansWithSyntheticQuery0`).
    (void)isJoinBuf;
    (void)isJoinHiv;
@@ -766,7 +766,8 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
 ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    mlir::ModuleOp query0,
    mlir::ModuleOp query1,
-   llvm::ArrayRef<CrossQueryStateMatchPair> matches) {
+   llvm::ArrayRef<CrossQueryStateMatchPair> matches,
+   lingodb::catalog::Catalog* catalog) {
    ReusePlanRewriteResult res;
 
    llvm::SmallVector<CrossQueryStateMatchPair, 64> matchesLocal(matches.begin(), matches.end());
@@ -792,6 +793,12 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
             mlir::isa<subop::HashIndexedViewType>(tb.getType());
          if (reuseMatchFiltersDefinitelyDisjoint(m.stateA, m.stateB, reuse0Early, reuse1Early)) {
             continue;
+         }
+         if (bothHiv) {
+            assert(catalog && "join superset CE threshold requires a catalog");
+            double mergedRows = estimateMergedHivExternalFilterRows(query0, query1, m.stateA, m.stateB,
+                                                                    reuse0Early, reuse1Early, *catalog);
+            if (mergedRows < 100.0) continue;
          }
          if (bothHiv &&
              joinMatchPeerExternalFiltersIdentical(query0, query1, m.stateA, m.stateB, reuse0Early, reuse1Early)) {
@@ -929,8 +936,6 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       }
    }
 
-   applyProbePredFiltersForConsumerClosures(query0, probeClosuresQ0);
-   applyProbePredFiltersForConsumerClosures(query1, probeClosuresQ1);
    for (auto& t : targets0) {
       resyncConsumerCachedHivCarrierTypesFromCacheGet(query0, t.cacheKey);
    }
@@ -945,6 +950,8 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    }
    syncProbeGatherMappingsInModule(query0);
    syncProbeGatherMappingsInModule(query1);
+   applyProbePredFiltersForConsumerClosures(query0, probeClosuresQ0);
+   applyProbePredFiltersForConsumerClosures(query1, probeClosuresQ1);
 
    return res;
 }

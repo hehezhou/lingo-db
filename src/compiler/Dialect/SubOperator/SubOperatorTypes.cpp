@@ -91,6 +91,9 @@ subop::StateMembersAttr subop::MapType::getMembers() {
 subop::StateMembersAttr subop::HashIndexedViewType::getMembers() {
    return subop::StateMembersAttr::get(this->getContext(), combineMembers(getKeyMembers(), getValueMembers()));
 }
+subop::StateMembersAttr subop::MixedHashIndexedViewType::getMembers() {
+   return subop::StateMembersAttr::get(this->getContext(), combineMembers(getKeyMembers(), getValueMembers()));
+}
 subop::StateMembersAttr subop::SegmentTreeViewType::getMembers() {
    return subop::StateMembersAttr::get(this->getContext(), combineMembers(getKeyMembers(), getValueMembers()));
 }

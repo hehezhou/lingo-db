@@ -13,6 +13,9 @@
 #include <cstdint>
 #include <string>
 
+namespace lingodb::catalog {
+class Catalog;
+} // namespace lingodb::catalog
 namespace lingodb::compiler::dialect::subop {
 
 struct ReusePlanRewriteResult {
@@ -36,7 +39,8 @@ struct ReusePlanRewriteResult {
 ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    mlir::ModuleOp query0,
    mlir::ModuleOp query1,
-   llvm::ArrayRef<CrossQueryStateMatchPair> matches);
+   llvm::ArrayRef<CrossQueryStateMatchPair> matches,
+   lingodb::catalog::Catalog* catalog = nullptr);
 
 /// \p reuseBeforeMutation must reflect the module **before** `rewriteHashmapTypesInModule` runs on
 /// \p producerModule (when null, it is collected here). Used to skip a redundant full-module scan.
@@ -54,4 +58,3 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
 } // namespace lingodb::compiler::dialect::subop
 
 #endif
-

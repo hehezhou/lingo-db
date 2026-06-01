@@ -77,6 +77,9 @@ class ToJson {
          .Case<subop::HashIndexedViewType>([&](subop::HashIndexedViewType resultTableType) {
             return "HashIndexedView";
          })
+         .Case<subop::MixedHashIndexedViewType>([&](subop::MixedHashIndexedViewType resultTableType) {
+            return "MixedHashIndexedView";
+         })
          .Case<subop::HashMapType>([&](subop::HashMapType resultTableType) {
             return "HashMap";
          })

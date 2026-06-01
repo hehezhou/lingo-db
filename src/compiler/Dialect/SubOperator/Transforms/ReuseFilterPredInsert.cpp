@@ -26,12 +26,58 @@ static std::optional<unsigned> parseFilterPredMemberSlot(llvm::StringRef memberN
    return slot;
 }
 
+static subop::StateMembersAttr appendMember(mlir::MLIRContext* ctx, subop::StateMembersAttr members,
+                                            subop::Member m);
+bool valueMembersContainMemberNamed(mlir::MLIRContext* ctx, subop::StateMembersAttr members,
+                                    llvm::StringRef name);
+
 static bool hashIndexedViewHasFilterPredMember(mlir::MLIRContext* ctx, subop::HashIndexedViewType hiv) {
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    for (subop::Member m : hiv.getValueMembers().getMembers()) {
       if (parseFilterPredMemberSlot(mm.getName(m))) return true;
    }
    return false;
+}
+
+static bool hashIndexedViewLikeHasFilterPredMember(mlir::MLIRContext* ctx, mlir::Type t) {
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   subop::StateMembersAttr valueMembers;
+   if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(t)) {
+      valueMembers = hiv.getValueMembers();
+   } else if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(t)) {
+      valueMembers = mixed.getValueMembers();
+   } else {
+      return false;
+   }
+   for (subop::Member m : valueMembers.getMembers()) {
+      if (parseFilterPredMemberSlot(mm.getName(m))) return true;
+   }
+   return false;
+}
+
+static subop::MixedHashIndexedViewType getMixedHashIndexedViewTypeForPredMember(mlir::MLIRContext* ctx,
+                                                                                mlir::Type t,
+                                                                                subop::Member predMember) {
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   subop::StateMembersAttr keyMembers;
+   subop::StateMembersAttr valueMembers;
+   bool compareHashForLookup = false;
+   if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(t)) {
+      keyMembers = hiv.getKeyMembers();
+      valueMembers = hiv.getValueMembers();
+      compareHashForLookup = hiv.getCompareHashForLookup();
+   } else if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(t)) {
+      keyMembers = mixed.getKeyMembers();
+      valueMembers = mixed.getValueMembers();
+      compareHashForLookup = mixed.getCompareHashForLookup();
+   } else {
+      return nullptr;
+   }
+   if (!valueMembersContainMemberNamed(ctx, valueMembers, mm.getName(predMember))) {
+      valueMembers = appendMember(ctx, valueMembers, predMember);
+   }
+   return subop::MixedHashIndexedViewType::get(ctx, keyMembers, valueMembers, compareHashForLookup,
+                                               mlir::StringAttr::get(ctx, mm.getName(predMember)));
 }
 
 subop::Member makeOrGetPredMemberForSlot(mlir::MLIRContext* ctx, unsigned slot) {
@@ -60,7 +106,7 @@ static subop::StateMembersAttr appendMember(mlir::MLIRContext* ctx, subop::State
 }
 
 bool valueMembersContainMemberNamed(mlir::MLIRContext* ctx, subop::StateMembersAttr members,
-                                           llvm::StringRef name) {
+                                    llvm::StringRef name) {
    auto* d = ctx->getLoadedDialect<subop::SubOperatorDialect>();
    assert(d);
    auto& mm = d->getMemberManager();
@@ -87,10 +133,13 @@ static void syncCreateHashIndexedViewResultType(subop::CreateHashIndexedView chi
       if (m == linkM || m == hashM) continue;
       vals.push_back(m);
    }
-   auto oldHiv = mlir::cast<subop::HashIndexedViewType>(chiv.getType());
+   auto oldHiv = mlir::dyn_cast<subop::HashIndexedViewType>(chiv.getType());
+   auto oldMixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(chiv.getType());
+   if (!oldHiv && !oldMixed) return;
    auto keyMs = subop::StateMembersAttr::get(ctx, llvm::SmallVector<subop::Member>{hashM});
    auto valMs = subop::StateMembersAttr::get(ctx, vals);
-   auto newHiv = subop::HashIndexedViewType::get(ctx, keyMs, valMs, oldHiv.getCompareHashForLookup());
+   bool compareHashForLookup = oldHiv ? oldHiv.getCompareHashForLookup() : oldMixed.getCompareHashForLookup();
+   auto newHiv = subop::HashIndexedViewType::get(ctx, keyMs, valMs, compareHashForLookup);
    chiv.getResult().setType(newHiv);
 }
 
@@ -448,6 +497,10 @@ static mlir::Type deepReplaceHivLookupEntryRefWithPredLayout(mlir::MLIRContext* 
          if (!hashIndexedViewHasFilterPredMember(ctx, hiv)) return t;
          auto nhiv = extendHashIndexedViewWithPredMemberIfMissing(ctx, hiv, predMember);
          if (nhiv != hiv) return subop::LookupEntryRefType::get(ctx, nhiv);
+      } else if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(ler.getState())) {
+         if (!hashIndexedViewLikeHasFilterPredMember(ctx, mixed)) return t;
+         auto nmixed = getMixedHashIndexedViewTypeForPredMember(ctx, mixed, predMember);
+         if (nmixed != mixed) return subop::LookupEntryRefType::get(ctx, nmixed);
       }
       return t;
    }
@@ -706,6 +759,13 @@ void propagateSubOpColumnAttrsFromSsaStateLayout(mlir::ModuleOp module,
          r.getColumn().type = expected;
          op.setRefAttr(r);
          return;
+      } else if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(op.getState().getType())) {
+         auto expected =
+            subop::ListType::get(ctx, subop::LookupEntryRefType::get(ctx, mixed));
+         if (r.getColumn().type == expected) return;
+         r.getColumn().type = expected;
+         op.setRefAttr(r);
+         return;
       }
       subop::HashMapType hm = getHashMapTypeForStateValue(op.getState());
       if (!hm) return;
@@ -830,9 +890,9 @@ void propagateSubOpColumnAttrsFromSsaStateLayout(mlir::ModuleOp module,
    });
    module.walk([&](subop::LookupOp lookup) {
       if (!shouldUpdateOp(lookup.getOperation())) return;
-      auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(lookup.getState().getType());
-      if (!hiv) return;
-      auto expected = subop::ListType::get(ctx, subop::LookupEntryRefType::get(ctx, hiv));
+      auto stateTy = lookup.getState().getType();
+      if (!mlir::isa<subop::HashIndexedViewType, subop::MixedHashIndexedViewType>(stateTy)) return;
+      auto expected = subop::ListType::get(ctx, subop::LookupEntryRefType::get(ctx, mlir::cast<subop::LookupAbleState>(stateTy)));
       auto refDef = lookup.getRef();
       if (refDef.getColumn().type == expected) return;
       refDef.getColumn().type = expected;
@@ -1645,8 +1705,8 @@ std::optional<subop::Member> findFilterPredMemberOnHashIndexedView(subop::HashIn
 }
 
 void materializeConstantTruePredMemberOnBufferMaterialize(subop::MaterializeOp matOp,
-                                                                 llvm::StringRef predMemberName,
-                                                                 bool updateStreamOperand) {
+	                                                                 llvm::StringRef predMemberName,
+	                                                                 bool updateStreamOperand) {
    auto* ctx = matOp.getContext();
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
@@ -1979,32 +2039,157 @@ void insertScanRefsPredFilter(ExecutionStepOp step, subop::Member predMember) {
    insertProbePredFilterImmediatelyAfterScanProducer(scanOp.getOperation(), scanOp.getRes(), entryRef, predMember);
 }
 
-static std::optional<subop::ScanListOp> findHivScanListInStep(subop::ExecutionStepOp step, subop::Member predMember) {
+static llvm::SmallVector<subop::ScanListOp, 4> findHivScanListsInStep(
+   subop::ExecutionStepOp step, subop::Member predMember, const llvm::DenseSet<void*>* closureFilter) {
+   llvm::SmallVector<subop::ScanListOp, 4> out;
    auto* ctx = step.getContext();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    mlir::Block& body = step.getSubOps().front();
    for (mlir::Operation& op : body.without_terminator()) {
       auto scanListOp = mlir::dyn_cast<subop::ScanListOp>(&op);
       if (!scanListOp) continue;
+      if (closureFilter && !opaqueClosureContains(*closureFilter, scanListOp.getList())) continue;
       auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(scanListOp.getElem().getColumn().type);
       if (!ler) continue;
       auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState());
-      if (!hiv) continue;
-      if (!valueMembersContainMemberNamed(ctx, hiv.getValueMembers(), mm.getName(predMember))) continue;
-      return scanListOp;
+      auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(ler.getState());
+      if (!hiv && !mixed) continue;
+      subop::StateMembersAttr valueMembers = hiv ? hiv.getValueMembers() : mixed.getValueMembers();
+      if (!valueMembersContainMemberNamed(ctx, valueMembers, mm.getName(predMember))) continue;
+      out.push_back(scanListOp);
    }
-   return std::nullopt;
+   return out;
 }
 
-/// After `scan_list` on cached `hash_indexed_view`, gather `filter_pred$N` and filter at step entry.
-void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member predMember) {
-   std::optional<subop::ScanListOp> scanListOp = findHivScanListInStep(step, predMember);
-   if (!scanListOp) return;
-   auto* ctx = step.getContext();
+static bool lookupTargetsHashIndexedViewPredMember(subop::LookupOp lookup, subop::Member predMember) {
+   auto* ctx = lookup.getContext();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   auto stateTy = lookup.getState().getType();
+   subop::StateMembersAttr valueMembers;
+   if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(stateTy)) {
+      valueMembers = hiv.getValueMembers();
+   } else if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(stateTy)) {
+      valueMembers = mixed.getValueMembers();
+   } else {
+      return false;
+   }
+   return valueMembersContainMemberNamed(ctx, valueMembers, mm.getName(predMember));
+}
+
+static void attachConstantTruePredArgToMixedLookup(subop::LookupOp lookup, subop::Member predMember) {
+   auto* ctx = lookup.getContext();
+   auto mixedTy = getMixedHashIndexedViewTypeForPredMember(ctx, lookup.getState().getType(), predMember);
+   if (!mixedTy) return;
+
+   lookup.getState().setType(mixedTy);
+   auto ref = lookup.getRef();
+   ref.getColumn().type = subop::ListType::get(ctx, subop::LookupEntryRefType::get(ctx, mixedTy));
+   lookup.setRefAttr(ref);
+
+   if (lookup.getKeys().size() > 1) return;
+
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
-   tuples::ColumnRefAttr entryRef = cm.createRef(&scanListOp->getElem().getColumn());
-   insertProbePredFilterImmediatelyAfterScanProducer(scanListOp->getOperation(), scanListOp->getRes(), entryRef,
-                                                     predMember);
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   std::string scopeSeed = "mixed_hiv_lookup_pred";
+   if (auto slot = parseFilterPredMemberSlot(mm.getName(predMember)))
+      scopeSeed = ("mixed_hiv_lookup_pred$" + llvm::Twine(*slot)).str();
+   tuples::ColumnDefAttr predDef = cm.createDef(cm.getUniqueScope(scopeSeed), "filter_pred");
+   predDef.getColumn().type = mlir::IntegerType::get(ctx, 1);
+
+   mlir::OpBuilder builder(lookup);
+   builder.setInsertionPoint(lookup);
+   subop::MapCreationHelper helper(ctx);
+   helper.buildBlock(builder, [&](mlir::OpBuilder& rb) {
+      mlir::Value t = rb.create<mlir::arith::ConstantIntOp>(lookup.getLoc(), 1, 1);
+      rb.create<tuples::ReturnOp>(lookup.getLoc(), mlir::ValueRange{t});
+   });
+   auto mapOp = builder.create<subop::MapOp>(lookup.getLoc(), tuples::TupleStreamType::get(ctx), lookup.getStream(),
+                                             builder.getArrayAttr({predDef}), helper.getColRefs());
+   mapOp.getFn().push_back(helper.getMapBlock());
+   lookup->setOperand(0, mapOp.getResult());
+
+   llvm::SmallVector<mlir::Attribute> keys;
+   for (mlir::Attribute key : lookup.getKeys()) keys.push_back(key);
+   keys.push_back(cm.createRef(&predDef.getColumn()));
+   lookup.setKeysAttr(mlir::ArrayAttr::get(ctx, keys));
+}
+
+static void retagHivScanListToMixed(subop::ScanListOp scanList, subop::Member predMember) {
+   auto* ctx = scanList.getContext();
+   auto listTy = mlir::dyn_cast<subop::ListType>(scanList.getList().getType());
+   if (!listTy) return;
+   auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(listTy.getT());
+   if (!ler) return;
+   auto mixedTy = getMixedHashIndexedViewTypeForPredMember(ctx, ler.getState(), predMember);
+   if (!mixedTy) return;
+   auto mixedLer = subop::LookupEntryRefType::get(ctx, mixedTy);
+   scanList.getList().setType(subop::ListType::get(ctx, mixedLer));
+   auto elem = scanList.getElem();
+   elem.getColumn().type = mixedLer;
+   scanList.setElemAttr(elem);
+}
+
+static mlir::Type retagHashIndexedViewCarrierTypeToMixed(mlir::MLIRContext* ctx, mlir::Type type,
+                                                         subop::Member predMember) {
+   if (!type) return type;
+   if (auto listTy = mlir::dyn_cast<subop::ListType>(type)) {
+      mlir::Type inner = retagHashIndexedViewCarrierTypeToMixed(ctx, listTy.getT(), predMember);
+      if (inner != listTy.getT()) return subop::ListType::get(ctx, mlir::cast<subop::StateEntryReference>(inner));
+      return type;
+   }
+   if (auto optTy = mlir::dyn_cast<subop::OptionalType>(type)) {
+      mlir::Type inner = retagHashIndexedViewCarrierTypeToMixed(ctx, optTy.getT(), predMember);
+      if (inner != optTy.getT()) return subop::OptionalType::get(ctx, mlir::cast<subop::StateEntryReference>(inner));
+      return type;
+   }
+   if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(type)) {
+      auto mixedTy = getMixedHashIndexedViewTypeForPredMember(ctx, ler.getState(), predMember);
+      if (mixedTy && mixedTy != ler.getState()) return subop::LookupEntryRefType::get(ctx, mixedTy);
+      return type;
+   }
+   if (auto mixedTy = getMixedHashIndexedViewTypeForPredMember(ctx, type, predMember)) return mixedTy;
+   return type;
+}
+
+static void retagHivCarrierValuesToMixed(mlir::ModuleOp module, subop::Member predMember,
+                                         const llvm::DenseSet<void*>* closureFilter) {
+   auto* ctx = module.getContext();
+   llvm::SmallVector<std::pair<mlir::Value, mlir::Type>, 16> updates;
+   auto maybeRetag = [&](mlir::Value v) {
+      if (!v) return;
+      if (closureFilter && !opaqueClosureContains(*closureFilter, v)) return;
+      mlir::Type newTy = retagHashIndexedViewCarrierTypeToMixed(ctx, v.getType(), predMember);
+      if (!newTy || v.getType() == newTy) return;
+      updates.push_back({v, newTy});
+   };
+   module.walk([&](mlir::Operation* op) {
+      for (mlir::Value result : op->getResults()) maybeRetag(result);
+      for (mlir::Region& region : op->getRegions()) {
+         for (mlir::Block& block : region) {
+            for (mlir::BlockArgument arg : block.getArguments()) maybeRetag(arg);
+         }
+      }
+   });
+   for (auto& [value, type] : updates) value.setType(type);
+}
+
+/// After `scan_list` on cached `hash_indexed_view`, use MixedHIV lookup/scan semantics to filter
+/// by stored `filter_pred$N` inside the hash table traversal.
+void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member predMember,
+                                            const llvm::DenseSet<void*>* closureFilter) {
+   llvm::SmallVector<subop::ScanListOp, 4> scanListOps = findHivScanListsInStep(step, predMember, closureFilter);
+   if (scanListOps.empty()) return;
+   for (subop::ScanListOp scanListOp : scanListOps) retagHivScanListToMixed(scanListOp, predMember);
+
+   mlir::ModuleOp module = step->getParentOfType<mlir::ModuleOp>();
+   if (!module) return;
+   retagHivCarrierValuesToMixed(module, predMember, closureFilter);
+   module.walk([&](subop::LookupOp lookup) {
+      if (closureFilter && !opOperandsOrNestedBlockArgsTouchClosure(lookup.getOperation(), *closureFilter)) return;
+      if (!lookupTargetsHashIndexedViewPredMember(lookup, predMember)) return;
+      attachConstantTruePredArgToMixedLookup(lookup, predMember);
+   });
+   synchronizeExecutionStepPortTypes(module, nullptr);
 }
 
 /// Forward walk (uses + `merge` + `execution_step` region args) until we see `subop.create_hash_indexed_view`

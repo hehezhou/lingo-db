@@ -307,6 +307,14 @@ def HashIndexedView : SubOperator_Type<"HashIndexedView", "hash_indexed_view", [
         StateMembersAttr getMembers();
      }];
 }
+def MixedHashIndexedView : SubOperator_Type<"MixedHashIndexedView", "mixed_hash_indexed_view", [State,LookupAbleState]> {
+    let summary = "hash indexed view variant with predicate-aware lookup traversal";
+    let parameters = (ins "StateMembersAttr":$keyMembers,"StateMembersAttr":$valueMembers, "bool":$compareHashForLookup, "mlir::StringAttr":$filterPredMemberName);
+    let assemblyFormat = "`<` custom<StateMembers>($keyMembers) `,` custom<StateMembers>($valueMembers) `,` $compareHashForLookup `,` $filterPredMemberName `>`";
+     let extraClassDeclaration = [{
+        StateMembersAttr getMembers();
+     }];
+}
 
 def SegmentTreeView : SubOperator_Type<"SegmentTreeView", "segment_tree_view", [State,LookupAbleState]> {
     let summary = "segment tree view type";
@@ -742,7 +750,7 @@ def CreateSortedViewOp : SubOperator_Op<"create_sorted_view", [IsolatedFromAbove
 }
 def CreateHashIndexedView : SubOperator_Op<"create_hash_indexed_view", [SubOperator]> {
     let arguments = (ins Buffer:$source,Member: $hash_member, Member: $link_member);
-    let results = (outs HashIndexedView:$result);
+    let results = (outs LookupAbleState:$result);
     let assemblyFormat = [{ $source `:` type($source) `hash` `(` $hash_member `)` `link` `(` $link_member `)` `->` type($result) attr-dict }];
       let extraClassDeclaration = [{
           llvm::SmallVector<Member> getWrittenMembers();
