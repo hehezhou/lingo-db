@@ -155,6 +155,60 @@ def parse_subop_metrics(stdout: str) -> Dict[str, Any]:
     return out
 
 
+def build_subop_result_payload(
+    cmd_result: CmdResult,
+    singles: Dict[int, Dict[str, Any]],
+    single_result_blocks: Dict[int, Optional[str]],
+    q0: int,
+    q1: int,
+) -> Dict[str, Any]:
+    metrics = parse_subop_metrics(cmd_result.stdout)
+    subop_results = parse_subop_result_blocks(cmd_result.stdout)
+
+    payload: Dict[str, Any] = {
+        "returncode": cmd_result.returncode,
+        "wall_ms": cmd_result.wall_ms,
+        **metrics,
+    }
+
+    expected0 = single_result_blocks.get(q0)
+    expected1 = single_result_blocks.get(q1)
+    actual0 = subop_results.get(0)
+    actual1 = subop_results.get(1)
+    result_compare: Dict[str, Any] = {
+        "q0_expected_sha256": singles[q0].get("result_sha256"),
+        "q1_expected_sha256": singles[q1].get("result_sha256"),
+        "q0_actual_sha256": hash_text(actual0),
+        "q1_actual_sha256": hash_text(actual1),
+        "q0_match": None,
+        "q1_match": None,
+        "all_match": None,
+    }
+
+    q0_expected_hash = singles[q0].get("result_sha256")
+    q1_expected_hash = singles[q1].get("result_sha256")
+    q0_actual_hash = result_compare["q0_actual_sha256"]
+    q1_actual_hash = result_compare["q1_actual_sha256"]
+    if q0_expected_hash is not None and q0_actual_hash is not None:
+        result_compare["q0_match"] = q0_expected_hash == q0_actual_hash
+    if q1_expected_hash is not None and q1_actual_hash is not None:
+        result_compare["q1_match"] = q1_expected_hash == q1_actual_hash
+    if result_compare["q0_match"] is not None and result_compare["q1_match"] is not None:
+        result_compare["all_match"] = bool(result_compare["q0_match"] and result_compare["q1_match"])
+    if result_compare["q0_match"] is False:
+        result_compare["q0_expected_preview"] = "\n".join(expected0.splitlines()[:12]) if expected0 else None
+        result_compare["q0_actual_preview"] = "\n".join(actual0.splitlines()[:12]) if actual0 else None
+    if result_compare["q1_match"] is False:
+        result_compare["q1_expected_preview"] = "\n".join(expected1.splitlines()[:12]) if expected1 else None
+        result_compare["q1_actual_preview"] = "\n".join(actual1.splitlines()[:12]) if actual1 else None
+    payload["result_compare"] = result_compare
+
+    if cmd_result.returncode != 0:
+        payload["stderr_tail"] = "\n".join(cmd_result.stderr.splitlines()[-30:])
+
+    return payload
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--build-dir", default="build/lingodb-release", help="e.g. build/lingodb-release")
@@ -217,18 +271,16 @@ def main() -> None:
         sql_b = os.path.join(args.sql_dir, f"{b}.sql")
 
         r = run_cmd([subop, args.db, sql_a, sql_b], env=env, timeout_s=args.timeout_s)
-        metrics = parse_subop_metrics(r.stdout)
-        subop_results = parse_subop_result_blocks(r.stdout)
+        r_no_reuse = run_cmd([subop, "--no-reuse-rewrite", args.db, sql_a, sql_b], env=env, timeout_s=args.timeout_s)
 
         row: Dict[str, Any] = {
             "pair_id": pair_id,
             "q0": a,
             "q1": b,
-            "subop": {
-                "returncode": r.returncode,
-                "wall_ms": r.wall_ms,
-                **metrics,
-            },
+            "subop": build_subop_result_payload(r, singles, single_result_blocks, a, b),
+            "subop_no_reuse_rewrite": build_subop_result_payload(
+                r_no_reuse, singles, single_result_blocks, a, b
+            ),
             "run_sql": {
                 "q0_execution_time_ms": singles[a]["execution_time_ms"],
                 "q1_execution_time_ms": singles[b]["execution_time_ms"],
@@ -239,51 +291,43 @@ def main() -> None:
         if q0 is not None and q1 is not None:
             row["run_sql"]["q0_plus_q1_execution_time_ms"] = q0 + q1
 
-        expected0 = single_result_blocks.get(a)
-        expected1 = single_result_blocks.get(b)
-        actual0 = subop_results.get(0)
-        actual1 = subop_results.get(1)
-        result_compare: Dict[str, Any] = {
-            "q0_expected_sha256": singles[a].get("result_sha256"),
-            "q1_expected_sha256": singles[b].get("result_sha256"),
-            "q0_actual_sha256": hash_text(actual0),
-            "q1_actual_sha256": hash_text(actual1),
-            "q0_match": None,
-            "q1_match": None,
-            "all_match": None,
-        }
-
-        q0_expected_hash = singles[a].get("result_sha256")
-        q1_expected_hash = singles[b].get("result_sha256")
-        q0_actual_hash = result_compare["q0_actual_sha256"]
-        q1_actual_hash = result_compare["q1_actual_sha256"]
-        if q0_expected_hash is not None and q0_actual_hash is not None:
-            result_compare["q0_match"] = q0_expected_hash == q0_actual_hash
-        if q1_expected_hash is not None and q1_actual_hash is not None:
-            result_compare["q1_match"] = q1_expected_hash == q1_actual_hash
-        if result_compare["q0_match"] is not None and result_compare["q1_match"] is not None:
-            result_compare["all_match"] = bool(result_compare["q0_match"] and result_compare["q1_match"])
-        if result_compare["q0_match"] is False:
-            result_compare["q0_expected_preview"] = "\n".join(expected0.splitlines()[:12]) if expected0 else None
-            result_compare["q0_actual_preview"] = "\n".join(actual0.splitlines()[:12]) if actual0 else None
-        if result_compare["q1_match"] is False:
-            result_compare["q1_expected_preview"] = "\n".join(expected1.splitlines()[:12]) if expected1 else None
-            result_compare["q1_actual_preview"] = "\n".join(actual1.splitlines()[:12]) if actual1 else None
-        row["result_compare"] = result_compare
-
         # Ratios (when data is available).
-        if "execution_time_ms_total" in metrics and q0 is not None and q1 is not None:
+        subop_metrics = row["subop"]
+        subop_no_reuse_metrics = row["subop_no_reuse_rewrite"]
+        if "execution_time_ms_total" in subop_metrics and q0 is not None and q1 is not None:
             denom = q0 + q1
             if denom > 0:
                 row["ratios"] = {
-                    "subop_total_over_run_sql_sum": metrics["execution_time_ms_total"] / denom,
+                    "subop_total_over_run_sql_sum": subop_metrics["execution_time_ms_total"] / denom,
                 }
-                if "execution_time_ms_q0_q1" in metrics:
-                    row["ratios"]["subop_q0_q1_over_run_sql_sum"] = metrics["execution_time_ms_q0_q1"] / denom
-
-        # Store a small stderr tail for debugging failures.
-        if r.returncode != 0:
-            row["subop"]["stderr_tail"] = "\n".join(r.stderr.splitlines()[-30:])
+                if "execution_time_ms_q0_q1" in subop_metrics:
+                    row["ratios"]["subop_q0_q1_over_run_sql_sum"] = subop_metrics["execution_time_ms_q0_q1"] / denom
+                if "execution_time_ms_total" in subop_no_reuse_metrics:
+                    row["ratios"]["subop_no_reuse_total_over_run_sql_sum"] = (
+                        subop_no_reuse_metrics["execution_time_ms_total"] / denom
+                    )
+                if "execution_time_ms_q0_q1" in subop_no_reuse_metrics:
+                    row["ratios"]["subop_no_reuse_q0_q1_over_run_sql_sum"] = (
+                        subop_no_reuse_metrics["execution_time_ms_q0_q1"] / denom
+                    )
+        if (
+            "execution_time_ms_total" in subop_metrics
+            and "execution_time_ms_total" in subop_no_reuse_metrics
+            and subop_no_reuse_metrics["execution_time_ms_total"] > 0
+        ):
+            row.setdefault("ratios", {})
+            row["ratios"]["subop_reuse_over_same_path_no_reuse_total"] = (
+                subop_metrics["execution_time_ms_total"] / subop_no_reuse_metrics["execution_time_ms_total"]
+            )
+        if (
+            "execution_time_ms_q0_q1" in subop_metrics
+            and "execution_time_ms_q0_q1" in subop_no_reuse_metrics
+            and subop_no_reuse_metrics["execution_time_ms_q0_q1"] > 0
+        ):
+            row.setdefault("ratios", {})
+            row["ratios"]["subop_reuse_over_same_path_no_reuse_q0_q1"] = (
+                subop_metrics["execution_time_ms_q0_q1"] / subop_no_reuse_metrics["execution_time_ms_q0_q1"]
+            )
 
         results.append(row)
         done += 1

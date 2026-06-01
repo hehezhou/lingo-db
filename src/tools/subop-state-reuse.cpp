@@ -385,11 +385,23 @@ int main(int argc, char** argv) {
       return 0;
    }
 
+   bool skipReuseRewrite = false;
+   llvm::SmallVector<const char*, 8> positionalArgs;
+   positionalArgs.push_back(argv[0]);
+   for (int i = 1; i < argc; i++) {
+      llvm::StringRef arg(argv[i]);
+      if (arg == "--no-reuse-rewrite") {
+         skipReuseRewrite = true;
+         continue;
+      }
+      positionalArgs.push_back(argv[i]);
+   }
+
    // Usage:
    // - subop-state-reuse <db_dir> <sql_or_json>
    // - subop-state-reuse <db_dir> <sql_file_a> <sql_file_b>
-   assert(argc == 3 || argc == 4);
-   std::string dbDir = argv[1];
+   assert(positionalArgs.size() == 3 || positionalArgs.size() == 4);
+   std::string dbDir = positionalArgs[1];
 
    lingodb::compiler::support::eval::init();
    // Execution backends expect a running scheduler (even if queries are forced sequential).
@@ -398,14 +410,14 @@ int main(int argc, char** argv) {
    auto session = lingodb::runtime::Session::createSession(dbDir, /*eagerLoading*/ true);
 
    llvm::SmallVector<std::string, 16> queries;
-   if (argc == 4) {
+   if (positionalArgs.size() == 4) {
       for (int fi = 2; fi <= 3; fi++) {
-         auto fileOrErr = llvm::MemoryBuffer::getFile(argv[fi]);
+         auto fileOrErr = llvm::MemoryBuffer::getFile(positionalArgs[fi]);
          assert(!fileOrErr.getError());
          queries.push_back((*fileOrErr)->getBuffer().str());
       }
    } else {
-      std::string input = argv[2];
+      std::string input = positionalArgs[2];
       auto fileOrErr = llvm::MemoryBuffer::getFileOrSTDIN(input);
       assert(!fileOrErr.getError());
 
@@ -491,7 +503,8 @@ int main(int argc, char** argv) {
    for (size_t i = 0; i < runs.size(); i++) {
       qmods.push_back({static_cast<int>(i), runs[i].module});
    }
-   auto matches = lingodb::compiler::dialect::subop::collectCrossQueryStateMatchPairs(qmods);
+   llvm::SmallVector<lingodb::compiler::dialect::subop::CrossQueryStateMatchPair, 64> matches;
+   if (!skipReuseRewrite) matches = lingodb::compiler::dialect::subop::collectCrossQueryStateMatchPairs(qmods);
    // Print matches on the unmodified modules.
    lingodb::compiler::dialect::subop::printCrossQueryStateMatches(qmods, llvm::outs());
    // Only inject reuse for the first two modules for now.
@@ -521,10 +534,16 @@ int main(int argc, char** argv) {
    }
 
    auto tRewrite = std::chrono::high_resolution_clock::now();
-   auto rewriteRes = lingodb::compiler::dialect::subop::rewritePlansWithSyntheticQuery0(
-      runs[0].module, runs[1].module, firstPair, catalog.get());
-   const double rewriteMs = millisSince(tRewrite);
+   lingodb::compiler::dialect::subop::ReusePlanRewriteResult rewriteRes;
+   if (!skipReuseRewrite) {
+      rewriteRes = lingodb::compiler::dialect::subop::rewritePlansWithSyntheticQuery0(
+         runs[0].module, runs[1].module, firstPair, catalog.get());
+   }
+   const double rewriteMs = skipReuseRewrite ? 0.0 : millisSince(tRewrite);
    optimizationMs += rewriteMs;
+   if (skipReuseRewrite) {
+      llvm::outs() << "\n// reuse_rewrite: skipped (--no-reuse-rewrite)\n";
+   }
    llvm::outs() << "\n// reuse_targets: query[0]=" << rewriteRes.numTargetsQuery0
                   << " query[1]=" << rewriteRes.numTargetsQuery1 << "\n";
    llvm::outs() << "\n// reuse_targets_no_table: query[0]=" << rewriteRes.numTargetsQuery0NoTable
