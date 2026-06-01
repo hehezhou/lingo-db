@@ -198,13 +198,93 @@ static subop::ExecutionStepOp findBufferBuildStepWithTableMaterialize(mlir::Valu
                                                                       const ModuleReuseInfo& reuse);
 static subop::ExecutionStepOp findBufferBuildStepWithTableScan(mlir::ModuleOp module);
 
+static bool stepHasTableScan(subop::ExecutionStepOp step) {
+   bool hasTableScan = false;
+   step.walk([&](subop::ScanRefsOp scan) {
+      if (mlir::isa<subop::TableType>(scan.getState().getType())) hasTableScan = true;
+   });
+   return hasTableScan;
+}
+
+static bool materializeWritesExactState(subop::MaterializeOp mat, mlir::Value targetState) {
+   mlir::Value matState = peelBlockArgsToEnclosingOperands(mat.getState());
+   mlir::Value target = peelBlockArgsToEnclosingOperands(targetState);
+   return canonicalizeStateValueForReuse(matState) == canonicalizeStateValueForReuse(target);
+}
+
+static subop::ExecutionStepOp findExactJoinBuildStepForState(mlir::Value buildState,
+                                                             const ModuleReuseInfo& reuse) {
+   auto tryWriters = [&](mlir::Value key) -> subop::ExecutionStepOp {
+      auto itW = reuse.writerStepsByState.find(key);
+      if (itW == reuse.writerStepsByState.end()) return {};
+      for (subop::ExecutionStepOp step : itW->second) {
+         if (!stepHasTableScan(step)) continue;
+         subop::MaterializeOp matOp;
+         step.walk([&](subop::MaterializeOp mat) {
+            if (matOp) return;
+            if (!materializeWritesExactState(mat, buildState)) return;
+            matOp = mat;
+         });
+         if (matOp) return step;
+      }
+      return {};
+   };
+   if (subop::ExecutionStepOp step = tryWriters(buildState)) return step;
+   mlir::Value canon = canonicalizeStateValueForReuse(buildState);
+   if (canon != buildState) {
+      if (subop::ExecutionStepOp step = tryWriters(canon)) return step;
+   }
+   return {};
+}
+
+static subop::ExecutionStepOp findJoinBufferBuildStepFromWriterChain(mlir::Value mergedBuffer,
+                                                                     const ModuleReuseInfo& reuse) {
+   if (auto it = reuse.mergedFromShadowState.find(canonicalizeStateValueForReuse(mergedBuffer));
+       it != reuse.mergedFromShadowState.end()) {
+      if (subop::ExecutionStepOp step = findExactJoinBuildStepForState(it->second, reuse)) return step;
+   }
+   if (subop::ExecutionStepOp step = findExactJoinBuildStepForState(mergedBuffer, reuse)) return step;
+
+   llvm::SmallVector<mlir::Value, 4> candidates;
+   auto addCandidate = [&](mlir::Value state) {
+      if (!state) return;
+      candidates.push_back(state);
+      mlir::Value canon = canonicalizeStateValueForReuse(state);
+      if (canon != state) candidates.push_back(canon);
+   };
+
+   addCandidate(mergedBuffer);
+   mlir::Value canonMerged = canonicalizeStateValueForReuse(mergedBuffer);
+   if (auto it = reuse.mergedFromShadowState.find(canonMerged); it != reuse.mergedFromShadowState.end())
+      addCandidate(it->second);
+
+   llvm::DenseSet<void*> seenSteps;
+   for (mlir::Value candidate : candidates) {
+      auto tryWriters = [&](mlir::Value key) -> subop::ExecutionStepOp {
+         auto itW = reuse.writerStepsByState.find(key);
+         if (itW == reuse.writerStepsByState.end()) return {};
+         for (subop::ExecutionStepOp step : itW->second) {
+            if (!seenSteps.insert(step.getOperation()).second) continue;
+            if (!stepHasTableScan(step)) continue;
+            subop::MaterializeOp matOp;
+            step.walk([&](subop::MaterializeOp mat) {
+               if (matOp) return;
+               if (!materializeTargetsJoinBuffer(mat, mergedBuffer, reuse)) return;
+               matOp = mat;
+            });
+            if (matOp) return step;
+         }
+         return {};
+      };
+      if (subop::ExecutionStepOp step = tryWriters(candidate)) return step;
+   }
+   return {};
+}
+
 static subop::ExecutionStepOp findJoinBufferBuildStepForHiv(mlir::ModuleOp module, mlir::Value hiv,
                                                             const ModuleReuseInfo& reuse) {
-   mlir::Value canon = resolveCacheTargetStateForReuse(hiv, reuse);
-   mlir::Value buf = canon;
-   if (auto it = reuse.mergedFromShadowState.find(canon); it != reuse.mergedFromShadowState.end()) {
-      buf = it->second;
-   }
+   mlir::Value buf = resolveJoinMergedBuffer(hiv, module, reuse);
+   if (subop::ExecutionStepOp step = findJoinBufferBuildStepFromWriterChain(buf, reuse)) return step;
    if (subop::ExecutionStepOp step = findBufferBuildStepWithTableMaterialize(buf, reuse)) return step;
    return findBufferBuildStepWithTableScan(module);
 }
@@ -213,11 +293,8 @@ static subop::ExecutionStepOp findBufferBuildStepWithTableMaterialize(mlir::Valu
                                                                         const ModuleReuseInfo& reuse) {
    for (const ModuleReuseInfo::StepRW& rw : reuse.steps) {
       subop::ExecutionStepOp step = rw.step;
-      bool hasTableScan = false;
+      bool hasTableScan = stepHasTableScan(step);
       bool hasJoinMat = false;
-      step->walk([&](subop::ScanRefsOp scan) {
-         if (mlir::isa<subop::TableType>(scan.getState().getType())) hasTableScan = true;
-      });
       step->walk([&](subop::MaterializeOp mat) {
          if (materializeTargetsJoinBuffer(mat, mergedBuffer, reuse)) hasJoinMat = true;
       });
@@ -531,13 +608,7 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
    plan.linkMember = chiv.getLinkMember().getMember();
    plan.hashMember = chiv.getHashMember().getMember();
    llvm::StringRef joinKeyMemberName;
-   mlir::Value canonBuf = hiv;
-   if (auto it = reuseA.mergedFromShadowState.find(hiv);
-       it != reuseA.mergedFromShadowState.end()) {
-      canonBuf = it->second;
-   }
-   subop::ExecutionStepOp buildStep = findBufferBuildStepWithTableMaterialize(canonBuf, reuseA);
-   if (!buildStep) buildStep = findBufferBuildStepWithTableScan(modA);
+   subop::ExecutionStepOp buildStep = findJoinBufferBuildStepForHiv(modA, hivA, reuseA);
    assert(buildStep && "join superset: HIV build step required for union plan");
    joinKeyMemberName = joinKeyMemberNameFromBuildStep(buildStep, plan.linkMember, plan.hashMember, mm, cm);
    llvm::StringRef linkMemberName = mm.getName(plan.linkMember);
@@ -546,17 +617,12 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
    llvm::StringMap<PayloadColumnSpec> unionCols;
    auto ingestHiv = [&](mlir::Value h, const ModuleReuseInfo& reuse, unsigned reuseQueryIndex) {
       auto& cm = h.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
-      mlir::Value canon = resolveCacheTargetStateForReuse(h, reuse);
-      mlir::Value buf = canon;
-      if (auto it = reuse.mergedFromShadowState.find(canon);
-          it != reuse.mergedFromShadowState.end()) {
-         buf = it->second;
-      }
-      subop::ExecutionStepOp buildStep = findBufferBuildStepWithTableMaterialize(buf, reuse);
+      mlir::Value mergedBuf = resolveJoinMergedBuffer(h, reuseQueryIndex == 0 ? modA : modB, reuse);
+      subop::ExecutionStepOp buildStep = findJoinBufferBuildStepForHiv(reuseQueryIndex == 0 ? modA : modB, h, reuse);
       assert(buildStep && "join superset: build step required for ingestHiv");
       buildStep.walk([&](subop::MaterializeOp mat) {
          if (!getInnerBufferTypeForMaterializeState(mat.getState().getType()) &&
-             !materializeTargetsJoinBuffer(mat, buf, reuse)) {
+             !materializeTargetsJoinBuffer(mat, mergedBuf, reuse)) {
             return;
          }
          collectPayloadFromMaterialize(mat, linkMemberName, hashMemberName, mm, cm, joinKeyMemberName, unionCols,
@@ -1068,6 +1134,37 @@ buildFilterLiteral(const std::variant<std::string, int64_t, double>& value,
    return lingodb::compiler::support::eval::createLiteral(std::get<int64_t>(value), type);
 }
 
+static bool filterLiteralSupportedForSampleEval(const std::variant<std::string, int64_t, double>& value,
+                                                const std::tuple<::arrow::Type::type, uint32_t, uint32_t>& type) {
+   auto [id, unused1, unused2] = type;
+   (void)unused1;
+   (void)unused2;
+   switch (id) {
+      case ::arrow::Type::STRING:
+      case ::arrow::Type::DECIMAL128:
+         return std::holds_alternative<std::string>(value);
+      case ::arrow::Type::FLOAT:
+      case ::arrow::Type::DOUBLE:
+      case ::arrow::Type::HALF_FLOAT:
+         return std::holds_alternative<double>(value) || std::holds_alternative<int64_t>(value);
+      case ::arrow::Type::BOOL:
+      case ::arrow::Type::INT8:
+      case ::arrow::Type::INT16:
+      case ::arrow::Type::INT32:
+      case ::arrow::Type::INT64:
+      case ::arrow::Type::UINT8:
+      case ::arrow::Type::UINT16:
+      case ::arrow::Type::UINT32:
+      case ::arrow::Type::UINT64:
+      case ::arrow::Type::DATE32:
+      case ::arrow::Type::DATE64:
+      case ::arrow::Type::TIMESTAMP:
+         return std::holds_alternative<int64_t>(value);
+      default:
+         return false;
+   }
+}
+
 static std::unique_ptr<lingodb::compiler::support::eval::expr>
 buildFilterPredicate(const lingodb::runtime::FilterDescription& f,
                      const std::shared_ptr<::arrow::Schema>& schema) {
@@ -1107,6 +1204,30 @@ buildFilterPredicate(const lingodb::runtime::FilterDescription& f,
    }
 }
 
+static bool filterPredicateSupportedForSampleEval(const lingodb::runtime::FilterDescription& f,
+                                                  const std::shared_ptr<::arrow::Schema>& schema) {
+   using lingodb::runtime::FilterOp;
+   auto field = schema->GetFieldByName(filterColumnName(f, schema));
+   if (!field) return false;
+   auto type = sampleEvalTypeForField(field->type());
+   if (f.op == FilterOp::NOTNULL) return true;
+   if (f.op == FilterOp::IN) {
+      bool supported = true;
+      std::visit([&](const auto& vals) {
+         for (const auto& v : vals) {
+            std::variant<std::string, int64_t, double> literalValue = v;
+            if (!filterLiteralSupportedForSampleEval(literalValue, type)) {
+               supported = false;
+               break;
+            }
+         }
+      },
+                 f.values);
+      return supported;
+   }
+   return filterLiteralSupportedForSampleEval(f.value, type);
+}
+
 static std::optional<std::unique_ptr<lingodb::compiler::support::eval::expr>>
 buildFilterClausePredicate(llvm::ArrayRef<lingodb::runtime::FilterDescription> clause,
                            const std::shared_ptr<::arrow::Schema>& schema) {
@@ -1134,6 +1255,18 @@ static double estimateExternalDatasourceOrRowsFromSample(
    for (const ExternalDatasourceProperty& src : filterSources) {
       if (src.filterDescriptions.empty() && src.orFilterClauses.empty()) {
          return static_cast<double>(tableEntry.value()->getNumRows());
+      }
+   }
+   for (const ExternalDatasourceProperty& src : filterSources) {
+      for (const auto& f : src.filterDescriptions) {
+         if (!filterPredicateSupportedForSampleEval(f, batch->schema()))
+            return static_cast<double>(tableEntry.value()->getNumRows());
+      }
+      for (const auto& clause : src.orFilterClauses) {
+         for (const auto& f : clause) {
+            if (!filterPredicateSupportedForSampleEval(f, batch->schema()))
+               return static_cast<double>(tableEntry.value()->getNumRows());
+         }
       }
    }
 

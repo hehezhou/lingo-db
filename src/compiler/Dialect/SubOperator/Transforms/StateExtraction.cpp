@@ -1208,9 +1208,11 @@ struct StepDagHasher {
    bool relaxJoinPayloadColumns = false;
    const llvm::SmallSet<std::string, 8>* joinIndexMemberNamesSanitized = nullptr;
    const llvm::SmallSet<uint64_t, 8>* joinKeyColumnAttrHashes = nullptr;
+   const llvm::SmallSet<std::string, 8>* joinKeyColumnIdentifiersSanitized = nullptr;
    const llvm::DenseMap<mlir::Value, lingodb::runtime::ExternalDatasourceProperty>* externalDatasourceByTableState =
       nullptr;
    llvm::DenseMap<mlir::Value, uint64_t> memo;
+   using SelectedColumnSet = llvm::SmallSet<uint64_t, 8>;
 
    bool isWithinStep(mlir::Operation* op) {
       for (auto* p = op; p; p = p->getParentOp()) {
@@ -1254,12 +1256,29 @@ struct StepDagHasher {
 
    uint64_t hashExternalLeaf(mlir::Value v) {
       assert(tableDescrByTableState);
-      if (relaxJoinPayloadColumns && externalDatasourceByTableState) {
+      if (relaxJoinPayloadColumns && externalDatasourceByTableState && joinKeyColumnIdentifiersSanitized) {
          if (auto itDs = externalDatasourceByTableState->find(v); itDs != externalDatasourceByTableState->end()) {
-            std::string descr =
-               renderExternalDataSourceDescrMatchString(itDs->second, itDs->second.mapping, /*includeFilters=*/false);
+            auto kept =
+               filterExternalDatasourceMappingForJoinMatch(itDs->second.mapping, *joinKeyColumnIdentifiersSanitized);
+            std::string descr = renderExternalDataSourceDescrMatchString(
+               itDs->second, kept, /*includeFilters=*/false);
             uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(descr)));
-            h = hashCombineU64(h, hashMlirType(v.getType()));
+            if (auto tableTy = mlir::dyn_cast<subop::TableType>(v.getType())) {
+               llvm::SmallVector<subop::Member, 8> keptMembers;
+               for (subop::Member m : tableTy.getMembers().getMembers()) {
+                  llvm::StringRef memberName = memberManager->getName(m);
+                  if (joinKeyColumnIdentifiersSanitized->contains(sanitizeBaseName(memberName)) ||
+                      joinKeyColumnIdentifiersSanitized->contains(sanitizeMemberSlotName(memberName))) {
+                     keptMembers.push_back(m);
+                  }
+               }
+               std::string fp = std::string("table{members=") +
+                                fingerprintSortedMemberPairs(*memberManager, keptMembers) + ",filtered=" +
+                                (tableTy.getFiltered() ? "1" : "0") + "}";
+               h = hashCombineU64(h, static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(fp))));
+            } else {
+               h = hashCombineU64(h, hashMlirType(v.getType()));
+            }
             return h;
          }
       }
@@ -1349,7 +1368,11 @@ struct StepDagHasher {
          }
          return h;
       }
-      assert(0);
+      std::string s;
+      llvm::raw_string_ostream ss(s);
+      a.print(ss);
+      ss.flush();
+      return static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(s)));
    }
 
    bool includeMemberForJoinIndexHash(llvm::StringRef memberNameSanitized) const {
@@ -1370,8 +1393,7 @@ struct StepDagHasher {
 
    uint64_t hashGatherOpRelaxed(subop::GatherOp gather) {
       uint64_t h = hashOpName(*gather.getOperation());
-      for (auto t : gather->getResultTypes()) h = hashCombineU64(h, hashMlirType(t));
-      for (auto v : gather->getOperands()) h = hashCombineU64(h, hashValue(v));
+      if (gather->getNumOperands() > 0) h = hashCombineU64(h, hashValue(gather->getOperand(0)));
       if (joinKeyColumnAttrHashes) {
          for (auto& [member, colDef] : gather.getMapping().getMapping()) {
             uint64_t colH = hashAttrNormalized(colDef);
@@ -1383,15 +1405,93 @@ struct StepDagHasher {
       return h;
    }
 
+   uint64_t hashSelectedStreamProducer(mlir::Value stream, const SelectedColumnSet& selected) {
+      auto* def = stream.getDefiningOp();
+      assert(def && "relaxed join hash expects tuple stream producer op");
+      assert(isWithinStep(def) && "relaxed join hash only traces producers within one execution_step");
+
+      if (auto gather = mlir::dyn_cast<subop::GatherOp>(def)) {
+         uint64_t h = 0;
+         bool matched = false;
+         for (auto& [member, colDef] : gather.getMapping().getMapping()) {
+            (void)member;
+            uint64_t outH = hashAttrNormalized(colDef);
+            if (!selected.contains(outH)) continue;
+            matched = true;
+            h = hashCombineU64(h, outH);
+         }
+         if (matched) h = hashCombineU64(hashOpName(*def), h);
+         return hashCombineU64(h, hashSelectedStreamProducer(gather.getStream(), selected));
+      }
+
+      if (auto map = mlir::dyn_cast<subop::MapOp>(def)) {
+         SelectedColumnSet nextSelected(selected.begin(), selected.end());
+         bool matched = false;
+         for (auto attr : map.getComputedCols()) {
+            auto colDef = mlir::cast<lingodb::compiler::dialect::tuples::ColumnDefAttr>(attr);
+            uint64_t outH = hashAttrNormalized(colDef);
+            if (!selected.contains(outH)) continue;
+            matched = true;
+            nextSelected.erase(outH);
+            for (auto inAttr : map.getInputCols()) {
+               nextSelected.insert(hashAttrNormalized(inAttr));
+            }
+         }
+         uint64_t h = hashSelectedStreamProducer(map.getStream(), nextSelected);
+         if (!matched) return h;
+
+         uint64_t local = hashOpName(*def);
+         for (auto attr : map.getComputedCols()) local = hashCombineU64(local, hashAttrNormalized(attr));
+         local = hashCombineU64(local, hashRegion(map.getFn()));
+         for (auto inAttr : map.getInputCols()) local = hashCombineU64(local, hashAttrNormalized(inAttr));
+         return hashCombineU64(local, h);
+      }
+
+      if (auto filter = mlir::dyn_cast<subop::FilterOp>(def)) {
+         SelectedColumnSet nextSelected(selected.begin(), selected.end());
+         uint64_t local = hashOpName(*def);
+         local = hashCombineU64(local, hashAttrNormalized(filter.getFilterSemanticAttr()));
+         for (auto condAttr : filter.getConditions()) {
+            local = hashCombineU64(local, hashAttrNormalized(condAttr));
+            nextSelected.insert(hashAttrNormalized(condAttr));
+         }
+         return hashCombineU64(local, hashSelectedStreamProducer(filter.getStream(), nextSelected));
+      }
+
+      if (auto rename = mlir::dyn_cast<subop::RenamingOp>(def)) {
+         SelectedColumnSet nextSelected;
+         for (uint64_t key : selected) nextSelected.insert(key);
+         for (auto attr : rename.getColumns()) {
+            auto colDef = mlir::cast<lingodb::compiler::dialect::tuples::ColumnDefAttr>(attr);
+            uint64_t outH = hashAttrNormalized(colDef);
+            if (!selected.contains(outH) || !colDef.getFromExisting()) continue;
+            nextSelected.erase(outH);
+            nextSelected.insert(hashAttrNormalized(colDef.getFromExisting()));
+         }
+         return hashSelectedStreamProducer(rename.getStream(), nextSelected);
+      }
+
+      if (auto scan = mlir::dyn_cast<subop::ScanRefsOp>(def)) {
+         uint64_t h = hashOpName(*def);
+         h = hashCombineU64(h, hashValue(scan.getState()));
+         return h;
+      }
+
+      assert(false && "unsupported tuple-stream producer in relaxed join construction hash");
+      return 0;
+   }
+
    uint64_t hashMaterializeOpRelaxed(subop::MaterializeOp mat) {
       uint64_t h = hashOpName(*mat.getOperation());
       for (auto t : mat->getResultTypes()) h = hashCombineU64(h, hashMlirType(t));
-      for (auto v : mat->getOperands()) h = hashCombineU64(h, hashValue(v));
+      SelectedColumnSet selected;
       for (auto& [member, colRef] : mat.getMapping().getMapping()) {
          if (!includeMemberForJoinIndexHash(sanitizeMemberSlotName(memberManager->getName(member)))) continue;
+         selected.insert(hashAttrNormalized(colRef));
          h = hashCombineU64(h, hashAttrNormalized(colRef));
          h = hashCombineU64(h, hashAttrNormalized(subop::MemberAttr::get(mat->getContext(), member)));
       }
+      h = hashCombineU64(h, hashSelectedStreamProducer(mat.getStream(), selected));
       return h;
    }
 
@@ -1399,10 +1499,17 @@ struct StepDagHasher {
       if (relaxJoinPayloadColumns) {
          if (auto gather = mlir::dyn_cast<subop::GatherOp>(&op)) return hashGatherOpRelaxed(gather);
          if (auto mat = mlir::dyn_cast<subop::MaterializeOp>(&op)) return hashMaterializeOpRelaxed(mat);
+         if (isCreateLike(op)) {
+            uint64_t h = hashOpName(op);
+            for (auto t : op.getResultTypes()) h = hashCombineU64(h, hashMlirType(t));
+            for (auto v : op.getOperands()) h = hashCombineU64(h, hashValue(v));
+            return h;
+         }
       }
       uint64_t h = 0;
       h = hashCombineU64(h, hashOpName(op));
       h = hashCombineU64(h, hashAttrDictSorted(op));
+      h = hashCombineU64(h, hashAttrNormalized(op.getPropertiesAsAttribute()));
       for (auto t : op.getResultTypes()) h = hashCombineU64(h, hashMlirType(t));
       // Operand order is semantic.
       for (auto v : op.getOperands()) h = hashCombineU64(h, hashValue(v));
@@ -1436,12 +1543,69 @@ struct StepDagHasher {
       return h;
    }
 
+   bool operationWritesTargetState(mlir::Operation& op, mlir::Value targetState) {
+      mlir::Value targetCanon = canonicalizeStateValueDeep(targetState);
+      auto matchesState = [&](mlir::Value state) {
+         return state && canonicalizeStateValueDeep(state) == targetCanon;
+      };
+
+      if (auto mat = mlir::dyn_cast<subop::MaterializeOp>(&op)) return matchesState(mat.getState());
+      if (auto hiv = mlir::dyn_cast<subop::CreateHashIndexedView>(&op)) return matchesState(hiv.getResult());
+      if (auto lock = mlir::dyn_cast<subop::LockOp>(&op)) {
+         return matchesState(findUpstreamLookupHashIndexedView(lock.getStream()));
+      }
+      if (auto scatter = mlir::dyn_cast<subop::ScatterOp>(&op)) {
+         return matchesState(findUpstreamLookupHashIndexedView(scatter.getStream()));
+      }
+      if (auto reduce = mlir::dyn_cast<subop::ReduceOp>(&op)) {
+         return matchesState(findUpstreamLookupHashIndexedView(reduce.getStream()));
+      }
+      if (auto from = mlir::dyn_cast<subop::CreateFrom>(&op)) return matchesState(from.getResult());
+      if (auto merge = mlir::dyn_cast<subop::MergeOp>(&op)) return matchesState(merge.getResult());
+
+      auto sub = mlir::dyn_cast<subop::SubOperator>(&op);
+      if (!sub) return false;
+      auto writtenMembers = sub.getWrittenMembers();
+      if (writtenMembers.empty()) return false;
+      for (mlir::Value operand : op.getOperands()) {
+         if (!isStateType(operand.getType()) && !isThreadLocalOfStateType(operand.getType())) continue;
+         mlir::Value operandCanon = canonicalizeStateValueDeep(operand);
+         if (operandCanon != targetCanon) continue;
+         if (intersectsMembers(writtenMembers, getMembersForStateValue(operandCanon))) return true;
+      }
+      return false;
+   }
+
+   uint64_t hashStepWriterRoots() {
+      llvm::DenseMap<mlir::Value, RWFlags> rw = analyzeStepStateRWWithNested(step);
+      mlir::Value writtenState;
+      for (auto& kv : rw) {
+         if (!kv.second.write) continue;
+         assert(!writtenState && "construction step hash expects at most one written state");
+         writtenState = kv.first;
+      }
+      if (!writtenState) return 0;
+
+      uint64_t h = 0;
+      step.walk([&](mlir::Operation* op) {
+         if (mlir::isa<subop::ExecutionStepOp>(op)) return;
+         if (!operationWritesTargetState(*op, writtenState)) return;
+         h = hashCombineU64(h, hashOp(*op));
+      });
+      return h;
+   }
+
    uint64_t hashStepReturnGraph() {
       auto& block = step.getSubOps().front();
       auto ret = mlir::cast<subop::ExecutionStepReturnOp>(block.getTerminator());
       uint64_t h = 0;
       for (auto v : ret.getInputs()) h = hashCombineU64(h, hashValue(v));
-      return h;
+      if (h != 0) return h;
+
+      // Build steps like table scan -> filter/map -> materialize often return no SSA state value;
+      // hash only the single-write chain root so upstream filter/map semantics contribute without
+      // pulling unrelated step-local ops into construction matching.
+      return hashStepWriterRoots();
    }
 };
 
@@ -1892,6 +2056,7 @@ static StateConstructionMatchHashes computeEligibleStateMatchHashes(
          hasher.relaxJoinPayloadColumns = true;
          hasher.joinIndexMemberNamesSanitized = &joinHivDetails->indexMemberNamesSanitized;
          hasher.joinKeyColumnAttrHashes = &joinHivDetails->joinKeyColumnAttrHashes;
+         hasher.joinKeyColumnIdentifiersSanitized = &joinHivDetails->joinKeyColumnIdentifiersSanitized;
          hasher.externalDatasourceByTableState = &module.reuse.externalDatasourceByTableState;
       }
       stepHashes.push_back(hasher.hashStepReturnGraph());
@@ -2566,6 +2731,12 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
             p.value.printAsOperand(os, dbgFlags);
             os << " eligible=" << (p.eligible ? "true" : "false");
             os << " h=" << p.constructionHash;
+            os << " step_hashes=[";
+            for (size_t i = 0; i < p.constructionStepHashes.size(); i++) {
+               if (i) os << ",";
+               os << p.constructionStepHashes[i];
+            }
+            os << "]";
             os << " type_fp=" << p.typeFingerprintStr;
             if (!p.storedValueMembersFingerprint.empty()) {
                os << " stored_cols=" << p.storedValueMembersFingerprint;
