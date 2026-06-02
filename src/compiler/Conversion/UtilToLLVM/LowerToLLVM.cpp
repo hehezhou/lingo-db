@@ -639,6 +639,49 @@ class PtrHashTagMatchesLowering : public OpConversionPattern<util::PtrHashTagMat
       return success();
    }
 };
+class PtrHashTagMatchesMaskedLowering : public OpConversionPattern<util::PtrHashTagMatchesMasked> {
+   public:
+   using OpConversionPattern<util::PtrHashTagMatchesMasked>::OpConversionPattern;
+   LogicalResult matchAndRewrite(util::PtrHashTagMatchesMasked op, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
+      auto loc = op->getLoc();
+      auto moduleOp = op->getParentOfType<ModuleOp>();
+      auto globalOp = moduleOp.lookupSymbol<mlir::LLVM::GlobalOp>("bloomMasks");
+      if (!globalOp) {
+         OpBuilder::InsertionGuard guard(rewriter);
+         rewriter.setInsertionPointToStart(moduleOp.getBody());
+         globalOp = rewriter.create<mlir::LLVM::GlobalOp>(loc, mlir::LLVM::LLVMArrayType::get(rewriter.getI16Type(), 2048), true, mlir::LLVM::Linkage::External, "bloomMasks", mlir::Attribute());
+      }
+      mlir::Value bloomMaskPtr = rewriter.create<mlir::LLVM::AddressOfOp>(loc, globalOp);
+      Value shiftAmount = rewriter.create<mlir::LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(54));
+      Value slot = rewriter.create<LLVM::LShrOp>(loc, adaptor.getHash(), shiftAmount);
+      slot = rewriter.create<LLVM::ShlOp>(loc, slot, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(1)));
+      if (op.getMask() == 1) {
+         slot = rewriter.create<LLVM::OrOp>(loc, slot, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(1)));
+      }
+      Value tagPtr = rewriter.create<LLVM::GEPOp>(loc, bloomMaskPtr.getType(), rewriter.getI16Type(), bloomMaskPtr, ValueRange{slot});
+      Value adaptedTag = rewriter.create<LLVM::LoadOp>(loc, rewriter.getI16Type(), tagPtr);
+      Value regularShiftAmount = rewriter.create<mlir::LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(53));
+      Value regularSlot = rewriter.create<LLVM::LShrOp>(loc, adaptor.getHash(), regularShiftAmount);
+      Value regularTagPtr = rewriter.create<LLVM::GEPOp>(loc, bloomMaskPtr.getType(), rewriter.getI16Type(), bloomMaskPtr, ValueRange{regularSlot});
+      Value regularTag = rewriter.create<LLVM::LoadOp>(loc, rewriter.getI16Type(), regularTagPtr);
+      auto adaptationGlobal = moduleOp.lookupSymbol<mlir::LLVM::GlobalOp>("useFilterPredBloomAdaptation");
+      if (!adaptationGlobal) {
+         OpBuilder::InsertionGuard guard(rewriter);
+         rewriter.setInsertionPointToStart(moduleOp.getBody());
+         adaptationGlobal = rewriter.create<mlir::LLVM::GlobalOp>(loc, rewriter.getI8Type(), false, mlir::LLVM::Linkage::External, "useFilterPredBloomAdaptation", mlir::Attribute());
+      }
+      Value adaptationPtr = rewriter.create<mlir::LLVM::AddressOfOp>(loc, adaptationGlobal);
+      Value adaptationByte = rewriter.create<LLVM::LoadOp>(loc, rewriter.getI8Type(), adaptationPtr);
+      Value useAdaptation = rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::ne, adaptationByte, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI8Type(), rewriter.getI8IntegerAttr(0)));
+      Value tag = rewriter.create<LLVM::SelectOp>(loc, rewriter.getI16Type(), useAdaptation, adaptedTag, regularTag);
+      Value entry = rewriter.create<LLVM::PtrToIntOp>(loc, rewriter.getI16Type(), adaptor.getRef());
+      Value negatedEntry = rewriter.create<LLVM::XOrOp>(loc, entry, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI16Type(), rewriter.getI16IntegerAttr(0xffff)));
+      Value anded = rewriter.create<LLVM::AndOp>(loc, tag, negatedEntry);
+      Value isMatch = rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::eq, anded, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI16Type(), rewriter.getI16IntegerAttr(0)));
+      rewriter.replaceOp(op, isMatch);
+      return success();
+   }
+};
 class PtrTagHasBitsLowering : public OpConversionPattern<util::PtrTagHasBits> {
    public:
    using OpConversionPattern<util::PtrTagHasBits>::OpConversionPattern;
@@ -749,6 +792,7 @@ void util::populateUtilToLLVMConversionPatterns(LLVMTypeConverter& typeConverter
    patterns.add<HashVarLenLowering>(typeConverter, patterns.getContext());
    patterns.add<PtrTagMatchesLowering>(typeConverter, patterns.getContext());
    patterns.add<PtrHashTagMatchesLowering>(typeConverter, patterns.getContext());
+   patterns.add<PtrHashTagMatchesMaskedLowering>(typeConverter, patterns.getContext());
    patterns.add<PtrTagHasBitsLowering>(typeConverter, patterns.getContext());
    patterns.add<UnTagPtrLowering>(typeConverter, patterns.getContext());
    patterns.add<BufferCreateOpLowering>(typeConverter, patterns.getContext());

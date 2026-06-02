@@ -104,6 +104,11 @@ def PtrHashTagMatches : Util_Op<"ptr_hash_tag_matches",[Pure]> {
     let results = (outs I1:$matches);
     let assemblyFormat = "$hash `,` $ref `:` type($ref) attr-dict";
 }
+def PtrHashTagMatchesMasked : Util_Op<"ptr_hash_tag_matches_masked",[Pure]> {
+    let arguments = (ins RefType:$ref, Index:$hash, I32Attr:$mask);
+    let results = (outs I1:$matches);
+    let assemblyFormat = "$hash `,` $ref `mask` $mask `:` type($ref) attr-dict";
+}
 def PtrTagHasBits : Util_Op<"ptr_tag_has_bits",[Pure]> {
     let arguments = (ins RefType:$ref, I32Attr:$bits);
     let results = (outs I1:$matches);

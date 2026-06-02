@@ -2332,11 +2332,11 @@ static std::optional<size_t> getMixedHashIndexedViewFilterPredIndex(mlir::Type t
    return std::nullopt;
 }
 
-static unsigned getMixedHashIndexedViewFilterPredTagBit(subop::MixedHashIndexedViewType mixed) {
+static unsigned getMixedHashIndexedViewFilterPredIndex(subop::MixedHashIndexedViewType mixed) {
    llvm::StringRef predMemberName = mixed.getFilterPredMemberName().getValue();
-   if (predMemberName == "filter_pred$0") return 0x8000;
-   if (predMemberName == "filter_pred$1") return 0x4000;
-   assert(false && "mixed HIV predicate tag is only reserved for filter_pred$0/$1");
+   if (predMemberName == "filter_pred$0") return 0;
+   if (predMemberName == "filter_pred$1") return 1;
+   assert(false && "mixed HIV predicate bloom index is only reserved for filter_pred$0/$1");
    return 0;
 }
 
@@ -2735,15 +2735,13 @@ class LookupHashIndexedViewLowering : public SubOpTupleStreamConsumerConversionP
       Value ptr = rewriter.create<util::LoadOp>(loc, rewriter.getPtrType(), ht, buckedPos);
       //optimization
       auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(lookupOp.getState().getType());
-      Value refValid = mixed ? rewriter.create<util::PtrHashTagMatches>(loc, rewriter.getI1Type(), ptr, hash).getResult()
+      Value refValid = mixed ? rewriter.create<util::PtrHashTagMatchesMasked>(loc, rewriter.getI1Type(), ptr, hash, getMixedHashIndexedViewFilterPredIndex(mixed)).getResult()
                              : rewriter.create<util::PtrTagMatches>(loc, rewriter.getI1Type(), ptr, hash).getResult();
       mlir::Value lookupPred = rewriter.create<arith::ConstantIntOp>(loc, 1, 1);
       if (mlir::isa<subop::MixedHashIndexedViewType>(lookupOp.getState().getType()) && lookupArgs.size() > 1) {
          lookupPred = lookupArgs[1];
       }
       if (mixed) {
-         auto predTagMatches = rewriter.create<util::PtrTagHasBits>(loc, rewriter.getI1Type(), ptr, getMixedHashIndexedViewFilterPredTagBit(mixed));
-         refValid = rewriter.create<arith::AndIOp>(loc, refValid, predTagMatches);
          refValid = rewriter.create<arith::AndIOp>(loc, refValid, lookupPred);
       }
       ptr = rewriter.create<util::UnTagPtr>(loc, ptr.getType(), ptr);

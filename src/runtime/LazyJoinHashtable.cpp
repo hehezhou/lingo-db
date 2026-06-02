@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <iostream>
 
 namespace {
 static lingodb::utility::Tracer::Event buildEvent("HashIndexedView", "build");
@@ -24,14 +23,14 @@ lingodb::runtime::HashIndexedView* lingodb::runtime::HashIndexedView::buildInter
       std::atomic_ref<Entry*> slot(htView->ht[pos]);
       Entry* current = slot.load();
       Entry* newEntry;
-      uint16_t predTag = 0;
+      uint8_t predSelectors = 0;
       if (withPredFlags) {
-         if (*(ptr + filterPred0Offset)) predTag |= lingodb::runtime::filterPred0TagBit;
-         if (*(ptr + filterPred1Offset)) predTag |= lingodb::runtime::filterPred1TagBit;
+         if (*(ptr + filterPred0Offset)) predSelectors |= lingodb::runtime::filterPred0Selector;
+         if (*(ptr + filterPred1Offset)) predSelectors |= lingodb::runtime::filterPred1Selector;
       }
       do {
          entry->next = lingodb::runtime::untag(current);
-         newEntry = withPredFlags ? lingodb::runtime::tagWithFilterPreds(entry, current, hash, predTag) : lingodb::runtime::tag(entry, current, hash);
+         newEntry = withPredFlags ? lingodb::runtime::tagWithFilterPreds(entry, current, hash, predSelectors) : lingodb::runtime::tag(entry, current, hash);
       } while (!slot.compare_exchange_weak(current, newEntry));
    });
    trace.stop();

@@ -15,9 +15,14 @@
 #define INLINE __attribute__((always_inline))
 namespace lingodb::runtime {
 alignas(4096) extern uint16_t bloomMasks[2048];
+extern bool useFilterPredBloomAdaptation;
 static constexpr uint16_t hashTagMask = 0x3fff;
-static constexpr uint16_t filterPred0TagBit = 0x8000;
-static constexpr uint16_t filterPred1TagBit = 0x4000;
+static constexpr uint8_t filterPred0Selector = 1;
+static constexpr uint8_t filterPred1Selector = 2;
+
+static inline uint16_t predBloomTag(size_t hash, uint8_t predIndex) {
+   return bloomMasks[((hash >> (64 - 10)) << 1) | predIndex];
+}
 
 struct MemoryHelper {
    static uint8_t* resize(uint8_t* old, size_t oldNumBytes, size_t newNumBytes) {
@@ -205,10 +210,15 @@ T* tag(T* ptr, T* previousPtr, size_t hash) {
    return res;
 }
 template <typename T>
-T* tagWithFilterPreds(T* ptr, T* previousPtr, size_t hash, uint16_t predTag) {
+T* tagWithFilterPreds(T* ptr, T* previousPtr, size_t hash, uint8_t predSelectors) {
    auto asInt = reinterpret_cast<uintptr_t>(ptr);
    uint16_t previousTag = reinterpret_cast<uintptr_t>(previousPtr);
-   uint16_t currentTag = (bloomMasks[hash >> (64 - 11)] & hashTagMask) | predTag;
+   uint16_t currentTag = bloomMasks[hash >> (64 - 11)];
+   if (useFilterPredBloomAdaptation) {
+      currentTag = 0;
+      if (predSelectors & filterPred0Selector) currentTag |= predBloomTag(hash, 0);
+      if (predSelectors & filterPred1Selector) currentTag |= predBloomTag(hash, 1);
+   }
    return reinterpret_cast<T*>(asInt << 16 | (currentTag | previousTag));
 }
 template <typename T>
@@ -221,6 +231,12 @@ template <typename T>
 bool matchesHashTag(T* ptr, size_t hash) {
    uint16_t entry = reinterpret_cast<uintptr_t>(ptr);
    uint16_t tag = bloomMasks[hash >> (64 - 11)] & hashTagMask;
+   return !(tag & ~entry);
+}
+template <typename T>
+bool matchesHashTagMasked(T* ptr, size_t hash, uint8_t predIndex) {
+   uint16_t entry = reinterpret_cast<uintptr_t>(ptr);
+   uint16_t tag = useFilterPredBloomAdaptation ? predBloomTag(hash, predIndex) : bloomMasks[hash >> (64 - 11)];
    return !(tag & ~entry);
 }
 template <typename T>
