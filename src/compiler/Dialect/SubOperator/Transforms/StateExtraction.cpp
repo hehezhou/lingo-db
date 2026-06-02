@@ -1940,7 +1940,7 @@ static void finalizeModuleMatchAnalysis(mlir::ModuleOp moduleOp, ModuleMatchAndR
       mlir::Value globalBuf = canonicalizeStateValueDeep(chiv.getSource());
       mlir::Value hiv = canonicalizeStateValueDeep(chiv.getResult());
       assert(mlir::isa<subop::BufferType>(globalBuf.getType()));
-      assert(mlir::isa<subop::HashIndexedViewType>(hiv.getType()));
+      assert((mlir::isa<subop::HashIndexedViewType, subop::MixedHashIndexedViewType>(hiv.getType())));
       if (mlir::Value existing = hashIndexedViewShadowingBuffer(globalBuf, a.reuse)) {
          assert(existing == hiv && "each join buffer must feed at most one hash_indexed_view in a serial chain");
       }

@@ -13,6 +13,7 @@ class HashIndexedView {
    Entry** ht;
    size_t htMask; //NOLINT(clang-diagnostic-unused-private-field)
    HashIndexedView(size_t htSize, size_t htMask);
+   static HashIndexedView* buildInternal(GrowingBuffer* buffer, bool withPredFlags, size_t filterPred0Offset, size_t filterPred1Offset);
    static uint64_t nextPow2(uint64_t v) {
       v--;
       v |= v >> 1;
@@ -27,6 +28,7 @@ class HashIndexedView {
 
    public:
    static HashIndexedView* build(GrowingBuffer* buffer);
+   static HashIndexedView* buildWithPredFlags(GrowingBuffer* buffer, size_t filterPred0Offset, size_t filterPred1Offset);
    static void destroy(HashIndexedView*);
    ~HashIndexedView();
 };

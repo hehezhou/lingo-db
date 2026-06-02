@@ -9,9 +9,9 @@
 namespace {
 static lingodb::utility::Tracer::Event buildEvent("HashIndexedView", "build");
 } // end namespace
-lingodb::runtime::HashIndexedView* lingodb::runtime::HashIndexedView::build(lingodb::runtime::GrowingBuffer* buffer) {
+lingodb::runtime::HashIndexedView* lingodb::runtime::HashIndexedView::buildInternal(lingodb::runtime::GrowingBuffer* buffer, bool withPredFlags, size_t filterPred0Offset, size_t filterPred1Offset) {
    utility::Tracer::Trace trace(buildEvent);
-   auto* executionContext = runtime::getCurrentExecutionContext();
+   auto* executionContext = lingodb::runtime::getCurrentExecutionContext();
    auto& values = buffer->getValues();
    size_t htSize = std::max(nextPow2(values.getLen() * 1.25), static_cast<uint64_t>(1));
    size_t htMask = htSize - 1;
@@ -24,13 +24,24 @@ lingodb::runtime::HashIndexedView* lingodb::runtime::HashIndexedView::build(ling
       std::atomic_ref<Entry*> slot(htView->ht[pos]);
       Entry* current = slot.load();
       Entry* newEntry;
+      uint16_t predTag = 0;
+      if (withPredFlags) {
+         if (*(ptr + filterPred0Offset)) predTag |= lingodb::runtime::filterPred0TagBit;
+         if (*(ptr + filterPred1Offset)) predTag |= lingodb::runtime::filterPred1TagBit;
+      }
       do {
          entry->next = lingodb::runtime::untag(current);
-         newEntry = lingodb::runtime::tag(entry, current, hash);
+         newEntry = withPredFlags ? lingodb::runtime::tagWithFilterPreds(entry, current, hash, predTag) : lingodb::runtime::tag(entry, current, hash);
       } while (!slot.compare_exchange_weak(current, newEntry));
    });
    trace.stop();
    return htView;
+}
+lingodb::runtime::HashIndexedView* lingodb::runtime::HashIndexedView::build(lingodb::runtime::GrowingBuffer* buffer) {
+   return buildInternal(buffer, false, 0, 0);
+}
+lingodb::runtime::HashIndexedView* lingodb::runtime::HashIndexedView::buildWithPredFlags(lingodb::runtime::GrowingBuffer* buffer, size_t filterPred0Offset, size_t filterPred1Offset) {
+   return buildInternal(buffer, true, filterPred0Offset, filterPred1Offset);
 }
 void lingodb::runtime::HashIndexedView::destroy(lingodb::runtime::HashIndexedView* ht) {
    delete ht;

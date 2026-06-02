@@ -2332,6 +2332,51 @@ static std::optional<size_t> getMixedHashIndexedViewFilterPredIndex(mlir::Type t
    return std::nullopt;
 }
 
+static unsigned getMixedHashIndexedViewFilterPredTagBit(subop::MixedHashIndexedViewType mixed) {
+   llvm::StringRef predMemberName = mixed.getFilterPredMemberName().getValue();
+   if (predMemberName == "filter_pred$0") return 0x8000;
+   if (predMemberName == "filter_pred$1") return 0x4000;
+   assert(false && "mixed HIV predicate tag is only reserved for filter_pred$0/$1");
+   return 0;
+}
+
+static size_t alignTo(size_t offset, size_t alignment) {
+   return ((offset + alignment - 1) / alignment) * alignment;
+}
+
+static std::pair<size_t, size_t> getRuntimeSizeAndAlign(mlir::Type type) {
+   if (mlir::isa<util::RefType>(type)) return {8, 8};
+   if (mlir::isa<mlir::IndexType>(type)) return {8, 8};
+   if (auto intType = mlir::dyn_cast<mlir::IntegerType>(type)) {
+      size_t size = std::max<size_t>(1, (intType.getWidth() + 7) / 8);
+      if (size <= 1) return {1, 1};
+      if (size <= 2) return {2, 2};
+      if (size <= 4) return {4, 4};
+      if (size <= 8) return {8, 8};
+      return {16, 16};
+   }
+   if (auto decimalType = mlir::dyn_cast<db::DecimalType>(type)) return decimalType.getP() < 19 ? std::pair<size_t, size_t>{8, 8} : std::pair<size_t, size_t>{16, 16};
+   if (mlir::isa<db::DateType>(type)) return {8, 8};
+   if (auto charType = mlir::dyn_cast<db::CharType>(type)) return charType.getLen() > 1 ? std::pair<size_t, size_t>{16, 16} : std::pair<size_t, size_t>{4, 4};
+   if (mlir::isa<db::StringType, util::VarLen32Type>(type)) return {16, 16};
+   assert(false && "unsupported type in mixed HIV filter_pred offset computation");
+   return {0, 1};
+}
+
+static std::optional<size_t> getStoredMemberByteOffset(subop::StateMembersAttr members, subop::Member target, mlir::TypeConverter* typeConverter) {
+   auto& memberManager = members.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   size_t offset = 0;
+   for (subop::Member member : members.getMembers()) {
+      mlir::Type type = memberManager.getType(member);
+      if (mlir::Type converted = typeConverter->convertType(type)) type = converted;
+      auto [size, alignment] = getRuntimeSizeAndAlign(type);
+      offset = alignTo(offset, alignment);
+      if (member == target) return offset;
+      offset += size;
+   }
+   return std::nullopt;
+}
+
 class ScanListLowering : public SubOpConversionPattern<subop::ScanListOp> {
    public:
    using SubOpConversionPattern<subop::ScanListOp>::SubOpConversionPattern;
@@ -2689,12 +2734,19 @@ class LookupHashIndexedViewLowering : public SubOpTupleStreamConsumerConversionP
       Value buckedPos = rewriter.create<arith::AndIOp>(loc, htMask, hash);
       Value ptr = rewriter.create<util::LoadOp>(loc, rewriter.getPtrType(), ht, buckedPos);
       //optimization
-      Value refValid = rewriter.create<util::PtrTagMatches>(loc, rewriter.getI1Type(), ptr, hash);
-      ptr = rewriter.create<util::UnTagPtr>(loc, ptr.getType(), ptr);
+      auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(lookupOp.getState().getType());
+      Value refValid = mixed ? rewriter.create<util::PtrHashTagMatches>(loc, rewriter.getI1Type(), ptr, hash).getResult()
+                             : rewriter.create<util::PtrTagMatches>(loc, rewriter.getI1Type(), ptr, hash).getResult();
       mlir::Value lookupPred = rewriter.create<arith::ConstantIntOp>(loc, 1, 1);
       if (mlir::isa<subop::MixedHashIndexedViewType>(lookupOp.getState().getType()) && lookupArgs.size() > 1) {
          lookupPred = lookupArgs[1];
       }
+      if (mixed) {
+         auto predTagMatches = rewriter.create<util::PtrTagHasBits>(loc, rewriter.getI1Type(), ptr, getMixedHashIndexedViewFilterPredTagBit(mixed));
+         refValid = rewriter.create<arith::AndIOp>(loc, refValid, predTagMatches);
+         refValid = rewriter.create<arith::AndIOp>(loc, refValid, lookupPred);
+      }
+      ptr = rewriter.create<util::UnTagPtr>(loc, ptr.getType(), ptr);
       Value matches = mlir::isa<subop::MixedHashIndexedViewType>(lookupOp.getState().getType())
                          ? rewriter.create<util::PackOp>(loc, ValueRange{ptr, hash, refValid, lookupPred})
                          : rewriter.create<util::PackOp>(loc, ValueRange{ptr, hash, refValid});
@@ -3911,7 +3963,25 @@ class CreateHashIndexedViewLowering : public SubOpConversionPattern<subop::Creat
       auto linkIsFirst = bufferType.getMembers().getMembers()[0] == createOp.getLinkMember().getMember();
       auto hashIsSecond = bufferType.getMembers().getMembers()[1] == createOp.getHashMember().getMember();
       if (!linkIsFirst || !hashIsSecond) return failure();
-      auto htView = rt::HashIndexedView::build(rewriter, createOp->getLoc())({adaptor.getSource()})[0];
+      mlir::Value htView;
+      if (mlir::isa<subop::MixedHashIndexedViewType>(createOp.getType())) {
+         auto& memberManager = getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+         std::optional<subop::Member> pred0Member;
+         std::optional<subop::Member> pred1Member;
+         for (subop::Member member : bufferType.getMembers().getMembers()) {
+            if (memberManager.getName(member) == "filter_pred$0") pred0Member = member;
+            if (memberManager.getName(member) == "filter_pred$1") pred1Member = member;
+         }
+         assert(pred0Member && pred1Member && "mixed HIV pred tag build expects filter_pred$0/$1");
+         auto pred0Offset = getStoredMemberByteOffset(bufferType.getMembers(), *pred0Member, typeConverter);
+         auto pred1Offset = getStoredMemberByteOffset(bufferType.getMembers(), *pred1Member, typeConverter);
+         assert(pred0Offset && pred1Offset && "could not compute mixed HIV predicate offsets");
+         auto pred0OffsetVal = rewriter.create<arith::ConstantIndexOp>(createOp->getLoc(), *pred0Offset);
+         auto pred1OffsetVal = rewriter.create<arith::ConstantIndexOp>(createOp->getLoc(), *pred1Offset);
+         htView = rt::HashIndexedView::buildWithPredFlags(rewriter, createOp->getLoc())({adaptor.getSource(), pred0OffsetVal, pred1OffsetVal})[0];
+      } else {
+         htView = rt::HashIndexedView::build(rewriter, createOp->getLoc())({adaptor.getSource()})[0];
+      }
       rewriter.replaceOp(createOp, htView);
       return success();
    }

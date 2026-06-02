@@ -67,6 +67,8 @@ void util::populateUtilTypeConversionPatterns(TypeConverter& typeConverter, Rewr
    patterns.add<SimpleTypeConversionPattern<TupleElementPtrOp>>(typeConverter, patterns.getContext());
    patterns.add<SimpleTypeConversionPattern<ArrayElementPtrOp>>(typeConverter, patterns.getContext());
    patterns.add<SimpleTypeConversionPattern<PtrTagMatches>>(typeConverter, patterns.getContext());
+   patterns.add<SimpleTypeConversionPattern<PtrHashTagMatches>>(typeConverter, patterns.getContext());
+   patterns.add<SimpleTypeConversionPattern<PtrTagHasBits>>(typeConverter, patterns.getContext());
    patterns.add<SimpleTypeConversionPattern<UnTagPtr>>(typeConverter, patterns.getContext());
    patterns.add<SimpleTypeConversionPattern<BufferCastOp>>(typeConverter, patterns.getContext());
    patterns.add<SimpleTypeConversionPattern<BufferCreateOp>>(typeConverter, patterns.getContext());

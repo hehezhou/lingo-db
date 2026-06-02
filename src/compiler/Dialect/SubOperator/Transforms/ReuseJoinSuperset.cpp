@@ -816,6 +816,21 @@ static void resolveHashLinkMembersForChiv(subop::CreateHashIndexedView chiv, sub
    }
 }
 
+static subop::HashIndexedViewType asHashIndexedViewLayoutType(mlir::Type type) {
+   if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(type)) return hiv;
+   if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(type)) {
+      return subop::HashIndexedViewType::get(mixed.getContext(), mixed.getKeyMembers(), mixed.getValueMembers(),
+                                             mixed.getCompareHashForLookup());
+   }
+   return nullptr;
+}
+
+static bool membersContainNamed(subop::StateMembersAttr members, subop::MemberManager& mm, llvm::StringRef name) {
+   for (subop::Member m : members.getMembers())
+      if (mm.getName(m) == name) return true;
+   return false;
+}
+
 static void syncCreateHashIndexedViewFromBuffer(subop::CreateHashIndexedView chiv) {
    auto* ctx = chiv.getContext();
    mlir::Value src = chiv.getSource();
@@ -834,11 +849,17 @@ static void syncCreateHashIndexedViewFromBuffer(subop::CreateHashIndexedView chi
       if (n.starts_with("link$") || n.starts_with("hash$")) continue;
       vals.push_back(m);
    }
-   auto oldHiv = mlir::cast<subop::HashIndexedViewType>(chiv.getType());
+   auto oldHiv = asHashIndexedViewLayoutType(chiv.getType());
+   assert(oldHiv && "create_hash_indexed_view must produce HIV-like type");
    auto keyMs = subop::StateMembersAttr::get(ctx, llvm::SmallVector<subop::Member>{hashM});
    auto valMs = subop::StateMembersAttr::get(ctx, vals);
-   auto newHiv = subop::HashIndexedViewType::get(ctx, keyMs, valMs, oldHiv.getCompareHashForLookup());
-   chiv.getResult().setType(newHiv);
+   if (membersContainNamed(valMs, mm, "filter_pred$0") && membersContainNamed(valMs, mm, "filter_pred$1")) {
+      auto newMixed = subop::MixedHashIndexedViewType::get(ctx, keyMs, valMs, oldHiv.getCompareHashForLookup(),
+                                                           mlir::StringAttr::get(ctx, "filter_pred$0"));
+      chiv.getResult().setType(newMixed);
+      return;
+   }
+   chiv.getResult().setType(subop::HashIndexedViewType::get(ctx, keyMs, valMs, oldHiv.getCompareHashForLookup()));
 }
 
 static void syncMaterializeMappingsToBufferMembers(mlir::ModuleOp module, subop::StateMembersAttr targetMembers,
@@ -1854,7 +1875,7 @@ static subop::HashIndexedViewType findSyntheticProducerHivForMergedBuffer(mlir::
    synthetic.walk([&](subop::CreateHashIndexedView chiv) {
       if (producerHiv) return;
       if (canonicalizeStateValueForReuse(chiv.getSource()) != canonMergedBuf) return;
-      producerHiv = mlir::dyn_cast<subop::HashIndexedViewType>(chiv.getResult().getType());
+      producerHiv = asHashIndexedViewLayoutType(chiv.getResult().getType());
    });
    return producerHiv;
 }
@@ -3177,8 +3198,8 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
 
       mlir::Value hivA = resolveCacheTargetStateForReuse(m.stateA, reuse0);
       mlir::Value hivB = resolveCacheTargetStateForReuse(m.stateB, reuse1);
-      if (!mlir::isa<subop::HashIndexedViewType>(hivA.getType()) ||
-          !mlir::isa<subop::HashIndexedViewType>(hivB.getType())) {
+      if (!asHashIndexedViewLayoutType(hivA.getType()) ||
+          !asHashIndexedViewLayoutType(hivB.getType())) {
          continue;
       }
 
@@ -3207,7 +3228,7 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
       }
 
       mlir::Value synthHiv = t.state;
-      if (!mlir::isa<subop::HashIndexedViewType>(synthHiv.getType())) continue;
+      if (!asHashIndexedViewLayoutType(synthHiv.getType())) continue;
 
       auto reuseSynthetic = collectModuleReuseInfo(synthetic);
       applyUnionPlanToSyntheticHiv(synthetic, synthHiv, plan, reuseSynthetic, query0, hivA, reuse0, query1, hivB,
@@ -3219,7 +3240,7 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
             if (put.getKey() != t.cacheKey) return;
             canonHiv = put.getState();
          });
-         if (auto hivTy = mlir::dyn_cast<subop::HashIndexedViewType>(canonHiv.getType())) {
+         if (auto hivTy = asHashIndexedViewLayoutType(canonHiv.getType())) {
             (*outLayouts)[t.cacheKey] = layoutFromUnionPlan(hivTy, plan);
          }
       }
@@ -3317,7 +3338,7 @@ void refreshCachedJoinLayoutsFromSyntheticCachePuts(mlir::ModuleOp synthetic,
    for (const CacheTarget& t : targetsInSynthetic) {
       synthetic.walk([&](subop::CachePutOp put) {
          if (static_cast<uint64_t>(put.getKey()) != t.cacheKey) return;
-         auto hivTy = mlir::dyn_cast<subop::HashIndexedViewType>(put.getState().getType());
+         auto hivTy = asHashIndexedViewLayoutType(put.getState().getType());
          if (!hivTy) return;
          const CachedJoinBufferLayout* prev = nullptr;
          if (auto it = layoutsByKey.find(t.cacheKey); it != layoutsByKey.end()) prev = &it->second;
