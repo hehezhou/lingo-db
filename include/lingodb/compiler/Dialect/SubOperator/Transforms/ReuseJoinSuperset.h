@@ -36,6 +36,19 @@ struct CachedJoinBufferLayout {
 
 using CachedJoinBufferLayoutsByKey = llvm::DenseMap<uint64_t, CachedJoinBufferLayout>;
 
+struct CachedAggregateLayout {
+   subop::PreAggrHtType producerHt;
+   llvm::SmallVector<std::string> payloadSemanticKeys;
+   llvm::SmallVector<subop::Member> payloadMembers;
+   llvm::SmallVector<mlir::Type> payloadColumnTypes;
+   llvm::SmallVector<std::string> query0SemanticKeys;
+   llvm::SmallVector<subop::Member> query0Members;
+   llvm::SmallVector<std::string> query1SemanticKeys;
+   llvm::SmallVector<subop::Member> query1Members;
+};
+
+using CachedAggregateLayoutsByKey = llvm::DenseMap<uint64_t, CachedAggregateLayout>;
+
 /// Union payload semantic key \c reuse_filter_pred\x1fN → query index \p N.
 bool parseReuseFilterPredSemanticKey(llvm::StringRef semanticKey, unsigned& reuseQueryIndex);
 
@@ -76,6 +89,13 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
                                              const mlir::IRMapping& donorToSynthetic,
                                              CachedJoinBufferLayoutsByKey* outLayouts = nullptr);
 
+void extendSyntheticAggregateHashTablesToPayloadUnion(mlir::ModuleOp synthetic, mlir::ModuleOp query0,
+                                                      mlir::ModuleOp query1,
+                                                      llvm::ArrayRef<CrossQueryStateMatchPair> matches,
+                                                      llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+                                                      const mlir::IRMapping& donorToSynthetic,
+                                                      CachedAggregateLayoutsByKey* outLayouts = nullptr);
+
 /// Align a consumer to the union column layout: HIV payload order matches the cached producer, but existing
 /// columns keep the consumer's \c member$N names and types; union-only columns are inserted (not type-replaced).
 /// Then walk the \c cache_get HIV use chain, remap probe \c gather member keys to the aligned layout, and update
@@ -86,6 +106,10 @@ void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const Cache
                                             std::optional<unsigned> consumerReuseQueryIndex = std::nullopt,
                                             llvm::SmallVectorImpl<ConsumerCacheGetProbeClosure>* outProbeClosures =
                                                nullptr);
+
+void alignConsumerModulesToCachedAggregateLayout(mlir::ModuleOp consumer, const CachedAggregateLayout& layout,
+                                                 std::optional<uint64_t> cacheKey = std::nullopt,
+                                                 std::optional<unsigned> consumerReuseQueryIndex = std::nullopt);
 
 /// After \c extendSyntheticJoinBuffersToColumnUnion, record table→buffer build steps in cloned synthetic IR.
 ClonedJoinBufferBuildSitesByKey recordClonedJoinBufferBuildSites(mlir::ModuleOp synthetic,

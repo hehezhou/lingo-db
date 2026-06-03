@@ -771,6 +771,14 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    ReusePlanRewriteResult res;
 
    llvm::SmallVector<CrossQueryStateMatchPair, 64> matchesLocal(matches.begin(), matches.end());
+   for (auto& m : matchesLocal) {
+      if (m.queryA == 1 && m.queryB == 0) {
+         std::swap(m.queryA, m.queryB);
+         std::swap(m.stateA, m.stateB);
+      }
+      assert((m.queryA < 0 || m.queryA == 0) && (m.queryB < 0 || m.queryB == 1) &&
+             "rewritePlansWithSyntheticQuery0 expects match stateA/stateB to align with query0/query1");
+   }
 
    llvm::SmallVector<CacheTarget, 64> targets0;
    llvm::SmallVector<CacheTarget, 64> targets1;
@@ -903,6 +911,9 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    CachedJoinBufferLayoutsByKey producerLayoutsByKey;
    extendSyntheticJoinBuffersToColumnUnion(*res.query0, query0, query1, matchesLocal, targetsQ0, mapping,
                                            &producerLayoutsByKey);
+   CachedAggregateLayoutsByKey aggregateLayoutsByKey;
+   extendSyntheticAggregateHashTablesToPayloadUnion(*res.query0, query0, query1, matchesLocal, targetsQ0, mapping,
+                                                   &aggregateLayoutsByKey);
    insertSyntheticFilterPredsAfterColumnUnion(*res.query0, query0, query1, matchesLocal, targetsQ0,
                                               producerLayoutsByKey, joinBuildSites);
 
@@ -933,6 +944,16 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
          std::optional<unsigned> consumerQ =
             t.enableFilterPredReuse ? std::optional<unsigned>(1u) : std::nullopt;
          alignConsumerModulesToCachedJoinLayout(query1, it->second, t.cacheKey, consumerQ, &probeClosuresQ1);
+      }
+   }
+   for (auto& t : targets0) {
+      if (auto it = aggregateLayoutsByKey.find(t.cacheKey); it != aggregateLayoutsByKey.end()) {
+         alignConsumerModulesToCachedAggregateLayout(query0, it->second, t.cacheKey, 0u);
+      }
+   }
+   for (auto& t : targets1) {
+      if (auto it = aggregateLayoutsByKey.find(t.cacheKey); it != aggregateLayoutsByKey.end()) {
+         alignConsumerModulesToCachedAggregateLayout(query1, it->second, t.cacheKey, 1u);
       }
    }
 

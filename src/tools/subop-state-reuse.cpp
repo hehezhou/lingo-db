@@ -258,7 +258,8 @@ static bool lowerFromSubOpLayer(mlir::ModuleOp subopModule, const char* snapshot
             });
          }
       };
-      lowerDBPm.addPass(std::make_unique<FixGenericMemrefCastTargets>());
+      if (!envFlagEnabled("LINGODB_SUBOP_SKIP_LOWER_FIXUPS"))
+         lowerDBPm.addPass(std::make_unique<FixGenericMemrefCastTargets>());
       struct FixUnrealizedScalarCasts
          : public mlir::PassWrapper<FixUnrealizedScalarCasts, mlir::OperationPass<mlir::ModuleOp>> {
          void runOnOperation() override {
@@ -268,6 +269,11 @@ static bool lowerFromSubOpLayer(mlir::ModuleOp subopModule, const char* snapshot
                mlir::Value in = castOp.getOperand(0);
                mlir::Type srcT = in.getType();
                mlir::Type dstT = castOp.getResult(0).getType();
+               if (srcT == dstT) {
+                  castOp.getResult(0).replaceAllUsesWith(in);
+                  castOp.erase();
+                  return;
+               }
                // Only handle scalar casts; util.ref and tuples are handled by other conversions.
                llvm::SmallString<64> s1, s2;
                {
@@ -289,7 +295,8 @@ static bool lowerFromSubOpLayer(mlir::ModuleOp subopModule, const char* snapshot
          }
       };
       // Experimental: turn remaining unrealized scalar casts into explicit db.cast ops.
-      lowerDBPm.addPass(std::make_unique<FixUnrealizedScalarCasts>());
+      if (!envFlagEnabled("LINGODB_SUBOP_SKIP_LOWER_FIXUPS"))
+         lowerDBPm.addPass(std::make_unique<FixUnrealizedScalarCasts>());
       db::createLowerDBPipeline(lowerDBPm);
       if (failed(lowerDBPm.run(subopModule))) {
          snap("lower-db-failed", subopModule);
@@ -456,6 +463,9 @@ int main(int argc, char** argv) {
    double optimizationMs = 0;
    llvm::SmallVector<double, 8> queryCompileMs;
    queryCompileMs.reserve(queries.size());
+   const bool printPlan = envFlagEnabled("LINGODB_REUSE_PRINT_PLAN");
+   const bool printMatches = envFlagEnabled("LINGODB_REUSE_PRINT_MATCHES");
+   const bool verboseTiming = envFlagEnabled("LINGODB_REUSE_VERBOSE_TIMING");
 
    for (size_t i = 0; i < queries.size(); i++) {
       std::string sql = queries[i];
@@ -485,16 +495,16 @@ int main(int argc, char** argv) {
       }
       runs.push_back(std::move(run));
 
-      // 1) Print SubOp layer IR (previous json-sql-to-subop output).
-      llvm::outs() << "\n// ============================\n";
-      llvm::outs() << "// query[" << i << "] subop layer\n";
-      llvm::outs() << "// ============================\n";
-      runs.back().module.print(llvm::outs());
-      llvm::outs() << "\n";
+      if (printPlan) {
+         llvm::outs() << "\n// ============================\n";
+         llvm::outs() << "// query[" << i << "] subop layer\n";
+         llvm::outs() << "// ============================\n";
+         runs.back().module.print(llvm::outs());
+         llvm::outs() << "\n";
 
-      // 2) Print execution-step/state debug.
-      lingodb::compiler::dialect::subop::printExecutionSteps(runs.back().module, llvm::outs());
-      llvm::outs() << "\n";
+         lingodb::compiler::dialect::subop::printExecutionSteps(runs.back().module, llvm::outs());
+         llvm::outs() << "\n";
+      }
    }
 
    // If we have at least two queries, detect matches and inject cache_put/cache_get to reuse states.
@@ -505,8 +515,9 @@ int main(int argc, char** argv) {
    }
    llvm::SmallVector<lingodb::compiler::dialect::subop::CrossQueryStateMatchPair, 64> matches;
    if (!skipReuseRewrite) matches = lingodb::compiler::dialect::subop::collectCrossQueryStateMatchPairs(qmods);
-   // Print matches on the unmodified modules.
-   lingodb::compiler::dialect::subop::printCrossQueryStateMatches(qmods, llvm::outs());
+   if (printMatches) {
+      lingodb::compiler::dialect::subop::printCrossQueryStateMatches(qmods, llvm::outs());
+   }
    // Only inject reuse for the first two modules for now.
    llvm::SmallVector<lingodb::compiler::dialect::subop::CrossQueryStateMatchPair, 64> firstPair;
    for (auto& m : matches) {
@@ -641,10 +652,12 @@ int main(int argc, char** argv) {
       auto sharedExecCtx = session->createExecutionContext();
       auto runOne = [&](mlir::ModuleOp mod, const std::string& label, SubOpExecuteTiming& segment,
                         std::optional<unsigned> resultQueryIndex) {
-         llvm::outs() << "\n// ============================\n";
-         llvm::outs() << label << "\n";
-         llvm::outs() << "// ============================\n";
-         llvm::outs().flush();
+         if (verboseTiming) {
+            llvm::outs() << "\n// ============================\n";
+            llvm::outs() << label << "\n";
+            llvm::outs() << "// ============================\n";
+            llvm::outs().flush();
+         }
          mlir::OwningOpRef<mlir::ModuleOp> execModule = mlir::cast<mlir::ModuleOp>(mod->clone());
          SubOpExecuteTiming one = executeFromSubOpLayer(*execModule, sharedExecCtx.get(), resultQueryIndex);
          segment = one;
@@ -652,17 +665,19 @@ int main(int argc, char** argv) {
          timingPerRun.push_back(one);
          // TablePrinter uses std::cout; flush before timing on llvm::outs to preserve log order.
          std::cout.flush();
-         llvm::outs() << "// timing_run executionTime_ms=" << one.executionTime << " lower_ms=" << one.lowerMs
-                      << " llvm_jit_ms=" << one.llvmJitMs() << " execute_wall_ms=" << one.wallMs << "\n";
-         llvm::outs().flush();
-         llvm::outs() << "\n";
+         if (verboseTiming) {
+            llvm::outs() << "// timing_run executionTime_ms=" << one.executionTime << " lower_ms=" << one.lowerMs
+                         << " llvm_jit_ms=" << one.llvmJitMs() << " execute_wall_ms=" << one.wallMs << "\n";
+            llvm::outs().flush();
+            llvm::outs() << "\n";
+         }
       };
       // When cross-query rewrite could not map any donor state into the synthetic module, it only
       // contains an empty execution_group shell — skip JIT for that shell.
       if (rewriteRes.numTargetsQuery0Mapped > 0) {
          runOne(*rewriteRes.query0, "// query[0] (synthetic) execute", segmentSynthetic, std::nullopt);
       } else {
-         llvm::outs() << "\n// (skip synthetic execute: reuse_targets_q0_mapped==0)\n";
+         if (verboseTiming) llvm::outs() << "\n// (skip synthetic execute: reuse_targets_q0_mapped==0)\n";
       }
       for (size_t i = 0; i < runs.size(); i++) {
          SubOpExecuteTiming& seg = (i == 0) ? segmentConsumer0 : segmentConsumer1;
@@ -687,27 +702,29 @@ int main(int argc, char** argv) {
    }
    llvm::outs() << "] rewrite=" << rewriteMs << " total_optimization_ms=" << optimizationMs << "\n";
 
-   llvm::outs() << "// timing_note: executionTime_ms is run-sql `executionTime` (generated main() only).\n";
-   llvm::outs() << "// timing_note: shared ExecutionContext keeps cache_put pointers valid across runs;\n";
-   llvm::outs() << "// timing_note: does not change executionTime; per-run clearResult(0) only. Arena/state\n";
-   llvm::outs() << "// timing_note: may accumulate on the shared context (memory, not timing).\n";
-
    printPerRun("execution_time", [](const SubOpExecuteTiming& t) { return t.executionTime; });
-   printPerRun("lower_imperative", [](const SubOpExecuteTiming& t) { return t.lowerMs; });
-   printPerRun("llvm_jit", [](const SubOpExecuteTiming& t) { return t.llvmJitMs(); });
-   printPerRun("execute_wall", [](const SubOpExecuteTiming& t) { return t.wallMs; });
-
-   if (rewriteRes.numTargetsQuery0Mapped > 0) {
-      printTimingSegment(llvm::outs(), "synthetic_ir", segmentSynthetic);
-   }
-   printTimingSegment(llvm::outs(), "consumer_q0_ir", segmentConsumer0);
-   printTimingSegment(llvm::outs(), "consumer_q1_ir", segmentConsumer1);
 
    SubOpExecuteTiming consumersOnly;
    consumersOnly.add(segmentConsumer0);
    consumersOnly.add(segmentConsumer1);
-   printTimingSegment(llvm::outs(), "consumers_only_ir", consumersOnly);
-   printTimingSegment(llvm::outs(), "all_execute_runs", totalExec);
+   if (verboseTiming) {
+      llvm::outs() << "// timing_note: executionTime_ms is run-sql `executionTime` (generated main() only).\n";
+      llvm::outs() << "// timing_note: shared ExecutionContext keeps cache_put pointers valid across runs;\n";
+      llvm::outs() << "// timing_note: does not change executionTime; per-run clearResult(0) only. Arena/state\n";
+      llvm::outs() << "// timing_note: may accumulate on the shared context (memory, not timing).\n";
+
+      printPerRun("lower_imperative", [](const SubOpExecuteTiming& t) { return t.lowerMs; });
+      printPerRun("llvm_jit", [](const SubOpExecuteTiming& t) { return t.llvmJitMs(); });
+      printPerRun("execute_wall", [](const SubOpExecuteTiming& t) { return t.wallMs; });
+
+      if (rewriteRes.numTargetsQuery0Mapped > 0) {
+         printTimingSegment(llvm::outs(), "synthetic_ir", segmentSynthetic);
+      }
+      printTimingSegment(llvm::outs(), "consumer_q0_ir", segmentConsumer0);
+      printTimingSegment(llvm::outs(), "consumer_q1_ir", segmentConsumer1);
+      printTimingSegment(llvm::outs(), "consumers_only_ir", consumersOnly);
+      printTimingSegment(llvm::outs(), "all_execute_runs", totalExec);
+   }
 
    llvm::outs() << "// timing: optimization_ms=" << optimizationMs
                 << " execution_time_ms=" << totalExec.executionTime << "\n";

@@ -1649,6 +1649,88 @@ std::string fingerprintMemberTypesMultiset(subop::MemberManager& mm, llvm::Array
    return out;
 }
 
+static subop::PreAggrHtFragmentType fragmentTypeForAggregateHt(subop::PreAggrHtType ht) {
+   return subop::PreAggrHtFragmentType::get(ht.getContext(), ht.getKeyMembers(), ht.getValueMembers(),
+                                            ht.getWithLock());
+}
+
+static bool lookupOrInsertTargetsAggregateFragment(subop::LookupOrInsertOp lookup,
+                                                   subop::PreAggrHtFragmentType fragTy) {
+   auto refTy = mlir::dyn_cast<subop::LookupEntryRefType>(lookup.getRef().getColumn().type);
+   return refTy && refTy.getState() == fragTy;
+}
+
+static std::string columnRefSemanticFingerprint(
+   lingodb::compiler::dialect::tuples::ColumnRefAttr col,
+   lingodb::compiler::dialect::tuples::ColumnManager& columnManager) {
+   auto [scope, leaf] = columnManager.getName(&col.getColumn());
+   std::string out = sanitizeScopeName(scope);
+   out.push_back('.');
+   out.append(sanitizeBaseName(leaf));
+   out.push_back(':');
+   out.append(typeFingerprint(col.getColumn().type));
+   return out;
+}
+
+static std::string aggregateGroupKeyFingerprint(
+   mlir::Value aggregateState, const ModuleReuseInfo& reuse, subop::MemberManager& memberManager,
+   lingodb::compiler::dialect::tuples::ColumnManager& columnManager) {
+   auto ht = mlir::cast<subop::PreAggrHtType>(aggregateState.getType());
+   auto fragTy = fragmentTypeForAggregateHt(ht);
+
+   llvm::SmallVector<mlir::Value, 4> buildStates;
+   buildStates.push_back(canonicalizeStateValueDeep(aggregateState));
+   for (mlir::Value cur = canonicalizeStateValueDeep(aggregateState);;) {
+      auto it = reuse.mergedFromShadowState.find(cur);
+      if (it == reuse.mergedFromShadowState.end()) break;
+      cur = canonicalizeStateValueDeep(it->second);
+      buildStates.push_back(cur);
+   }
+
+   subop::LookupOrInsertOp lookupOp;
+   for (mlir::Value s : buildStates) {
+      auto it = reuse.writerStepsByState.find(canonicalizeStateValueDeep(s));
+      if (it == reuse.writerStepsByState.end()) continue;
+      for (subop::ExecutionStepOp step : it->second) {
+         step.walk([&](subop::LookupOrInsertOp lookup) {
+            if (!lookupOrInsertTargetsAggregateFragment(lookup, fragTy)) return;
+            assert(!lookupOp && "aggregate state must have a single lookup_or_insert construction site");
+            lookupOp = lookup;
+         });
+      }
+   }
+   assert(lookupOp && "aggregate match requires lookup_or_insert keys");
+
+   std::string out = "optimistic_ht_key{keys=[";
+   for (size_t i = 0; i < lookupOp.getKeys().size(); ++i) {
+      if (i) out.push_back(',');
+      auto col = mlir::cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(lookupOp.getKeys()[i]);
+      out.append(columnRefSemanticFingerprint(col, columnManager));
+   }
+   out.append("],key_types=");
+   out.append(fingerprintMemberTypesMultiset(memberManager, ht.getKeyMembers().getMembers()));
+   out.append(",lock=");
+   out.append(ht.getWithLock() ? "1" : "0");
+   out.push_back('}');
+   return out;
+}
+
+static std::string aggregateDependencyFingerprint(llvm::ArrayRef<std::string> depTokensSorted) {
+   llvm::SmallVector<std::string, 4> deps;
+   for (llvm::StringRef d : depTokensSorted) {
+      std::string s = d.str();
+      size_t mapStart = s.find(";mapping=[");
+      if (mapStart != std::string::npos) {
+         size_t mapEnd = s.find("];filters=", mapStart);
+         assert(mapEnd != std::string::npos && "table dependency token must contain filters after mapping");
+         s.erase(mapStart, mapEnd + 1 - mapStart);
+      }
+      deps.push_back(std::move(s));
+   }
+   llvm::sort(deps);
+   return joinSortedStrings(deps);
+}
+
 // Fingerprint SubOp "state-like" types in a way that is stable across separate compilations of the same SQL.
 // (MemberManager assigns unique `$<id>` suffixes that differ per MLIRContext/module.)
 std::string normalizedSubopStateTypeFingerprint(subop::MemberManager& mm, mlir::Type t) {
@@ -1748,6 +1830,8 @@ struct StateMatchProfile {
    std::string typeFingerprintStr;
    /// Full HIV/buffer stored-value column layout (excluded from `constructionHash` / match type key).
    std::string storedValueMembersFingerprint;
+   /// Aggregate hash-table group-key identity. Payloads are intentionally excluded from aggregate matching.
+   std::string aggregateGroupKeyFingerprint;
 };
 
 /// Phase 1 output: per top-level-step state read/write (nested bodies merged into parent).
@@ -2135,6 +2219,9 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
          if (mlir::isa<subop::HashIndexedViewType>(state.getType())) {
             assert(!prof.storedValueMembersFingerprint.empty());
             module.reuse.joinBuildStoredValueMembersByState[state] = prof.storedValueMembersFingerprint;
+         } else if (mlir::isa<subop::PreAggrHtType>(state.getType())) {
+            prof.aggregateGroupKeyFingerprint = aggregateGroupKeyFingerprint(
+               state, module.reuse, memberManager, tupDialect->getColumnManager());
          }
       }
 
@@ -2768,6 +2855,9 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
             os << " eligible=" << (p.eligible ? "true" : "false");
             os << " type=" << ty;
             os << " deps=" << deps;
+            if (!p.aggregateGroupKeyFingerprint.empty()) {
+               os << " agg_key=" << p.aggregateGroupKeyFingerprint;
+            }
             os << " h=" << p.constructionHash;
             os << "\n";
             if (++printedDbg >= cap) {
@@ -2799,6 +2889,9 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
          auto* a = all[i];
          auto* b = all[j];
          if (a->queryId == b->queryId) continue;
+         if (mlir::isa<subop::PreAggrHtType>(a->value.getType()) ||
+             mlir::isa<subop::PreAggrHtType>(b->value.getType()))
+            continue;
          if (a->constructionHash != b->constructionHash) continue;
          if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
          if (a->depTokensSorted != b->depTokensSorted) continue;
@@ -2810,6 +2903,34 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
          }
 
          os << "\n// -- match_pair --\n";
+         os << "//   query[" << a->queryId << "] ";
+         a->value.printAsOperand(os, flags);
+         os << "\n";
+         os << "//   query[" << b->queryId << "] ";
+         b->value.printAsOperand(os, flags);
+         os << "\n";
+         printed++;
+         if (printed >= 100) {
+            os << "\n// ... truncated match_pairs (max 100) ...\n";
+            return;
+         }
+      }
+   }
+   for (size_t i = 0; i < all.size(); i++) {
+      for (size_t j = i + 1; j < all.size(); j++) {
+         auto* a = all[i];
+         auto* b = all[j];
+         if (a->queryId == b->queryId) continue;
+         if (!mlir::isa<subop::PreAggrHtType>(a->value.getType())) continue;
+         if (!mlir::isa<subop::PreAggrHtType>(b->value.getType())) continue;
+         assert(!a->aggregateGroupKeyFingerprint.empty() && "eligible aggregate profile must carry group-key fingerprint");
+         assert(!b->aggregateGroupKeyFingerprint.empty() && "eligible aggregate profile must carry group-key fingerprint");
+         if (aggregateDependencyFingerprint(a->depTokensSorted) !=
+             aggregateDependencyFingerprint(b->depTokensSorted))
+            continue;
+         if (a->aggregateGroupKeyFingerprint != b->aggregateGroupKeyFingerprint) continue;
+
+         os << "\n// -- match_pair aggregate --\n";
          os << "//   query[" << a->queryId << "] ";
          a->value.printAsOperand(os, flags);
          os << "\n";
@@ -2881,6 +3002,9 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
          auto* b = all[j];
          if (a->queryId == b->queryId) continue;
          if (matchedStates.contains(a->value) || matchedStates.contains(b->value)) continue;
+         if (mlir::isa<subop::PreAggrHtType>(a->value.getType()) ||
+             mlir::isa<subop::PreAggrHtType>(b->value.getType()))
+            continue;
          if (a->constructionHash != b->constructionHash) continue;
          if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
          if (a->depTokensSorted != b->depTokensSorted) continue;
@@ -2900,6 +3024,42 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
          p.stateA = a->value;
          p.stateB = b->value;
          p.cacheKey = cacheKey;
+         out.push_back(p);
+         matchedStates.insert(a->value);
+         matchedStates.insert(b->value);
+         break;
+      }
+   }
+
+   // Aggregate hash tables match on table/filter dependencies plus group-key identity. Payload value
+   // layout is intentionally ignored here; the reuse rewrite computes the payload union later.
+   for (size_t i = 0; i < all.size(); i++) {
+      auto* a = all[i];
+      if (matchedStates.contains(a->value)) continue;
+      if (!mlir::isa<subop::PreAggrHtType>(a->value.getType())) continue;
+      assert(!a->aggregateGroupKeyFingerprint.empty() && "eligible aggregate profile must carry group-key fingerprint");
+      for (size_t j = i + 1; j < all.size(); j++) {
+         auto* b = all[j];
+         if (a->queryId == b->queryId) continue;
+         if (matchedStates.contains(b->value)) continue;
+         if (!mlir::isa<subop::PreAggrHtType>(b->value.getType())) continue;
+         assert(!b->aggregateGroupKeyFingerprint.empty() && "eligible aggregate profile must carry group-key fingerprint");
+         if (aggregateDependencyFingerprint(a->depTokensSorted) !=
+             aggregateDependencyFingerprint(b->depTokensSorted))
+            continue;
+         if (a->aggregateGroupKeyFingerprint != b->aggregateGroupKeyFingerprint) continue;
+
+         std::string k = aggregateDependencyFingerprint(a->depTokensSorted) + "@@agg=" +
+                         a->aggregateGroupKeyFingerprint;
+         uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
+
+         CrossQueryStateMatchPair p;
+         p.queryA = a->queryId;
+         p.queryB = b->queryId;
+         p.stateA = a->value;
+         p.stateB = b->value;
+         p.cacheKey = cacheKey;
+         p.enableFilterPredReuse = false;
          out.push_back(p);
          matchedStates.insert(a->value);
          matchedStates.insert(b->value);
