@@ -12,13 +12,10 @@
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ColumnUsageAnalysis.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/StateUsageTransformer.h"
 #include "lingodb/compiler/Dialect/TupleStream/TupleStreamDialect.h"
-#include "lingodb/compiler/mlir-support/eval.h"
-#include "lingodb/catalog/Catalog.h"
-#include "lingodb/catalog/TableCatalogEntry.h"
+#include "lingodb/compiler/Dialect/RelAlg/Transforms/CardinalityEstimation.h"
 #include "lingodb/runtime/ExternalDataSourceProperty.h"
 #include "lingodb/utility/Serialization.h"
 
-#include <arrow/api.h>
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/DenseSet.h"
@@ -1100,226 +1097,6 @@ static void mergeExternalFiltersForOrReuse(ExternalDatasourceProperty& merged,
    for (size_t i = 1; i < uniqueClauses.size(); ++i) {
       merged.orFilterClauses.emplace_back(uniqueClauses[i].begin(), uniqueClauses[i].end());
    }
-}
-
-static std::tuple<::arrow::Type::type, uint32_t, uint32_t> sampleEvalTypeForField(const std::shared_ptr<::arrow::DataType>& type) {
-   switch (type->id()) {
-      case ::arrow::Type::BOOL: return {::arrow::Type::BOOL, 0, 0};
-      case ::arrow::Type::INT8: return {::arrow::Type::INT8, 0, 0};
-      case ::arrow::Type::INT16: return {::arrow::Type::INT16, 0, 0};
-      case ::arrow::Type::INT32: return {::arrow::Type::INT32, 0, 0};
-      case ::arrow::Type::INT64: return {::arrow::Type::INT64, 0, 0};
-      case ::arrow::Type::UINT8: return {::arrow::Type::UINT8, 0, 0};
-      case ::arrow::Type::UINT16: return {::arrow::Type::UINT16, 0, 0};
-      case ::arrow::Type::UINT32: return {::arrow::Type::UINT32, 0, 0};
-      case ::arrow::Type::UINT64: return {::arrow::Type::UINT64, 0, 0};
-      case ::arrow::Type::FLOAT: return {::arrow::Type::FLOAT, 0, 0};
-      case ::arrow::Type::DOUBLE: return {::arrow::Type::DOUBLE, 0, 0};
-      case ::arrow::Type::STRING: return {::arrow::Type::STRING, 0, 0};
-      case ::arrow::Type::DATE32: return {::arrow::Type::DATE32, 0, 0};
-      case ::arrow::Type::DATE64: return {::arrow::Type::DATE64, 0, 0};
-      case ::arrow::Type::TIMESTAMP: {
-         auto ts = std::static_pointer_cast<::arrow::TimestampType>(type);
-         return {::arrow::Type::TIMESTAMP, static_cast<uint32_t>(ts->unit()), 0};
-      }
-      case ::arrow::Type::DECIMAL128: {
-         auto dec = std::static_pointer_cast<::arrow::Decimal128Type>(type);
-         return {::arrow::Type::DECIMAL128, static_cast<uint32_t>(dec->precision()), static_cast<uint32_t>(dec->scale())};
-      }
-      default: llvm_unreachable("join superset CE: unsupported sample column type");
-   }
-}
-
-static std::string filterColumnName(const lingodb::runtime::FilterDescription& f,
-                                    const std::shared_ptr<::arrow::Schema>& schema) {
-   if (!f.columnName.empty()) return f.columnName;
-   assert(f.columnId < static_cast<size_t>(schema->num_fields()) &&
-          "join superset CE: filter column id must be in sample schema");
-   return schema->field(static_cast<int>(f.columnId))->name();
-}
-
-static std::unique_ptr<lingodb::compiler::support::eval::expr>
-buildFilterLiteral(const std::variant<std::string, int64_t, double>& value,
-                   const std::tuple<::arrow::Type::type, uint32_t, uint32_t>& type) {
-   auto [id, unused1, unused2] = type;
-   (void)unused1;
-   (void)unused2;
-   if (id == ::arrow::Type::STRING || id == ::arrow::Type::DECIMAL128) {
-      assert(std::holds_alternative<std::string>(value) &&
-             "join superset CE: string/decimal filters must carry string values");
-      return lingodb::compiler::support::eval::createLiteral(std::get<std::string>(value), type);
-   }
-   if (id == ::arrow::Type::FLOAT || id == ::arrow::Type::DOUBLE || id == ::arrow::Type::HALF_FLOAT) {
-      if (std::holds_alternative<double>(value))
-         return lingodb::compiler::support::eval::createLiteral(std::get<double>(value), type);
-      assert(std::holds_alternative<int64_t>(value) &&
-             "join superset CE: numeric filters must carry numeric values");
-      return lingodb::compiler::support::eval::createLiteral(static_cast<double>(std::get<int64_t>(value)), type);
-   }
-   assert(std::holds_alternative<int64_t>(value) &&
-          "join superset CE: integral/date/timestamp filters must carry int64 values");
-   return lingodb::compiler::support::eval::createLiteral(std::get<int64_t>(value), type);
-}
-
-static bool filterLiteralSupportedForSampleEval(const std::variant<std::string, int64_t, double>& value,
-                                                const std::tuple<::arrow::Type::type, uint32_t, uint32_t>& type) {
-   auto [id, unused1, unused2] = type;
-   (void)unused1;
-   (void)unused2;
-   switch (id) {
-      case ::arrow::Type::STRING:
-      case ::arrow::Type::DECIMAL128:
-         return std::holds_alternative<std::string>(value);
-      case ::arrow::Type::FLOAT:
-      case ::arrow::Type::DOUBLE:
-      case ::arrow::Type::HALF_FLOAT:
-         return std::holds_alternative<double>(value) || std::holds_alternative<int64_t>(value);
-      case ::arrow::Type::BOOL:
-      case ::arrow::Type::INT8:
-      case ::arrow::Type::INT16:
-      case ::arrow::Type::INT32:
-      case ::arrow::Type::INT64:
-      case ::arrow::Type::UINT8:
-      case ::arrow::Type::UINT16:
-      case ::arrow::Type::UINT32:
-      case ::arrow::Type::UINT64:
-      case ::arrow::Type::DATE32:
-      case ::arrow::Type::DATE64:
-      case ::arrow::Type::TIMESTAMP:
-         return std::holds_alternative<int64_t>(value);
-      default:
-         return false;
-   }
-}
-
-static std::unique_ptr<lingodb::compiler::support::eval::expr>
-buildFilterPredicate(const lingodb::runtime::FilterDescription& f,
-                     const std::shared_ptr<::arrow::Schema>& schema) {
-   using lingodb::runtime::FilterOp;
-   namespace eval = lingodb::compiler::support::eval;
-   std::string colName = filterColumnName(f, schema);
-   auto field = schema->GetFieldByName(colName);
-   assert(field && "join superset CE: filtered column must exist in sample schema");
-   auto type = sampleEvalTypeForField(field->type());
-
-   if (f.op == FilterOp::NOTNULL) {
-      return eval::createNot(eval::createIsNull(eval::createAttrRef(colName)));
-   }
-   if (f.op == FilterOp::IN) {
-      std::vector<std::unique_ptr<eval::expr>> disjuncts;
-      std::visit([&](const auto& vals) {
-         for (const auto& v : vals) {
-            std::variant<std::string, int64_t, double> literalValue = v;
-            disjuncts.push_back(eval::createEq(eval::createAttrRef(colName), buildFilterLiteral(literalValue, type)));
-         }
-      },
-                 f.values);
-      assert(!disjuncts.empty() && "join superset CE: IN filters must have at least one value");
-      return eval::createOr(disjuncts);
-   }
-
-   auto lhs = eval::createAttrRef(colName);
-   auto rhs = buildFilterLiteral(f.value, type);
-   switch (f.op) {
-      case FilterOp::EQ: return eval::createEq(std::move(lhs), std::move(rhs));
-      case FilterOp::NEQ: return eval::createNot(eval::createEq(std::move(lhs), std::move(rhs)));
-      case FilterOp::LT: return eval::createLt(std::move(lhs), std::move(rhs));
-      case FilterOp::LTE: return eval::createLte(std::move(lhs), std::move(rhs));
-      case FilterOp::GT: return eval::createGt(std::move(lhs), std::move(rhs));
-      case FilterOp::GTE: return eval::createGte(std::move(lhs), std::move(rhs));
-      default: llvm_unreachable("join superset CE: unexpected filter op");
-   }
-}
-
-static bool filterPredicateSupportedForSampleEval(const lingodb::runtime::FilterDescription& f,
-                                                  const std::shared_ptr<::arrow::Schema>& schema) {
-   using lingodb::runtime::FilterOp;
-   auto field = schema->GetFieldByName(filterColumnName(f, schema));
-   if (!field) return false;
-   auto type = sampleEvalTypeForField(field->type());
-   if (f.op == FilterOp::NOTNULL) return true;
-   if (f.op == FilterOp::IN) {
-      bool supported = true;
-      std::visit([&](const auto& vals) {
-         for (const auto& v : vals) {
-            std::variant<std::string, int64_t, double> literalValue = v;
-            if (!filterLiteralSupportedForSampleEval(literalValue, type)) {
-               supported = false;
-               break;
-            }
-         }
-      },
-                 f.values);
-      return supported;
-   }
-   return filterLiteralSupportedForSampleEval(f.value, type);
-}
-
-static std::optional<std::unique_ptr<lingodb::compiler::support::eval::expr>>
-buildFilterClausePredicate(llvm::ArrayRef<lingodb::runtime::FilterDescription> clause,
-                           const std::shared_ptr<::arrow::Schema>& schema) {
-   namespace eval = lingodb::compiler::support::eval;
-   if (clause.empty()) return std::nullopt;
-   std::vector<std::unique_ptr<eval::expr>> conjuncts;
-   for (const auto& f : clause) conjuncts.push_back(buildFilterPredicate(f, schema));
-   return eval::createAnd(conjuncts);
-}
-
-static double estimateExternalDatasourceOrRowsFromSample(
-   llvm::ArrayRef<ExternalDatasourceProperty> filterSources, lingodb::catalog::Catalog& catalog) {
-   assert(!filterSources.empty() && "join superset CE: expected at least one filter source");
-   for (const ExternalDatasourceProperty& src : filterSources) {
-      assert(src.tableName == filterSources.front().tableName &&
-             "join superset CE: all filter sources must scan the same table");
-   }
-   auto tableEntry = catalog.getTypedEntry<lingodb::catalog::TableCatalogEntry>(filterSources.front().tableName);
-   assert(tableEntry && "join superset CE: table must exist in catalog");
-   auto sample = tableEntry.value()->getSample();
-   assert(sample && "join superset CE: table must have a sample");
-   auto batch = sample.getSampleData();
-   assert(batch && batch->num_rows() > 0 && "join superset CE: sample must be non-empty");
-
-   for (const ExternalDatasourceProperty& src : filterSources) {
-      if (src.filterDescriptions.empty() && src.orFilterClauses.empty()) {
-         return static_cast<double>(tableEntry.value()->getNumRows());
-      }
-   }
-   for (const ExternalDatasourceProperty& src : filterSources) {
-      for (const auto& f : src.filterDescriptions) {
-         if (!filterPredicateSupportedForSampleEval(f, batch->schema()))
-            return static_cast<double>(tableEntry.value()->getNumRows());
-      }
-      for (const auto& clause : src.orFilterClauses) {
-         for (const auto& f : clause) {
-            if (!filterPredicateSupportedForSampleEval(f, batch->schema()))
-               return static_cast<double>(tableEntry.value()->getNumRows());
-         }
-      }
-   }
-
-   ExternalDatasourceProperty merged = filterSources.front();
-   mergeExternalFiltersForOrReuse(merged, filterSources);
-
-   llvm::SmallVector<llvm::ArrayRef<lingodb::runtime::FilterDescription>, 4> clauses;
-   clauses.push_back(merged.filterDescriptions);
-   for (const auto& c : merged.orFilterClauses) clauses.push_back(c);
-   if (llvm::any_of(clauses, [](auto c) { return c.empty(); })) {
-      return static_cast<double>(tableEntry.value()->getNumRows());
-   }
-
-   std::vector<std::unique_ptr<lingodb::compiler::support::eval::expr>> disjuncts;
-   for (auto clause : clauses) {
-      auto expr = buildFilterClausePredicate(clause, batch->schema());
-      assert(expr.has_value() && "join superset CE: non-empty clause must produce predicate");
-      disjuncts.push_back(std::move(expr.value()));
-   }
-   assert(!disjuncts.empty() && "join superset CE: merged filtered datasource must have clauses");
-   auto optionalCount = lingodb::compiler::support::eval::countResults(batch, lingodb::compiler::support::eval::createOr(disjuncts));
-   assert(optionalCount.has_value() && "join superset CE: sample predicate must be evaluable");
-   size_t count = optionalCount.value();
-   if (count == 0) count = 1;
-   return static_cast<double>(tableEntry.value()->getNumRows()) *
-      static_cast<double>(count) / static_cast<double>(batch->num_rows());
 }
 
 static subop::ExecutionStepOp createMergedExternalTableRefStep(mlir::OpBuilder& gb, mlir::Location loc,
@@ -3759,7 +3536,7 @@ double estimateMergedHivExternalFilterRows(mlir::ModuleOp query0, mlir::ModuleOp
    assert(okA && okB && "join superset CE: both HIVs must resolve to donor external datasources");
    assert(dsA.tableName == dsB.tableName && "join superset CE: matched HIVs must scan the same donor table");
    llvm::SmallVector<ExternalDatasourceProperty, 2> sources{dsA, dsB};
-   return estimateExternalDatasourceOrRowsFromSample(sources, catalog);
+   return relalg::estimateExternalDatasourceOrRowsFromSample(sources, catalog, {}, {});
 }
 
 bool parseReuseFilterPredSemanticKey(llvm::StringRef semanticKey, unsigned& reuseQueryIndex) {

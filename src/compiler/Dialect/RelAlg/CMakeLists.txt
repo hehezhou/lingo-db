@@ -14,6 +14,7 @@ add_mlir_dialect_library(MLIRRelAlg
         Transforms/PropagateConstraints.cpp
         Transforms/IntroduceTmp.cpp
         Transforms/CommonSubtreeElimination.cpp
+        Transforms/CardinalityEstimation.cpp
         Transforms/Unnesting.cpp
         Transforms/Pushdown.cpp
         Transforms/ImplicitToExplicitJoins.cpp
