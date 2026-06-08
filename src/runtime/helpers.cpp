@@ -1,6 +1,14 @@
 #include "lingodb/runtime/helpers.h"
 
-bool lingodb::runtime::useFilterPredBloomAdaptation = true;
+#include <cstdlib>
+
+static bool initUseFilterPredBloomAdaptation() {
+   const char* v = std::getenv("LINGODB_DISABLE_FILTER_PRED_BLOOM_ADAPTATION");
+   if (!v || v[0] == '\0') return true;
+   return false;
+}
+
+bool lingodb::runtime::useFilterPredBloomAdaptation = initUseFilterPredBloomAdaptation();
 
 alignas(4096) uint16_t lingodb::runtime::bloomMasks[2048] = {
    // The 1820 distinct bit-patterns
