@@ -851,6 +851,54 @@ static mlir::BlockArgument appendMapInputColumn(subop::MapOp map, tuples::Column
    return map.getFn().front().addArgument(ref.getColumn().type, map.getLoc());
 }
 
+static subop::ScanRefsOp findTableScanRefsInBuildStep(subop::ExecutionStepOp step);
+
+static bool mapHasInputSemantic(subop::MapOp map, llvm::StringRef semantic,
+                                tuples::ColumnManager& cm) {
+   for (auto attr : map.getInputCols()) {
+      auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
+      auto [scope, leaf] = cm.getName(&ref.getColumn());
+      if (columnSemanticKey(scope, leaf) == semantic) return true;
+   }
+   return false;
+}
+
+static void ensureSyntheticMapHasPeerInputs(subop::ExecutionStepOp syntheticBuild,
+                                            subop::MapOp syntheticMap,
+                                            subop::MapOp peerMap) {
+   auto* ctx = syntheticMap.getContext();
+   auto& synthCm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   auto& peerCm = peerMap.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   subop::ScanRefsOp scan = findTableScanRefsInBuildStep(syntheticBuild);
+   assert(scan && "residual filter rewrite: synthetic build must scan a table");
+   auto tableTy = mlir::cast<subop::TableType>(scan.getState().getType());
+
+   llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> gatherPairs;
+   llvm::SmallVector<tuples::ColumnRefAttr, 4> newInputs;
+   for (auto attr : peerMap.getInputCols()) {
+      auto peerRef = mlir::cast<tuples::ColumnRefAttr>(attr);
+      auto [scope, leaf] = peerCm.getName(&peerRef.getColumn());
+      std::string semantic = columnSemanticKey(scope, leaf);
+      if (mapHasInputSemantic(syntheticMap, semantic, synthCm)) continue;
+      subop::Member member = tableMemberForIdentifier(tableTy, mm, leaf);
+      assert(member && "residual filter rewrite: synthetic table scan must contain peer predicate input");
+      tuples::ColumnDefAttr def = synthCm.createDef(scope, leaf);
+      def.getColumn().type = mm.getType(member);
+      gatherPairs.push_back({member, def});
+      newInputs.push_back(synthCm.createRef(&def.getColumn()));
+   }
+   if (gatherPairs.empty()) return;
+
+   mlir::OpBuilder b(syntheticMap);
+   auto gather = b.create<subop::GatherOp>(
+      syntheticMap.getLoc(), syntheticMap.getStream(), synthCm.createRef(&scan.getRef().getColumn()),
+      subop::ColumnDefMemberMappingAttr::get(ctx, gatherPairs));
+   syntheticMap->setOperand(0, gather.getRes());
+   for (tuples::ColumnRefAttr ref : newInputs)
+      appendMapInputColumn(syntheticMap, ref);
+}
+
 static void andResidualPredicateWithSimpleFilter(subop::MapOp map, unsigned resultIdx,
                                                  tuples::ColumnRefAttr simplePredRef) {
    mlir::Block& block = map.getFn().front();
@@ -906,7 +954,8 @@ static mlir::Value cloneResidualPredicateExprToSynthetic(mlir::Value v, mlir::IR
    mlir::Location loc = mlir::UnknownLoc::get(ctx);
    auto finish = [&](mlir::Value cloned) {
       assert(cloned);
-      cloned.setType(cloneTypeToContext(v.getType(), ctx));
+      assert(cloned.getType() == cloneTypeToContext(v.getType(), ctx) &&
+             "residual filter: cloned expression type mismatch");
       if (mlir::Operation* def = cloned.getDefiningOp()) def->setLoc(loc);
       mapping.map(v, cloned);
       return cloned;
@@ -915,6 +964,28 @@ static mlir::Value cloneResidualPredicateExprToSynthetic(mlir::Value v, mlir::IR
    if (auto c = mlir::dyn_cast<db::ConstantOp>(op)) {
       out = b.create<db::ConstantOp>(loc, cloneTypeToContext(c.getType(), ctx),
                                      cloneResidualAttrToContext(c.getValue(), ctx));
+   } else if (auto cast = mlir::dyn_cast<db::CastOp>(op)) {
+      out = b.create<db::CastOp>(loc, cloneTypeToContext(cast.getType(), ctx),
+                                 cloneResidualPredicateExprToSynthetic(cast.getVal(), mapping, b, ctx));
+   } else if (auto cmp = mlir::dyn_cast<db::CmpOp>(op)) {
+      out = b.create<db::CmpOp>(
+         loc, cmp.getPredicate(),
+         cloneResidualPredicateExprToSynthetic(cmp.getLeft(), mapping, b, ctx),
+         cloneResidualPredicateExprToSynthetic(cmp.getRight(), mapping, b, ctx));
+   } else if (auto between = mlir::dyn_cast<db::BetweenOp>(op)) {
+      out = b.create<db::BetweenOp>(
+         loc,
+         cloneResidualPredicateExprToSynthetic(between.getVal(), mapping, b, ctx),
+         cloneResidualPredicateExprToSynthetic(between.getLower(), mapping, b, ctx),
+         cloneResidualPredicateExprToSynthetic(between.getUpper(), mapping, b, ctx),
+         between.getLowerInclusive(), between.getUpperInclusive());
+   } else if (auto oneOf = mlir::dyn_cast<db::OneOfOp>(op)) {
+      llvm::SmallVector<mlir::Value, 8> vals;
+      for (mlir::Value arg : oneOf.getVals())
+         vals.push_back(cloneResidualPredicateExprToSynthetic(arg, mapping, b, ctx));
+      out = b.create<db::OneOfOp>(
+         loc,
+         cloneResidualPredicateExprToSynthetic(oneOf.getVal(), mapping, b, ctx), vals);
    } else if (auto rt = mlir::dyn_cast<db::RuntimeCall>(op)) {
       llvm::SmallVector<mlir::Value, 4> args;
       for (mlir::Value arg : rt.getArgs())
@@ -931,6 +1002,9 @@ static mlir::Value cloneResidualPredicateExprToSynthetic(mlir::Value v, mlir::IR
       for (mlir::Value arg : orOp->getOperands())
          args.push_back(cloneResidualPredicateExprToSynthetic(arg, mapping, b, ctx));
       out = b.create<db::OrOp>(loc, args);
+   } else if (auto notOp = mlir::dyn_cast<db::NotOp>(op)) {
+      out = b.create<db::NotOp>(loc,
+                                cloneResidualPredicateExprToSynthetic(notOp.getVal(), mapping, b, ctx));
    } else if (auto derive = mlir::dyn_cast<db::DeriveTruth>(op)) {
       out = b.create<db::DeriveTruth>(loc,
                                       cloneResidualPredicateExprToSynthetic(derive.getVal(), mapping, b, ctx));
@@ -1001,6 +1075,79 @@ static tuples::ColumnRefAttr appendTrueResidualPredicateToSyntheticMap(subop::Ma
    return cm.createRef(&predDef.getColumn());
 }
 
+static bool mapComputesColumn(subop::MapOp map, tuples::ColumnRefAttr ref) {
+   for (auto attr : map.getComputedCols()) {
+      auto def = mlir::cast<tuples::ColumnDefAttr>(attr);
+      if (&def.getColumn() == &ref.getColumn()) return true;
+   }
+   return false;
+}
+
+static subop::MapOp findMapComputingColumn(subop::ExecutionStepOp step, tuples::ColumnRefAttr ref) {
+   subop::MapOp found;
+   step.walk([&](subop::MapOp map) {
+      if (!found && mapComputesColumn(map, ref)) found = map;
+   });
+   assert(found && "residual filter rewrite: simple predicate producer map must exist");
+   return found;
+}
+
+static mlir::Value streamInputOf(mlir::Operation* op) {
+   if (auto gather = mlir::dyn_cast<subop::GatherOp>(op)) return gather.getStream();
+   if (auto map = mlir::dyn_cast<subop::MapOp>(op)) return map.getStream();
+   if (auto rename = mlir::dyn_cast<subop::RenamingOp>(op)) return rename.getStream();
+   llvm_unreachable("residual filter rewrite: unexpected stream op in predicate producer chain");
+}
+
+static void setStreamInputOf(mlir::Operation* op, mlir::Value stream) {
+   if (mlir::isa<subop::GatherOp, subop::MapOp, subop::RenamingOp>(op)) {
+      op->setOperand(0, stream);
+      return;
+   }
+   llvm_unreachable("residual filter rewrite: unexpected stream op in predicate producer chain");
+}
+
+static bool streamChainContains(mlir::Value stream, mlir::Value target) {
+   for (;;) {
+      if (stream == target) return true;
+      mlir::Operation* def = stream.getDefiningOp();
+      if (!def) return false;
+      if (!mlir::isa<subop::GatherOp, subop::MapOp, subop::RenamingOp>(def)) return false;
+      stream = streamInputOf(def);
+   }
+}
+
+static void moveSimplePredicateProducerBeforeResidualMap(subop::ExecutionStepOp step,
+                                                        subop::MapOp residualMap,
+                                                        tuples::ColumnRefAttr predRef) {
+   subop::MapOp predMap = findMapComputingColumn(step, predRef);
+   if (predMap == residualMap) return;
+   if (predMap->isBeforeInBlock(residualMap.getOperation())) {
+      if (streamChainContains(residualMap.getStream(), predMap.getResult())) return;
+      if (residualMap.getStream() != predMap.getResult()) residualMap->setOperand(0, predMap.getResult());
+      return;
+   }
+
+   llvm::SmallVector<mlir::Operation*, 4> chain;
+   mlir::Value stream = predMap.getStream();
+   while (stream != residualMap.getResult()) {
+      mlir::Operation* def = stream.getDefiningOp();
+      assert(def && "residual filter rewrite: predicate producer must be downstream of residual map");
+      chain.push_back(def);
+      stream = streamInputOf(def);
+   }
+
+   mlir::Value newStream = residualMap.getStream();
+   for (mlir::Operation* op : llvm::reverse(chain)) {
+      setStreamInputOf(op, newStream);
+      op->moveBefore(residualMap.getOperation());
+      newStream = op->getResult(0);
+   }
+   predMap->setOperand(0, newStream);
+   predMap->moveBefore(residualMap.getOperation());
+   residualMap->setOperand(0, predMap.getResult());
+}
+
 static void eraseDeadOpsInMapBlock(subop::MapOp map) {
    mlir::Block& block = map.getFn().front();
    auto ret = mlir::cast<tuples::ReturnOp>(block.getTerminator());
@@ -1028,15 +1175,6 @@ static mlir::Value splitResidualPredicateMapResults(subop::MapOp map) {
    llvm::SmallVector<mlir::Value> originalRetVals(originalRet->getOperands().begin(), originalRet->getOperands().end());
    assert(originalComputed.size() == originalRetVals.size() &&
           "residual predicate map must return one value per computed column");
-
-   {
-      mlir::OpBuilder b(originalRet);
-      auto newRet = b.create<tuples::ReturnOp>(originalRet.getLoc(), mlir::ValueRange{originalRetVals.front()});
-      originalRet.erase();
-      (void)newRet;
-      map.setComputedColsAttr(mlir::ArrayAttr::get(ctx, mlir::ArrayRef<mlir::Attribute>{originalComputed.front()}));
-      eraseDeadOpsInMapBlock(map);
-   }
 
    mlir::Value stream = map.getResult();
    mlir::Operation* insertAfter = map.getOperation();
@@ -1066,6 +1204,15 @@ static mlir::Value splitResidualPredicateMapResults(subop::MapOp map) {
       stream = nextMap.getResult();
       insertAfter = nextMap.getOperation();
       newMaps.push_back(nextMap.getOperation());
+   }
+
+   {
+      mlir::OpBuilder b(originalRet);
+      auto newRet = b.create<tuples::ReturnOp>(originalRet.getLoc(), mlir::ValueRange{originalRetVals.front()});
+      originalRet.erase();
+      (void)newRet;
+      map.setComputedColsAttr(mlir::ArrayAttr::get(ctx, mlir::ArrayRef<mlir::Attribute>{originalComputed.front()}));
+      eraseDeadOpsInMapBlock(map);
    }
 
    map.getResult().replaceUsesWithIf(stream, [&](mlir::OpOperand& use) {
@@ -1229,6 +1376,10 @@ static bool rewriteSyntheticResidualFiltersAsFilterPreds(subop::ExecutionStepOp 
                                              : createResidualPredicateMapAfterTableScan(
                                                   syntheticBuild, peerResidual0 ? peerResidual0->predMap
                                                                                 : peerResidual1->predMap);
+   if (simplePred0Ref) moveSimplePredicateProducerBeforeResidualMap(syntheticBuild, syntheticMap, simplePred0Ref);
+   if (simplePred1Ref) moveSimplePredicateProducerBeforeResidualMap(syntheticBuild, syntheticMap, simplePred1Ref);
+   if (peerResidual0) ensureSyntheticMapHasPeerInputs(syntheticBuild, syntheticMap, peerResidual0->predMap);
+   if (peerResidual1) ensureSyntheticMapHasPeerInputs(syntheticBuild, syntheticMap, peerResidual1->predMap);
 
    tuples::ColumnRefAttr pred0Ref;
    if (peerResidual0) {
@@ -1272,7 +1423,12 @@ static bool rewriteSyntheticResidualFiltersAsFilterPreds(subop::ExecutionStepOp 
    }
    setMaterializeMapping(mat, predMember1, pred1Ref);
 
+   mlir::Value residualInputStream = syntheticMap.getStream();
    mlir::Value finalPredicateStream = splitResidualPredicateMapResults(syntheticMap);
+   if (mlir::Operation* finalPredDef = finalPredicateStream.getDefiningOp()) {
+      rewireStreamUsesAfterAnchorInStep(residualInputStream, finalPredicateStream, finalPredDef,
+                                        llvm::ArrayRef<mlir::Operation*>{finalPredDef});
+   }
    if (peerResidual0 && peerResidual1) {
       finalPredicateStream = insertResidualFilterUnionAfterPredicates(finalPredicateStream, pred0Ref, pred1Ref);
    }
@@ -1281,7 +1437,6 @@ static bool rewriteSyntheticResidualFiltersAsFilterPreds(subop::ExecutionStepOp 
       synthResidual->filter.erase();
    }
 
-   llvm::errs() << "[reuse-rewrite-debug] residual table filters rewritten as filter_pred payloads\n";
    return true;
 }
 

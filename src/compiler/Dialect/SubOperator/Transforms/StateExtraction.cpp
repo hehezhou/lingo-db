@@ -2,6 +2,7 @@
 
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorDialect.h"
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorOps.h"
+#include "lingodb/compiler/Dialect/DB/IR/DBOps.h"
 #include "lingodb/compiler/Dialect/TupleStream/TupleStreamDialect.h"
 #include "lingodb/runtime/ExternalDataSourceProperty.h"
 #include "lingodb/utility/Serialization.h"
@@ -1200,6 +1201,97 @@ static std::string normalizedHashIndexedViewTypeFingerprintForJoinMatch(subop::M
           ",compare=" + (hivTy.getCompareHashForLookup() ? "1" : "0") + "}";
 }
 
+static bool residualPredicateValueSupportedForRelaxedHiv(mlir::Value v,
+                                                         llvm::DenseSet<mlir::Value>& seen) {
+   if (!seen.insert(v).second) return true;
+   if (mlir::isa<mlir::BlockArgument>(v)) return true;
+   mlir::Operation* op = v.getDefiningOp();
+   assert(op && "residual predicate value must have a defining op or be a block argument");
+   if (mlir::isa<db::ConstantOp>(op)) return true;
+   if (auto cast = mlir::dyn_cast<db::CastOp>(op))
+      return residualPredicateValueSupportedForRelaxedHiv(cast.getVal(), seen);
+   if (auto cmp = mlir::dyn_cast<db::CmpOp>(op))
+      return residualPredicateValueSupportedForRelaxedHiv(cmp.getLeft(), seen) &&
+             residualPredicateValueSupportedForRelaxedHiv(cmp.getRight(), seen);
+   if (auto between = mlir::dyn_cast<db::BetweenOp>(op))
+      return residualPredicateValueSupportedForRelaxedHiv(between.getVal(), seen) &&
+             residualPredicateValueSupportedForRelaxedHiv(between.getLower(), seen) &&
+             residualPredicateValueSupportedForRelaxedHiv(between.getUpper(), seen);
+   if (auto oneOf = mlir::dyn_cast<db::OneOfOp>(op)) {
+      if (!residualPredicateValueSupportedForRelaxedHiv(oneOf.getVal(), seen)) return false;
+      for (mlir::Value arg : oneOf.getVals())
+         if (!residualPredicateValueSupportedForRelaxedHiv(arg, seen)) return false;
+      return true;
+   }
+   if (auto rt = mlir::dyn_cast<db::RuntimeCall>(op)) {
+      for (mlir::Value arg : rt.getArgs())
+         if (!residualPredicateValueSupportedForRelaxedHiv(arg, seen)) return false;
+      return true;
+   }
+   if (auto andOp = mlir::dyn_cast<db::AndOp>(op)) {
+      for (mlir::Value arg : andOp->getOperands())
+         if (!residualPredicateValueSupportedForRelaxedHiv(arg, seen)) return false;
+      return true;
+   }
+   if (auto orOp = mlir::dyn_cast<db::OrOp>(op)) {
+      for (mlir::Value arg : orOp->getOperands())
+         if (!residualPredicateValueSupportedForRelaxedHiv(arg, seen)) return false;
+      return true;
+   }
+   if (auto notOp = mlir::dyn_cast<db::NotOp>(op))
+      return residualPredicateValueSupportedForRelaxedHiv(notOp.getVal(), seen);
+   if (auto derive = mlir::dyn_cast<db::DeriveTruth>(op))
+      return residualPredicateValueSupportedForRelaxedHiv(derive.getVal(), seen);
+   return false;
+}
+
+static bool residualPredicateValueIsComplexForRelaxedHiv(mlir::Value v,
+                                                         llvm::DenseSet<mlir::Value>& seen) {
+   if (!seen.insert(v).second) return false;
+   if (mlir::isa<mlir::BlockArgument>(v)) return false;
+   mlir::Operation* op = v.getDefiningOp();
+   assert(op && "residual predicate value must have a defining op or be a block argument");
+   if (mlir::isa<db::CastOp, db::CmpOp, db::BetweenOp, db::OneOfOp>(op)) return true;
+   for (mlir::Value operand : op->getOperands())
+      if (residualPredicateValueIsComplexForRelaxedHiv(operand, seen)) return true;
+   return false;
+}
+
+static bool residualPredicateMapSupportedForRelaxedHiv(subop::MapOp map,
+                                                       subop::FilterOp filter) {
+   auto ret = mlir::cast<tuples::ReturnOp>(map.getFn().front().getTerminator());
+   for (auto attr : filter.getConditions()) {
+      auto cond = mlir::cast<tuples::ColumnRefAttr>(attr);
+      bool found = false;
+      for (unsigned i = 0; i < map.getComputedCols().size(); ++i) {
+         auto def = mlir::cast<tuples::ColumnDefAttr>(map.getComputedCols()[i]);
+         if (&def.getColumn() != &cond.getColumn()) continue;
+         llvm::DenseSet<mlir::Value> seen;
+         if (!residualPredicateValueSupportedForRelaxedHiv(ret.getOperand(i), seen)) return false;
+         found = true;
+         break;
+      }
+      assert(found && "residual predicate condition must be produced by predicate map");
+   }
+   return true;
+}
+
+static bool residualPredicateMapComplexForRelaxedHiv(subop::MapOp map,
+                                                     subop::FilterOp filter) {
+   auto ret = mlir::cast<tuples::ReturnOp>(map.getFn().front().getTerminator());
+   for (auto attr : filter.getConditions()) {
+      auto cond = mlir::cast<tuples::ColumnRefAttr>(attr);
+      for (unsigned i = 0; i < map.getComputedCols().size(); ++i) {
+         auto def = mlir::cast<tuples::ColumnDefAttr>(map.getComputedCols()[i]);
+         if (&def.getColumn() != &cond.getColumn()) continue;
+         llvm::DenseSet<mlir::Value> seen;
+         if (residualPredicateValueIsComplexForRelaxedHiv(ret.getOperand(i), seen)) return true;
+         break;
+      }
+   }
+   return false;
+}
+
 struct StepDagHasher {
    subop::ExecutionStepOp step;
    const llvm::DenseMap<mlir::Value, std::string>* tableDescrByTableState = nullptr;
@@ -1212,7 +1304,6 @@ struct StepDagHasher {
    const llvm::DenseMap<mlir::Value, lingodb::runtime::ExternalDatasourceProperty>* externalDatasourceByTableState =
       nullptr;
    llvm::DenseMap<mlir::Value, uint64_t> memo;
-   llvm::DenseSet<mlir::Operation*> reportedRelaxedTableFilters;
    using SelectedColumnSet = llvm::SmallSet<uint64_t, 8>;
 
    bool isWithinStep(mlir::Operation* op) {
@@ -1470,6 +1561,7 @@ struct StepDagHasher {
          auto cond = mlir::cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(attr);
          if (!computedCols.contains(&cond.getColumn())) return {};
       }
+      if (!residualPredicateMapSupportedForRelaxedHiv(map, filter)) return {};
       if (!traceSingleUseStreamToTableScan(map.getOperation(), map.getStream())) return {};
       return map;
    }
@@ -1479,15 +1571,6 @@ struct StepDagHasher {
       if (!predMap) return false;
       scan = traceSingleUseStreamToTableScan(predMap.getOperation(), predMap.getStream());
       return static_cast<bool>(scan);
-   }
-
-   void debugRelaxedTableFilter(subop::FilterOp filter, subop::MapOp predMap, subop::ScanRefsOp scan) {
-      if (!reportedRelaxedTableFilters.insert(filter.getOperation()).second) return;
-      llvm::errs() << "[reuse-match-debug] relaxed table filter skipped from construction hash\n";
-      llvm::errs() << "  step=" << step.getOperation() << "\n";
-      llvm::errs() << "  scan=" << opOneLine(scan.getOperation()) << "\n";
-      llvm::errs() << "  pred_map=" << opOneLine(predMap.getOperation()) << "\n";
-      llvm::errs() << "  filter=" << opOneLine(filter.getOperation()) << "\n";
    }
 
    uint64_t hashSelectedStreamProducer(mlir::Value stream, const SelectedColumnSet& selected) {
@@ -1536,7 +1619,6 @@ struct StepDagHasher {
          subop::MapOp predMap;
          subop::ScanRefsOp scan;
          if (isRelaxedTableFilter(filter, predMap, scan)) {
-            debugRelaxedTableFilter(filter, predMap, scan);
             return hashSelectedStreamProducer(predMap.getStream(), selected);
          }
          SelectedColumnSet nextSelected(selected.begin(), selected.end());
@@ -1926,6 +2008,8 @@ struct StateMatchProfile {
    /// A scan_refs(table) -> ... -> map(predicate) -> filter residual table filter was observed
    /// in the HIV construction closure. Used to keep relaxed HIV fallback matching filter-specific.
    bool hasResidualTableFilter = false;
+   bool hasComplexResidualTableFilter = false;
+   bool hasUnsupportedResidualTableFilter = false;
 };
 
 /// Phase 1 output: per top-level-step state read/write (nested bodies merged into parent).
@@ -1988,7 +2072,7 @@ static subop::ScanRefsOp traceSingleUseStreamToTableScanForProfile(subop::Execut
    }
 }
 
-static bool stepHasResidualTableFilterForProfile(subop::ExecutionStepOp step) {
+static bool stepHasResidualTableFilterForProfile(subop::ExecutionStepOp step, bool requireSupported) {
    bool found = false;
    step.walk([&](subop::FilterOp filter) {
       if (found) return;
@@ -2004,17 +2088,51 @@ static bool stepHasResidualTableFilterForProfile(subop::ExecutionStepOp step) {
          auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
          if (!computedCols.contains(&ref.getColumn())) return;
       }
+      if (requireSupported && !residualPredicateMapSupportedForRelaxedHiv(map, filter)) return;
       found = static_cast<bool>(traceSingleUseStreamToTableScanForProfile(step, map.getOperation(), map.getStream()));
    });
    return found;
 }
 
 static bool constructionHasResidualTableFilter(llvm::ArrayRef<int> constructionStepIndices,
-                                               const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex) {
+                                               const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex,
+                                               bool requireSupported) {
    for (int si : constructionStepIndices) {
       auto itS = stepByIndex.find(si);
       assert(itS != stepByIndex.end());
-      if (stepHasResidualTableFilterForProfile(itS->second)) return true;
+      if (stepHasResidualTableFilterForProfile(itS->second, requireSupported)) return true;
+   }
+   return false;
+}
+
+static bool constructionHasComplexResidualTableFilter(
+   llvm::ArrayRef<int> constructionStepIndices,
+   const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex) {
+   for (int si : constructionStepIndices) {
+      auto itS = stepByIndex.find(si);
+      assert(itS != stepByIndex.end());
+      subop::ExecutionStepOp step = itS->second;
+      bool found = false;
+      step.walk([&](subop::FilterOp filter) {
+         if (found) return;
+         auto map = mlir::dyn_cast_or_null<subop::MapOp>(filter.getStream().getDefiningOp());
+         if (!map) return;
+         if (!streamValueHasOnlyUseByInStep(map.getResult(), filter.getOperation(), step)) return;
+         llvm::DenseSet<const void*> computedCols;
+         for (auto attr : map.getComputedCols()) {
+            auto def = mlir::cast<tuples::ColumnDefAttr>(attr);
+            computedCols.insert(&def.getColumn());
+         }
+         for (auto attr : filter.getConditions()) {
+            auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
+            if (!computedCols.contains(&ref.getColumn())) return;
+         }
+         if (!residualPredicateMapSupportedForRelaxedHiv(map, filter)) return;
+         if (!residualPredicateMapComplexForRelaxedHiv(map, filter)) return;
+         found = static_cast<bool>(
+            traceSingleUseStreamToTableScanForProfile(step, map.getOperation(), map.getStream()));
+      });
+      if (found) return true;
    }
    return false;
 }
@@ -2380,8 +2498,15 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
                module.stepByIndex);
             relaxJoinHivDepTokensInProfile(prof.depTokensSorted, joinHivDetails,
                                            module.reuse.externalDatasourceByTableState, tableDescrByTableState);
+            bool hasAnyResidualFilter =
+               constructionHasResidualTableFilter(constructionStepIndices, module.stepByIndex,
+                                                  /*requireSupported*/ false);
             prof.hasResidualTableFilter =
-               constructionHasResidualTableFilter(constructionStepIndices, module.stepByIndex);
+               constructionHasResidualTableFilter(constructionStepIndices, module.stepByIndex,
+                                                  /*requireSupported*/ true);
+            prof.hasComplexResidualTableFilter =
+               constructionHasComplexResidualTableFilter(constructionStepIndices, module.stepByIndex);
+            prof.hasUnsupportedResidualTableFilter = hasAnyResidualFilter && !prof.hasResidualTableFilter;
          }
          StateConstructionMatchHashes hashes = computeEligibleStateMatchHashes(
             state, constructionStepIndices, module, tableDescrByTableState, memberManager,
@@ -3167,6 +3292,14 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       }
       return deps + "@@type=" + p.typeFingerprintStr + "@@h=" + std::to_string(p.constructionHash);
    };
+   auto complexResidualMatchAllowed = [&](const StateMatchProfile& a, const QueryModel* modelA,
+                                          const StateMatchProfile& b, const QueryModel* modelB) {
+      if (!a.hasComplexResidualTableFilter && !b.hasComplexResidualTableFilter) return true;
+      if (!a.hasResidualTableFilter || !b.hasResidualTableFilter) return false;
+      if (a.hasComplexResidualTableFilter && b.hasComplexResidualTableFilter) return true;
+      return !decodeSimpleMatchFiltersAlongShadowChain(a.value, modelA->reuse).empty() ||
+             !decodeSimpleMatchFiltersAlongShadowChain(b.value, modelB->reuse).empty();
+   };
 
    llvm::SmallVector<CrossQueryStateMatchPair, 64> out;
    llvm::DenseSet<mlir::Value> matchedStates;
@@ -3185,6 +3318,10 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
          const QueryModel* modelA = modelByQueryId.lookup(a->queryId);
          const QueryModel* modelB = modelByQueryId.lookup(b->queryId);
          assert(modelA && modelB && "missing query model for profile");
+         if (mlir::isa<subop::HashIndexedViewType>(a->value.getType()) &&
+             mlir::isa<subop::HashIndexedViewType>(b->value.getType()) &&
+             !complexResidualMatchAllowed(*a, modelA, *b, modelB))
+            continue;
          if (profilesDefinitelyDisjointByFilters(*a, modelA->reuse, *b, modelB->reuse)) {
             continue;
          }
@@ -3214,12 +3351,14 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
          if (a->queryId == b->queryId) continue;
          if (matchedStates.contains(b->value)) continue;
          if (!mlir::isa<subop::HashIndexedViewType>(b->value.getType())) continue;
+         if (a->hasUnsupportedResidualTableFilter || b->hasUnsupportedResidualTableFilter) continue;
          if (!a->hasResidualTableFilter && !b->hasResidualTableFilter) continue;
          if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
          if (a->depTokensSorted != b->depTokensSorted) continue;
          const QueryModel* modelA = modelByQueryId.lookup(a->queryId);
          const QueryModel* modelB = modelByQueryId.lookup(b->queryId);
          assert(modelA && modelB && "missing query model for HIV relaxed profile");
+         if (!complexResidualMatchAllowed(*a, modelA, *b, modelB)) continue;
          if (profilesDefinitelyDisjointByFilters(*a, modelA->reuse, *b, modelB->reuse)) continue;
 
          std::string k = makeKeyStr(*a) + "@@hiv_relaxed";
