@@ -1212,6 +1212,7 @@ struct StepDagHasher {
    const llvm::DenseMap<mlir::Value, lingodb::runtime::ExternalDatasourceProperty>* externalDatasourceByTableState =
       nullptr;
    llvm::DenseMap<mlir::Value, uint64_t> memo;
+   llvm::DenseSet<mlir::Operation*> reportedRelaxedTableFilters;
    using SelectedColumnSet = llvm::SmallSet<uint64_t, 8>;
 
    bool isWithinStep(mlir::Operation* op) {
@@ -1273,8 +1274,7 @@ struct StepDagHasher {
                   }
                }
                std::string fp = std::string("table{members=") +
-                                fingerprintSortedMemberPairs(*memberManager, keptMembers) + ",filtered=" +
-                                (tableTy.getFiltered() ? "1" : "0") + "}";
+                                fingerprintSortedMemberPairs(*memberManager, keptMembers) + "}";
                h = hashCombineU64(h, static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(fp))));
             } else {
                h = hashCombineU64(h, hashMlirType(v.getType()));
@@ -1405,6 +1405,91 @@ struct StepDagHasher {
       return h;
    }
 
+   static std::string opOneLine(mlir::Operation* op) {
+      std::string s;
+      llvm::raw_string_ostream os(s);
+      op->print(os);
+      os.flush();
+      for (char& c : s) {
+         if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+      }
+      if (s.size() > 500) s.resize(500);
+      return s;
+   }
+
+   bool valueHasOnlyUseBy(mlir::Value v, mlir::Operation* expectedUser) {
+      mlir::Operation* onlyUser = nullptr;
+      for (mlir::OpOperand& use : v.getUses()) {
+         mlir::Operation* user = use.getOwner();
+         if (!isWithinStep(user)) continue;
+         if (onlyUser && onlyUser != user) return false;
+         onlyUser = user;
+      }
+      return onlyUser == expectedUser;
+   }
+
+   subop::ScanRefsOp traceSingleUseStreamToTableScan(mlir::Operation* user, mlir::Value stream) {
+      for (;;) {
+         mlir::Operation* def = stream.getDefiningOp();
+         if (!def || !isWithinStep(def)) return {};
+         if (!valueHasOnlyUseBy(stream, user)) return {};
+         if (auto scan = mlir::dyn_cast<subop::ScanRefsOp>(def)) {
+            if (mlir::isa<subop::TableType>(scan.getState().getType())) return scan;
+            return {};
+         }
+         if (auto gather = mlir::dyn_cast<subop::GatherOp>(def)) {
+            user = def;
+            stream = gather.getStream();
+            continue;
+         }
+         if (auto map = mlir::dyn_cast<subop::MapOp>(def)) {
+            user = def;
+            stream = map.getStream();
+            continue;
+         }
+         if (auto rename = mlir::dyn_cast<subop::RenamingOp>(def)) {
+            user = def;
+            stream = rename.getStream();
+            continue;
+         }
+         return {};
+      }
+   }
+
+   subop::MapOp predicateMapForRelaxedTableFilter(subop::FilterOp filter) {
+      auto map = mlir::dyn_cast_or_null<subop::MapOp>(filter.getStream().getDefiningOp());
+      if (!map) return {};
+      if (!valueHasOnlyUseBy(map.getResult(), filter.getOperation())) return {};
+
+      llvm::DenseSet<const void*> computedCols;
+      for (auto attr : map.getComputedCols()) {
+         auto colDef = mlir::cast<lingodb::compiler::dialect::tuples::ColumnDefAttr>(attr);
+         computedCols.insert(&colDef.getColumn());
+      }
+      for (auto attr : filter.getConditions()) {
+         auto cond = mlir::cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(attr);
+         if (!computedCols.contains(&cond.getColumn())) return {};
+      }
+      if (!traceSingleUseStreamToTableScan(map.getOperation(), map.getStream())) return {};
+      return map;
+   }
+
+   bool isRelaxedTableFilter(subop::FilterOp filter, subop::MapOp& predMap, subop::ScanRefsOp& scan) {
+      predMap = predicateMapForRelaxedTableFilter(filter);
+      if (!predMap) return false;
+      scan = traceSingleUseStreamToTableScan(predMap.getOperation(), predMap.getStream());
+      return static_cast<bool>(scan);
+   }
+
+   void debugRelaxedTableFilter(subop::FilterOp filter, subop::MapOp predMap, subop::ScanRefsOp scan) {
+      if (!reportedRelaxedTableFilters.insert(filter.getOperation()).second) return;
+      llvm::errs() << "[reuse-match-debug] relaxed table filter skipped from construction hash\n";
+      llvm::errs() << "  step=" << step.getOperation() << "\n";
+      llvm::errs() << "  scan=" << opOneLine(scan.getOperation()) << "\n";
+      llvm::errs() << "  pred_map=" << opOneLine(predMap.getOperation()) << "\n";
+      llvm::errs() << "  filter=" << opOneLine(filter.getOperation()) << "\n";
+   }
+
    uint64_t hashSelectedStreamProducer(mlir::Value stream, const SelectedColumnSet& selected) {
       auto* def = stream.getDefiningOp();
       assert(def && "relaxed join hash expects tuple stream producer op");
@@ -1448,6 +1533,12 @@ struct StepDagHasher {
       }
 
       if (auto filter = mlir::dyn_cast<subop::FilterOp>(def)) {
+         subop::MapOp predMap;
+         subop::ScanRefsOp scan;
+         if (isRelaxedTableFilter(filter, predMap, scan)) {
+            debugRelaxedTableFilter(filter, predMap, scan);
+            return hashSelectedStreamProducer(predMap.getStream(), selected);
+         }
          SelectedColumnSet nextSelected(selected.begin(), selected.end());
          uint64_t local = hashOpName(*def);
          local = hashCombineU64(local, hashAttrNormalized(filter.getFilterSemanticAttr()));
@@ -1832,6 +1923,9 @@ struct StateMatchProfile {
    std::string storedValueMembersFingerprint;
    /// Aggregate hash-table group-key identity. Payloads are intentionally excluded from aggregate matching.
    std::string aggregateGroupKeyFingerprint;
+   /// A scan_refs(table) -> ... -> map(predicate) -> filter residual table filter was observed
+   /// in the HIV construction closure. Used to keep relaxed HIV fallback matching filter-specific.
+   bool hasResidualTableFilter = false;
 };
 
 /// Phase 1 output: per top-level-step state read/write (nested bodies merged into parent).
@@ -1846,6 +1940,84 @@ struct StateConstructionMatchHashes {
    std::string typeFingerprintStr;
    std::string storedValueMembersFingerprint;
 };
+
+static bool streamValueHasOnlyUseByInStep(mlir::Value v, mlir::Operation* expectedUser,
+                                          subop::ExecutionStepOp step) {
+   mlir::Operation* onlyUser = nullptr;
+   auto isWithinStep = [&](mlir::Operation* op) {
+      for (mlir::Operation* cur = op; cur; cur = cur->getParentOp())
+         if (cur == step.getOperation()) return true;
+      return false;
+   };
+   for (mlir::OpOperand& use : v.getUses()) {
+      mlir::Operation* user = use.getOwner();
+      if (!isWithinStep(user)) continue;
+      if (onlyUser && onlyUser != user) return false;
+      onlyUser = user;
+   }
+   return onlyUser == expectedUser;
+}
+
+static subop::ScanRefsOp traceSingleUseStreamToTableScanForProfile(subop::ExecutionStepOp step,
+                                                                   mlir::Operation* user,
+                                                                   mlir::Value stream) {
+   for (;;) {
+      mlir::Operation* def = stream.getDefiningOp();
+      if (!def) return {};
+      if (!streamValueHasOnlyUseByInStep(stream, user, step)) return {};
+      if (auto scan = mlir::dyn_cast<subop::ScanRefsOp>(def)) {
+         if (mlir::isa<subop::TableType>(scan.getState().getType())) return scan;
+         return {};
+      }
+      if (auto gather = mlir::dyn_cast<subop::GatherOp>(def)) {
+         user = def;
+         stream = gather.getStream();
+         continue;
+      }
+      if (auto map = mlir::dyn_cast<subop::MapOp>(def)) {
+         user = def;
+         stream = map.getStream();
+         continue;
+      }
+      if (auto rename = mlir::dyn_cast<subop::RenamingOp>(def)) {
+         user = def;
+         stream = rename.getStream();
+         continue;
+      }
+      return {};
+   }
+}
+
+static bool stepHasResidualTableFilterForProfile(subop::ExecutionStepOp step) {
+   bool found = false;
+   step.walk([&](subop::FilterOp filter) {
+      if (found) return;
+      auto map = mlir::dyn_cast_or_null<subop::MapOp>(filter.getStream().getDefiningOp());
+      if (!map) return;
+      if (!streamValueHasOnlyUseByInStep(map.getResult(), filter.getOperation(), step)) return;
+      llvm::DenseSet<const void*> computedCols;
+      for (auto attr : map.getComputedCols()) {
+         auto def = mlir::cast<tuples::ColumnDefAttr>(attr);
+         computedCols.insert(&def.getColumn());
+      }
+      for (auto attr : filter.getConditions()) {
+         auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
+         if (!computedCols.contains(&ref.getColumn())) return;
+      }
+      found = static_cast<bool>(traceSingleUseStreamToTableScanForProfile(step, map.getOperation(), map.getStream()));
+   });
+   return found;
+}
+
+static bool constructionHasResidualTableFilter(llvm::ArrayRef<int> constructionStepIndices,
+                                               const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex) {
+   for (int si : constructionStepIndices) {
+      auto itS = stepByIndex.find(si);
+      assert(itS != stepByIndex.end());
+      if (stepHasResidualTableFilterForProfile(itS->second)) return true;
+   }
+   return false;
+}
 
 struct ModuleMatchAndReuseAnalysis {
    struct StateInfo {
@@ -2208,6 +2380,8 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
                module.stepByIndex);
             relaxJoinHivDepTokensInProfile(prof.depTokensSorted, joinHivDetails,
                                            module.reuse.externalDatasourceByTableState, tableDescrByTableState);
+            prof.hasResidualTableFilter =
+               constructionHasResidualTableFilter(constructionStepIndices, module.stepByIndex);
          }
          StateConstructionMatchHashes hashes = computeEligibleStateMatchHashes(
             state, constructionStepIndices, module, tableDescrByTableState, memberManager,
@@ -3016,6 +3190,39 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
          }
 
          std::string k = makeKeyStr(*a);
+         uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
+
+         CrossQueryStateMatchPair p;
+         p.queryA = a->queryId;
+         p.queryB = b->queryId;
+         p.stateA = a->value;
+         p.stateB = b->value;
+         p.cacheKey = cacheKey;
+         out.push_back(p);
+         matchedStates.insert(a->value);
+         matchedStates.insert(b->value);
+         break;
+      }
+   }
+
+   for (size_t i = 0; i < all.size(); i++) {
+      auto* a = all[i];
+      if (matchedStates.contains(a->value)) continue;
+      if (!mlir::isa<subop::HashIndexedViewType>(a->value.getType())) continue;
+      for (size_t j = i + 1; j < all.size(); j++) {
+         auto* b = all[j];
+         if (a->queryId == b->queryId) continue;
+         if (matchedStates.contains(b->value)) continue;
+         if (!mlir::isa<subop::HashIndexedViewType>(b->value.getType())) continue;
+         if (!a->hasResidualTableFilter && !b->hasResidualTableFilter) continue;
+         if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
+         if (a->depTokensSorted != b->depTokensSorted) continue;
+         const QueryModel* modelA = modelByQueryId.lookup(a->queryId);
+         const QueryModel* modelB = modelByQueryId.lookup(b->queryId);
+         assert(modelA && modelB && "missing query model for HIV relaxed profile");
+         if (profilesDefinitelyDisjointByFilters(*a, modelA->reuse, *b, modelB->reuse)) continue;
+
+         std::string k = makeKeyStr(*a) + "@@hiv_relaxed";
          uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
 
          CrossQueryStateMatchPair p;
