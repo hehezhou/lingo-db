@@ -4290,7 +4290,18 @@ double estimateMergedHivExternalFilterRows(mlir::ModuleOp query0, mlir::ModuleOp
    (void)okB;
    assert(dsA.tableName == dsB.tableName && "join superset CE: matched HIVs must scan the same donor table");
    llvm::SmallVector<ExternalDatasourceProperty, 2> sources{dsA, dsB};
-   return relalg::estimateExternalDatasourceOrRowsFromSample(sources, catalog, {}, {});
+   subop::ExecutionStepOp buildA = findJoinBufferBuildStepForHiv(query0, hivA, reuse0);
+   subop::ExecutionStepOp buildB = findJoinBufferBuildStepForHiv(query1, hivB, reuse1);
+   assert(buildA && buildB && "join superset CE: both HIVs must have build steps");
+   auto residualA = findResidualTableFilterInBuildStep(buildA);
+   auto residualB = findResidualTableFilterInBuildStep(buildB);
+   llvm::SmallVector<mlir::Operation*, 2> maps{
+      residualA ? residualA->predMap.getOperation() : nullptr,
+      residualB ? residualB->predMap.getOperation() : nullptr};
+   llvm::SmallVector<mlir::Operation*, 2> filters{
+      residualA ? residualA->filter.getOperation() : nullptr,
+      residualB ? residualB->filter.getOperation() : nullptr};
+   return relalg::estimateExternalDatasourceOrRowsFromSample(sources, catalog, maps, filters);
 }
 
 bool parseReuseFilterPredSemanticKey(llvm::StringRef semanticKey, unsigned& reuseQueryIndex) {
