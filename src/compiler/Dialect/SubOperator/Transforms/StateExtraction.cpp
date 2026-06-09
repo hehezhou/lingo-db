@@ -1466,6 +1466,26 @@ struct StepDagHasher {
       return static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(s)));
    }
 
+   uint64_t hashSelectedStreamColumnAttr(mlir::Attribute a) {
+      if (auto cr = mlir::dyn_cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(a)) {
+         assert(columnManager);
+         auto [scope, name] = columnManager->getName(&cr.getColumn());
+         (void)scope;
+         uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(sanitizeBaseName(name))));
+         return hashCombineU64(h, hashMlirType(cr.getColumn().type));
+      }
+      if (auto cd = mlir::dyn_cast<lingodb::compiler::dialect::tuples::ColumnDefAttr>(a)) {
+         assert(columnManager);
+         auto [scope, name] = columnManager->getName(&cd.getColumn());
+         (void)scope;
+         uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(sanitizeBaseName(name))));
+         h = hashCombineU64(h, hashMlirType(cd.getColumn().type));
+         if (cd.getFromExisting()) h = hashCombineU64(h, hashSelectedStreamColumnAttr(cd.getFromExisting()));
+         return h;
+      }
+      return hashAttrNormalized(a);
+   }
+
    bool includeMemberForJoinIndexHash(llvm::StringRef memberNameSanitized) const {
       if (!relaxJoinPayloadColumns || !joinIndexMemberNamesSanitized) return true;
       return joinIndexMemberNamesSanitized->contains(memberNameSanitized.str());
@@ -1538,6 +1558,11 @@ struct StepDagHasher {
             stream = map.getStream();
             continue;
          }
+         if (auto filter = mlir::dyn_cast<subop::FilterOp>(def)) {
+            user = def;
+            stream = filter.getStream();
+            continue;
+         }
          if (auto rename = mlir::dyn_cast<subop::RenamingOp>(def)) {
             user = def;
             stream = rename.getStream();
@@ -1583,7 +1608,7 @@ struct StepDagHasher {
          bool matched = false;
          for (auto& [member, colDef] : gather.getMapping().getMapping()) {
             (void)member;
-            uint64_t outH = hashAttrNormalized(colDef);
+            uint64_t outH = hashSelectedStreamColumnAttr(colDef);
             if (!selected.contains(outH)) continue;
             matched = true;
             h = hashCombineU64(h, outH);
@@ -1597,21 +1622,21 @@ struct StepDagHasher {
          bool matched = false;
          for (auto attr : map.getComputedCols()) {
             auto colDef = mlir::cast<lingodb::compiler::dialect::tuples::ColumnDefAttr>(attr);
-            uint64_t outH = hashAttrNormalized(colDef);
+            uint64_t outH = hashSelectedStreamColumnAttr(colDef);
             if (!selected.contains(outH)) continue;
             matched = true;
             nextSelected.erase(outH);
             for (auto inAttr : map.getInputCols()) {
-               nextSelected.insert(hashAttrNormalized(inAttr));
+               nextSelected.insert(hashSelectedStreamColumnAttr(inAttr));
             }
          }
          uint64_t h = hashSelectedStreamProducer(map.getStream(), nextSelected);
          if (!matched) return h;
 
          uint64_t local = hashOpName(*def);
-         for (auto attr : map.getComputedCols()) local = hashCombineU64(local, hashAttrNormalized(attr));
+         for (auto attr : map.getComputedCols()) local = hashCombineU64(local, hashSelectedStreamColumnAttr(attr));
          local = hashCombineU64(local, hashRegion(map.getFn()));
-         for (auto inAttr : map.getInputCols()) local = hashCombineU64(local, hashAttrNormalized(inAttr));
+         for (auto inAttr : map.getInputCols()) local = hashCombineU64(local, hashSelectedStreamColumnAttr(inAttr));
          return hashCombineU64(local, h);
       }
 
@@ -1621,12 +1646,16 @@ struct StepDagHasher {
          if (isRelaxedTableFilter(filter, predMap, scan)) {
             return hashSelectedStreamProducer(predMap.getStream(), selected);
          }
+         if (relaxJoinPayloadColumns &&
+             traceSingleUseStreamToTableScan(filter.getOperation(), filter.getStream())) {
+            return hashSelectedStreamProducer(filter.getStream(), selected);
+         }
          SelectedColumnSet nextSelected(selected.begin(), selected.end());
          uint64_t local = hashOpName(*def);
          local = hashCombineU64(local, hashAttrNormalized(filter.getFilterSemanticAttr()));
          for (auto condAttr : filter.getConditions()) {
-            local = hashCombineU64(local, hashAttrNormalized(condAttr));
-            nextSelected.insert(hashAttrNormalized(condAttr));
+            local = hashCombineU64(local, hashSelectedStreamColumnAttr(condAttr));
+            nextSelected.insert(hashSelectedStreamColumnAttr(condAttr));
          }
          return hashCombineU64(local, hashSelectedStreamProducer(filter.getStream(), nextSelected));
       }
@@ -1636,10 +1665,10 @@ struct StepDagHasher {
          for (uint64_t key : selected) nextSelected.insert(key);
          for (auto attr : rename.getColumns()) {
             auto colDef = mlir::cast<lingodb::compiler::dialect::tuples::ColumnDefAttr>(attr);
-            uint64_t outH = hashAttrNormalized(colDef);
+            uint64_t outH = hashSelectedStreamColumnAttr(colDef);
             if (!selected.contains(outH) || !colDef.getFromExisting()) continue;
             nextSelected.erase(outH);
-            nextSelected.insert(hashAttrNormalized(colDef.getFromExisting()));
+            nextSelected.insert(hashSelectedStreamColumnAttr(colDef.getFromExisting()));
          }
          return hashSelectedStreamProducer(rename.getStream(), nextSelected);
       }
@@ -1660,8 +1689,9 @@ struct StepDagHasher {
       SelectedColumnSet selected;
       for (auto& [member, colRef] : mat.getMapping().getMapping()) {
          if (!includeMemberForJoinIndexHash(sanitizeMemberSlotName(memberManager->getName(member)))) continue;
-         selected.insert(hashAttrNormalized(colRef));
-         h = hashCombineU64(h, hashAttrNormalized(colRef));
+         uint64_t colH = hashSelectedStreamColumnAttr(colRef);
+         selected.insert(colH);
+         h = hashCombineU64(h, colH);
          h = hashCombineU64(h, hashAttrNormalized(subop::MemberAttr::get(mat->getContext(), member)));
       }
       h = hashCombineU64(h, hashSelectedStreamProducer(mat.getStream(), selected));
@@ -3292,124 +3322,183 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       }
       return deps + "@@type=" + p.typeFingerprintStr + "@@h=" + std::to_string(p.constructionHash);
    };
+   auto makeRelaxedHivKeyStr = [](const StateMatchProfile& p) -> std::string {
+      std::string deps;
+      for (auto& d : p.depTokensSorted) {
+         if (!deps.empty()) deps.push_back('|');
+         deps.append(d);
+      }
+      return deps + "@@type=" + p.typeFingerprintStr + "@@hiv_relaxed";
+   };
    auto complexResidualMatchAllowed = [&](const StateMatchProfile& a, const QueryModel* modelA,
                                           const StateMatchProfile& b, const QueryModel* modelB) {
       if (!a.hasComplexResidualTableFilter && !b.hasComplexResidualTableFilter) return true;
-      if (!a.hasResidualTableFilter || !b.hasResidualTableFilter) return false;
+      if (!a.hasResidualTableFilter || !b.hasResidualTableFilter) return true;
       if (a.hasComplexResidualTableFilter && b.hasComplexResidualTableFilter) return true;
       return !decodeSimpleMatchFiltersAlongShadowChain(a.value, modelA->reuse).empty() ||
              !decodeSimpleMatchFiltersAlongShadowChain(b.value, modelB->reuse).empty();
    };
 
+   using ProfileBucketMap = llvm::DenseMap<uint64_t, llvm::SmallVector<const StateMatchProfile*, 8>>;
+   auto appendToBucket = [](ProfileBucketMap& buckets,
+                            llvm::SmallVectorImpl<uint64_t>& bucketOrder,
+                            uint64_t hash,
+                            const StateMatchProfile* profile) {
+      auto it = buckets.find(hash);
+      if (it == buckets.end()) {
+         bucketOrder.push_back(hash);
+         it = buckets.try_emplace(hash).first;
+      }
+      it->second.push_back(profile);
+   };
+
+   ProfileBucketMap profilesByConstructionHash;
+   llvm::SmallVector<uint64_t, 64> constructionHashOrder;
+   for (auto* p : all) {
+      appendToBucket(profilesByConstructionHash, constructionHashOrder, p->constructionHash, p);
+   }
+
+   ProfileBucketMap hivProfilesByRelaxedHash;
+   llvm::SmallVector<uint64_t, 32> hivRelaxedHashOrder;
+   for (auto* p : all) {
+      if (!mlir::isa<subop::HashIndexedViewType>(p->value.getType())) continue;
+      std::string k = makeRelaxedHivKeyStr(*p);
+      uint64_t hash = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
+      appendToBucket(hivProfilesByRelaxedHash, hivRelaxedHashOrder, hash, p);
+   }
+
    llvm::SmallVector<CrossQueryStateMatchPair, 64> out;
    llvm::DenseSet<mlir::Value> matchedStates;
-   for (size_t i = 0; i < all.size(); i++) {
-      for (size_t j = i + 1; j < all.size(); j++) {
-         auto* a = all[i];
-         auto* b = all[j];
-         if (a->queryId == b->queryId) continue;
-         if (matchedStates.contains(a->value) || matchedStates.contains(b->value)) continue;
-         if (mlir::isa<subop::PreAggrHtType>(a->value.getType()) ||
-             mlir::isa<subop::PreAggrHtType>(b->value.getType()))
-            continue;
-         if (a->constructionHash != b->constructionHash) continue;
-         if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
-         if (a->depTokensSorted != b->depTokensSorted) continue;
-         const QueryModel* modelA = modelByQueryId.lookup(a->queryId);
-         const QueryModel* modelB = modelByQueryId.lookup(b->queryId);
-         assert(modelA && modelB && "missing query model for profile");
-         if (mlir::isa<subop::HashIndexedViewType>(a->value.getType()) &&
-             mlir::isa<subop::HashIndexedViewType>(b->value.getType()) &&
-             !complexResidualMatchAllowed(*a, modelA, *b, modelB))
-            continue;
-         if (profilesDefinitelyDisjointByFilters(*a, modelA->reuse, *b, modelB->reuse)) {
-            continue;
+
+   for (uint64_t hash : constructionHashOrder) {
+      auto bucketIt = profilesByConstructionHash.find(hash);
+      assert(bucketIt != profilesByConstructionHash.end());
+      auto& bucket = bucketIt->second;
+      for (size_t i = 0; i < bucket.size(); i++) {
+         for (size_t j = i + 1; j < bucket.size(); j++) {
+            auto* a = bucket[i];
+            auto* b = bucket[j];
+            if (a->queryId == b->queryId) continue;
+            if (matchedStates.contains(a->value) || matchedStates.contains(b->value)) continue;
+            if (mlir::isa<subop::PreAggrHtType>(a->value.getType()) ||
+                mlir::isa<subop::PreAggrHtType>(b->value.getType()))
+               continue;
+            if (a->constructionHash != b->constructionHash) continue;
+            if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
+            if (a->depTokensSorted != b->depTokensSorted) continue;
+            const QueryModel* modelA = modelByQueryId.lookup(a->queryId);
+            const QueryModel* modelB = modelByQueryId.lookup(b->queryId);
+            assert(modelA && modelB && "missing query model for profile");
+            if (mlir::isa<subop::HashIndexedViewType>(a->value.getType()) &&
+                mlir::isa<subop::HashIndexedViewType>(b->value.getType())) {
+               if (a->hasUnsupportedResidualTableFilter || b->hasUnsupportedResidualTableFilter) continue;
+               if (!complexResidualMatchAllowed(*a, modelA, *b, modelB)) continue;
+            }
+            if (profilesDefinitelyDisjointByFilters(*a, modelA->reuse, *b, modelB->reuse)) {
+               continue;
+            }
+
+            std::string k = makeKeyStr(*a);
+            uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
+
+            CrossQueryStateMatchPair p;
+            p.queryA = a->queryId;
+            p.queryB = b->queryId;
+            p.stateA = a->value;
+            p.stateB = b->value;
+            p.cacheKey = cacheKey;
+            out.push_back(p);
+            matchedStates.insert(a->value);
+            matchedStates.insert(b->value);
+            break;
          }
-
-         std::string k = makeKeyStr(*a);
-         uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
-
-         CrossQueryStateMatchPair p;
-         p.queryA = a->queryId;
-         p.queryB = b->queryId;
-         p.stateA = a->value;
-         p.stateB = b->value;
-         p.cacheKey = cacheKey;
-         out.push_back(p);
-         matchedStates.insert(a->value);
-         matchedStates.insert(b->value);
-         break;
       }
    }
 
-   for (size_t i = 0; i < all.size(); i++) {
-      auto* a = all[i];
-      if (matchedStates.contains(a->value)) continue;
-      if (!mlir::isa<subop::HashIndexedViewType>(a->value.getType())) continue;
-      for (size_t j = i + 1; j < all.size(); j++) {
-         auto* b = all[j];
-         if (a->queryId == b->queryId) continue;
-         if (matchedStates.contains(b->value)) continue;
-         if (!mlir::isa<subop::HashIndexedViewType>(b->value.getType())) continue;
-         if (a->hasUnsupportedResidualTableFilter || b->hasUnsupportedResidualTableFilter) continue;
-         if (!a->hasResidualTableFilter && !b->hasResidualTableFilter) continue;
-         if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
-         if (a->depTokensSorted != b->depTokensSorted) continue;
-         const QueryModel* modelA = modelByQueryId.lookup(a->queryId);
-         const QueryModel* modelB = modelByQueryId.lookup(b->queryId);
-         assert(modelA && modelB && "missing query model for HIV relaxed profile");
-         if (!complexResidualMatchAllowed(*a, modelA, *b, modelB)) continue;
-         if (profilesDefinitelyDisjointByFilters(*a, modelA->reuse, *b, modelB->reuse)) continue;
+   for (uint64_t hash : hivRelaxedHashOrder) {
+      auto bucketIt = hivProfilesByRelaxedHash.find(hash);
+      assert(bucketIt != hivProfilesByRelaxedHash.end());
+      auto& bucket = bucketIt->second;
+      for (size_t i = 0; i < bucket.size(); i++) {
+         auto* a = bucket[i];
+         if (matchedStates.contains(a->value)) continue;
+         if (!mlir::isa<subop::HashIndexedViewType>(a->value.getType())) continue;
+         for (size_t j = i + 1; j < bucket.size(); j++) {
+            auto* b = bucket[j];
+            if (a->queryId == b->queryId) continue;
+            if (matchedStates.contains(b->value)) continue;
+            if (!mlir::isa<subop::HashIndexedViewType>(b->value.getType())) continue;
+            if (a->hasUnsupportedResidualTableFilter || b->hasUnsupportedResidualTableFilter) continue;
+            if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
+            if (a->depTokensSorted != b->depTokensSorted) continue;
+            const QueryModel* modelA = modelByQueryId.lookup(a->queryId);
+            const QueryModel* modelB = modelByQueryId.lookup(b->queryId);
+            assert(modelA && modelB && "missing query model for HIV relaxed profile");
+            if (!complexResidualMatchAllowed(*a, modelA, *b, modelB)) continue;
+            if (profilesDefinitelyDisjointByFilters(*a, modelA->reuse, *b, modelB->reuse)) continue;
 
-         std::string k = makeKeyStr(*a) + "@@hiv_relaxed";
-         uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
+            std::string k = makeRelaxedHivKeyStr(*a);
+            uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
 
-         CrossQueryStateMatchPair p;
-         p.queryA = a->queryId;
-         p.queryB = b->queryId;
-         p.stateA = a->value;
-         p.stateB = b->value;
-         p.cacheKey = cacheKey;
-         out.push_back(p);
-         matchedStates.insert(a->value);
-         matchedStates.insert(b->value);
-         break;
+            CrossQueryStateMatchPair p;
+            p.queryA = a->queryId;
+            p.queryB = b->queryId;
+            p.stateA = a->value;
+            p.stateB = b->value;
+            p.cacheKey = cacheKey;
+            out.push_back(p);
+            matchedStates.insert(a->value);
+            matchedStates.insert(b->value);
+            break;
+         }
       }
    }
 
    // Aggregate hash tables match on table/filter dependencies plus group-key identity. Payload value
    // layout is intentionally ignored here; the reuse rewrite computes the payload union later.
-   for (size_t i = 0; i < all.size(); i++) {
-      auto* a = all[i];
-      if (matchedStates.contains(a->value)) continue;
-      if (!mlir::isa<subop::PreAggrHtType>(a->value.getType())) continue;
-      assert(!a->aggregateGroupKeyFingerprint.empty() && "eligible aggregate profile must carry group-key fingerprint");
-      for (size_t j = i + 1; j < all.size(); j++) {
-         auto* b = all[j];
-         if (a->queryId == b->queryId) continue;
-         if (matchedStates.contains(b->value)) continue;
-         if (!mlir::isa<subop::PreAggrHtType>(b->value.getType())) continue;
-         assert(!b->aggregateGroupKeyFingerprint.empty() && "eligible aggregate profile must carry group-key fingerprint");
-         if (aggregateDependencyFingerprint(a->depTokensSorted) !=
-             aggregateDependencyFingerprint(b->depTokensSorted))
-            continue;
-         if (a->aggregateGroupKeyFingerprint != b->aggregateGroupKeyFingerprint) continue;
+   auto aggregateMatchKeyStr = [](const StateMatchProfile& p) -> std::string {
+      return aggregateDependencyFingerprint(p.depTokensSorted) + "@@agg=" + p.aggregateGroupKeyFingerprint;
+   };
+   ProfileBucketMap aggregateProfilesByMatchHash;
+   llvm::SmallVector<uint64_t, 32> aggregateMatchHashOrder;
+   for (auto* p : all) {
+      if (!mlir::isa<subop::PreAggrHtType>(p->value.getType())) continue;
+      assert(!p->aggregateGroupKeyFingerprint.empty() && "eligible aggregate profile must carry group-key fingerprint");
+      std::string k = aggregateMatchKeyStr(*p);
+      uint64_t hash = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
+      appendToBucket(aggregateProfilesByMatchHash, aggregateMatchHashOrder, hash, p);
+   }
+   for (uint64_t hash : aggregateMatchHashOrder) {
+      auto bucketIt = aggregateProfilesByMatchHash.find(hash);
+      assert(bucketIt != aggregateProfilesByMatchHash.end());
+      auto& bucket = bucketIt->second;
+      for (size_t i = 0; i < bucket.size(); i++) {
+         auto* a = bucket[i];
+         if (matchedStates.contains(a->value)) continue;
+         for (size_t j = i + 1; j < bucket.size(); j++) {
+            auto* b = bucket[j];
+            if (a->queryId == b->queryId) continue;
+            if (matchedStates.contains(b->value)) continue;
+            if (aggregateDependencyFingerprint(a->depTokensSorted) !=
+                aggregateDependencyFingerprint(b->depTokensSorted))
+               continue;
+            if (a->aggregateGroupKeyFingerprint != b->aggregateGroupKeyFingerprint) continue;
 
-         std::string k = aggregateDependencyFingerprint(a->depTokensSorted) + "@@agg=" +
-                         a->aggregateGroupKeyFingerprint;
-         uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
+            std::string k = aggregateMatchKeyStr(*a);
+            uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
 
-         CrossQueryStateMatchPair p;
-         p.queryA = a->queryId;
-         p.queryB = b->queryId;
-         p.stateA = a->value;
-         p.stateB = b->value;
-         p.cacheKey = cacheKey;
-         p.enableFilterPredReuse = false;
-         out.push_back(p);
-         matchedStates.insert(a->value);
-         matchedStates.insert(b->value);
-         break;
+            CrossQueryStateMatchPair p;
+            p.queryA = a->queryId;
+            p.queryB = b->queryId;
+            p.stateA = a->value;
+            p.stateB = b->value;
+            p.cacheKey = cacheKey;
+            p.enableFilterPredReuse = false;
+            out.push_back(p);
+            matchedStates.insert(a->value);
+            matchedStates.insert(b->value);
+            break;
+         }
       }
    }
    return out;

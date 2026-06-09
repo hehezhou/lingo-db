@@ -467,11 +467,28 @@ class NotOpLowering : public OpConversionPattern<db::NotOp> {
 class AndOpLowering : public OpConversionPattern<db::AndOp> {
    public:
    using OpConversionPattern<db::AndOp>::OpConversionPattern;
+   static Value stripSameTypeUnrealizedCast(Value v) {
+      if (auto cast = v.getDefiningOp<UnrealizedConversionCastOp>()) {
+         if (cast.getInputs().size() == 1 && cast.getInputs()[0].getType() == v.getType()) return cast.getInputs()[0];
+         auto inInt = mlir::dyn_cast<mlir::IntegerType>(cast.getInputs()[0].getType());
+         auto outInt = mlir::dyn_cast<mlir::IntegerType>(v.getType());
+         if (inInt && outInt && inInt.getWidth() == 1 && outInt.getWidth() == 1) return cast.getInputs()[0];
+      }
+      return v;
+   }
+   static Value normalizeI1(Value v, ConversionPatternRewriter& rewriter, Location loc) {
+      v = stripSameTypeUnrealizedCast(v);
+      auto intTy = mlir::dyn_cast<mlir::IntegerType>(v.getType());
+      if (!intTy || intTy.getWidth() != 1) assert(false && "DB bool lowering expects i1-like value");
+      auto i8Ty = rewriter.getI8Type();
+      Value widened = rewriter.create<arith::ExtUIOp>(loc, i8Ty, v);
+      Value trueValue = rewriter.create<arith::ConstantOp>(loc, rewriter.getIntegerAttr(i8Ty, 1));
+      return rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, widened, trueValue);
+   }
    LogicalResult matchAndRewrite(db::AndOp andOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       Value result;
       Value isNull;
       auto loc = andOp->getLoc();
-      Value falseValue = rewriter.create<arith::ConstantOp>(loc, rewriter.getBoolAttr(false));
 
       for (size_t i = 0; i < adaptor.getVals().size(); i++) {
          auto currType = andOp.getVals()[i].getType();
@@ -480,10 +497,10 @@ class AndOpLowering : public OpConversionPattern<db::AndOp> {
          Value currVal;
          if (currNullable) {
             auto unpacked = unpackNullable(rewriter, loc, adaptor.getVals()[i]);
-            currNull = unpacked.first;
-            currVal = unpacked.second;
+            currNull = normalizeI1(unpacked.first, rewriter, loc);
+            currVal = normalizeI1(unpacked.second, rewriter, loc);
          } else {
-            currVal = adaptor.getVals()[i];
+            currVal = normalizeI1(adaptor.getVals()[i], rewriter, loc);
          }
          if (i == 0) {
             if (currNullable) {
@@ -501,9 +518,12 @@ class AndOpLowering : public OpConversionPattern<db::AndOp> {
                }
             }
             if (currNullable) {
+               result = normalizeI1(result, rewriter, loc);
+               currVal = normalizeI1(currVal, rewriter, loc);
                result = rewriter.create<arith::SelectOp>(loc, currNull, result, rewriter.create<arith::AndIOp>(loc, currVal, result));
             } else {
-               result = rewriter.create<arith::SelectOp>(loc, currVal, result, falseValue);
+               result = normalizeI1(result, rewriter, loc);
+               result = rewriter.create<arith::AndIOp>(loc, currVal, result);
             }
          }
       }
@@ -534,10 +554,10 @@ class OrOpLowering : public OpConversionPattern<db::OrOp> {
          Value currVal;
          if (currNullable) {
             auto unpacked = unpackNullable(rewriter, loc, adaptor.getVals()[i]);
-            currNull = unpacked.first;
-            currVal = unpacked.second;
+            currNull = AndOpLowering::normalizeI1(unpacked.first, rewriter, loc);
+            currVal = AndOpLowering::normalizeI1(unpacked.second, rewriter, loc);
          } else {
-            currVal = adaptor.getVals()[i];
+            currVal = AndOpLowering::normalizeI1(adaptor.getVals()[i], rewriter, loc);
          }
          if (i == 0) {
             if (currNullable) {
@@ -555,8 +575,11 @@ class OrOpLowering : public OpConversionPattern<db::OrOp> {
                }
             }
             if (currNullable) {
+               result = AndOpLowering::normalizeI1(result, rewriter, loc);
+               currVal = AndOpLowering::normalizeI1(currVal, rewriter, loc);
                result = rewriter.create<arith::SelectOp>(loc, currNull, result, rewriter.create<arith::OrIOp>(loc, currVal, result));
             } else {
+               result = AndOpLowering::normalizeI1(result, rewriter, loc);
                result = rewriter.create<arith::OrIOp>(loc, currVal, result);
             }
          }
@@ -833,6 +856,29 @@ class ConstantLowering : public OpConversionPattern<db::ConstantOp> {
 class CmpOpLowering : public OpConversionPattern<db::CmpOp> {
    public:
    using OpConversionPattern<db::CmpOp>::OpConversionPattern;
+   static Value rebuildIntegerConstantWithType(Value v, Type targetType, ConversionPatternRewriter& rewriter,
+                                               Location loc) {
+      auto constOp = v.getDefiningOp<arith::ConstantOp>();
+      if (!constOp) return {};
+      auto intAttr = mlir::dyn_cast<IntegerAttr>(constOp.getValue());
+      if (!intAttr) return {};
+      return rewriter.create<arith::ConstantOp>(loc, rewriter.getIntegerAttr(targetType, intAttr.getValue()));
+   }
+   static void normalizeIntegerCmpOperandTypes(Value& left, Value& right, ConversionPatternRewriter& rewriter,
+                                               Location loc) {
+      if (left.getType() == right.getType()) return;
+      auto leftInt = mlir::dyn_cast<IntegerType>(left.getType());
+      auto rightInt = mlir::dyn_cast<IntegerType>(right.getType());
+      if (!leftInt || !rightInt || leftInt.getWidth() != rightInt.getWidth()) return;
+      if (Value rebuiltRight = rebuildIntegerConstantWithType(right, left.getType(), rewriter, loc)) {
+         right = rebuiltRight;
+         return;
+      }
+      if (Value rebuiltLeft = rebuildIntegerConstantWithType(left, right.getType(), rewriter, loc)) {
+         left = rebuiltLeft;
+         return;
+      }
+   }
    arith::CmpIPredicate translateIPredicate(db::DBCmpPredicate pred) const {
       switch (pred) {
          case db::DBCmpPredicate::eq:
@@ -883,9 +929,18 @@ class CmpOpLowering : public OpConversionPattern<db::CmpOp> {
          return failure();
       }
       if (adaptor.getLeft().getType().isIntOrIndex()) {
-         rewriter.replaceOpWithNewOp<arith::CmpIOp>(cmpOp, translateIPredicate(cmpOp.getPredicate()), adaptor.getLeft(), adaptor.getRight());
+         Value left = adaptor.getLeft();
+         Value right = adaptor.getRight();
+         normalizeIntegerCmpOperandTypes(left, right, rewriter, cmpOp.getLoc());
+         auto replacement = rewriter.create<arith::CmpIOp>(cmpOp.getLoc(), translateIPredicate(cmpOp.getPredicate()),
+                                                           left, right);
+         cmpOp.getResult().replaceAllUsesWith(replacement);
+         rewriter.eraseOp(cmpOp);
       } else {
-         rewriter.replaceOpWithNewOp<arith::CmpFOp>(cmpOp, translateFPredicate(cmpOp.getPredicate()), adaptor.getLeft(), adaptor.getRight());
+         auto replacement = rewriter.create<arith::CmpFOp>(cmpOp.getLoc(), translateFPredicate(cmpOp.getPredicate()),
+                                                           adaptor.getLeft(), adaptor.getRight());
+         cmpOp.getResult().replaceAllUsesWith(replacement);
+         rewriter.eraseOp(cmpOp);
       }
       return success();
    }
@@ -1005,11 +1060,34 @@ class BetweenLowering : public OpConversionPattern<db::BetweenOp> {
    public:
    using OpConversionPattern<db::BetweenOp>::OpConversionPattern;
    LogicalResult matchAndRewrite(db::BetweenOp betweenOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
-      auto isGteLower = rewriter.create<db::CmpOp>(betweenOp->getLoc(), betweenOp.getLowerInclusive() ? db::DBCmpPredicate::gte : db::DBCmpPredicate::gt, betweenOp.getVal(), betweenOp.getLower());
-      auto isLteUpper = rewriter.create<db::CmpOp>(betweenOp->getLoc(), betweenOp.getUpperInclusive() ? db::DBCmpPredicate::lte : db::DBCmpPredicate::lt, betweenOp.getVal(), betweenOp.getUpper());
-      auto isInRange = rewriter.create<db::AndOp>(betweenOp->getLoc(), ValueRange({isGteLower, isLteUpper}));
-      betweenOp.getResult().replaceAllUsesWith(isInRange.getRes());
-      rewriter.eraseOp(betweenOp);
+      auto loc = betweenOp->getLoc();
+      Value valForLower = adaptor.getVal();
+      Value lower = adaptor.getLower();
+      Value valForUpper = adaptor.getVal();
+      Value upper = adaptor.getUpper();
+      if (valForLower.getType().isIntOrIndex()) {
+         CmpOpLowering::normalizeIntegerCmpOperandTypes(valForLower, lower, rewriter, loc);
+         CmpOpLowering::normalizeIntegerCmpOperandTypes(valForUpper, upper, rewriter, loc);
+         auto lowerPred = betweenOp.getLowerInclusive() ? arith::CmpIPredicate::sge
+                                                        : arith::CmpIPredicate::sgt;
+         auto upperPred = betweenOp.getUpperInclusive() ? arith::CmpIPredicate::sle
+                                                        : arith::CmpIPredicate::slt;
+         auto isGteLower = rewriter.create<arith::CmpIOp>(loc, lowerPred, valForLower, lower);
+         auto isLteUpper = rewriter.create<arith::CmpIOp>(loc, upperPred, valForUpper, upper);
+         auto isInRange = rewriter.create<arith::AndIOp>(loc, isGteLower, isLteUpper);
+         betweenOp.getResult().replaceAllUsesWith(isInRange);
+         rewriter.eraseOp(betweenOp);
+      } else {
+         auto lowerPred = betweenOp.getLowerInclusive() ? arith::CmpFPredicate::OGE
+                                                        : arith::CmpFPredicate::OGT;
+         auto upperPred = betweenOp.getUpperInclusive() ? arith::CmpFPredicate::OLE
+                                                        : arith::CmpFPredicate::OLT;
+         auto isGteLower = rewriter.create<arith::CmpFOp>(loc, lowerPred, adaptor.getVal(), adaptor.getLower());
+         auto isLteUpper = rewriter.create<arith::CmpFOp>(loc, upperPred, adaptor.getVal(), adaptor.getUpper());
+         auto isInRange = rewriter.create<arith::AndIOp>(loc, isGteLower, isLteUpper);
+         betweenOp.getResult().replaceAllUsesWith(isInRange);
+         rewriter.eraseOp(betweenOp);
+      }
       return success();
    }
 };
