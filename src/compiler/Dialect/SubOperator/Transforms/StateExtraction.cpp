@@ -43,21 +43,21 @@ namespace lingodb::compiler::dialect::subop {
 
 namespace {
 
+static std::string normalizeMappingMemberName(llvm::StringRef name) {
+   size_t dollar = name.rfind('$');
+   if (dollar == llvm::StringRef::npos || dollar + 1 >= name.size()) return name.str();
+   for (char c : name.drop_front(dollar + 1)) {
+      if (c < '0' || c > '9') return name.str();
+   }
+   return name.take_front(dollar).str();
+}
+
 static std::string renderExternalDataSourceDescrMatchString(
    const lingodb::runtime::ExternalDatasourceProperty& ds,
    llvm::ArrayRef<lingodb::runtime::ExternalDatasourceProperty::Mapping> mapping, bool includeFilters = true) {
    using lingodb::runtime::ExternalDatasourceProperty;
    using lingodb::runtime::FilterDescription;
    using lingodb::runtime::FilterOp;
-
-   auto normalizeMappingMemberName = [](llvm::StringRef name) -> std::string {
-      size_t dollar = name.rfind('$');
-      if (dollar == llvm::StringRef::npos || dollar + 1 >= name.size()) return name.str();
-      for (char c : name.drop_front(dollar + 1)) {
-         if (c < '0' || c > '9') return name.str();
-      }
-      return name.take_front(dollar).str();
-   };
 
    llvm::SmallVector<ExternalDatasourceProperty::Mapping, 8> mappingSorted(mapping.begin(), mapping.end());
    llvm::sort(mappingSorted, [&](const auto& a, const auto& b) {
@@ -1442,7 +1442,7 @@ struct StepDagHasher {
             for (const auto& m : itDs->second.mapping) {
                if (m.memberName == memberName || sanitizeBaseName(m.memberName) == memberNameSan) {
                   h = hashCombineU64(h, hashString(m.identifier));
-                  h = hashCombineU64(h, hashString(m.memberName));
+                  h = hashCombineU64(h, hashString(normalizeMappingMemberName(m.memberName)));
                   found = true;
                   break;
                }
