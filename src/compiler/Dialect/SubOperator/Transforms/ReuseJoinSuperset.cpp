@@ -16,6 +16,7 @@
 #include "lingodb/runtime/ExternalDataSourceProperty.h"
 #include "lingodb/utility/Serialization.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/DenseSet.h"
@@ -75,6 +76,9 @@ static llvm::StringRef normalizeColumnIdentifier(llvm::StringRef identifier) {
 }
 
 static bool isPayloadMemberSlotName(llvm::StringRef name) { return name.starts_with("member$"); }
+static bool isJoinBufferInternalMemberName(llvm::StringRef name) {
+   return name.starts_with("link$") || name.starts_with("hash$");
+}
 
 struct PayloadColumnSpec {
    std::string semanticKey;
@@ -329,7 +333,8 @@ static void collectPayloadFromMaterialize(
    llvm::StringMap<PayloadColumnSpec>& out, std::optional<unsigned> reuseQueryIndex) {
    for (auto& [member, colRef] : mat.getMapping().getMapping()) {
       llvm::StringRef memName = mm.getName(member);
-      if (memName == linkMemberName || memName == hashMemberName) continue;
+      if (memName == linkMemberName || memName == hashMemberName || isJoinBufferInternalMemberName(memName))
+         continue;
       auto [scope, leaf] = cm.getName(&colRef.getColumn());
       PayloadColumnSpec spec;
       spec.colType = colRef.getColumn().type;
@@ -619,7 +624,9 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
 
    llvm::StringMap<PayloadColumnSpec> unionCols;
    auto ingestHiv = [&](mlir::Value h, const ModuleReuseInfo& reuse, unsigned reuseQueryIndex) {
-      auto& cm = h.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+      auto* hCtx = h.getContext();
+      auto& hMm = hCtx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+      auto& hCm = hCtx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
       mlir::Value mergedBuf = resolveJoinMergedBuffer(h, reuseQueryIndex == 0 ? modA : modB, reuse);
       subop::ExecutionStepOp buildStep = findJoinBufferBuildStepForHiv(reuseQueryIndex == 0 ? modA : modB, h, reuse);
       assert(buildStep && "join superset: build step required for ingestHiv");
@@ -628,7 +635,7 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
              !materializeTargetsJoinBuffer(mat, mergedBuf, reuse)) {
             return;
          }
-         collectPayloadFromMaterialize(mat, linkMemberName, hashMemberName, mm, cm, joinKeyMemberName, unionCols,
+         collectPayloadFromMaterialize(mat, linkMemberName, hashMemberName, hMm, hCm, joinKeyMemberName, unionCols,
                                        reuseQueryIndex);
       });
       if (enableFilterPredReuse) {
@@ -686,9 +693,14 @@ static subop::Member allocUnusedPayloadMemberSlot(subop::MemberManager& mm, mlir
 }
 
 static mlir::Type cloneTypeToContext(mlir::Type ty, mlir::MLIRContext* ctx) {
-   if (!ty || ty.getContext() == ctx) return ty;
+   if (!ty) return ty;
    if (auto nullable = mlir::dyn_cast<db::NullableType>(ty))
       return db::NullableType::get(cloneTypeToContext(nullable.getType(), ctx));
+   if (auto tuple = mlir::dyn_cast<mlir::TupleType>(ty)) {
+      llvm::SmallVector<mlir::Type> types;
+      for (mlir::Type elem : tuple.getTypes()) types.push_back(cloneTypeToContext(elem, ctx));
+      return mlir::TupleType::get(ctx, types);
+   }
    if (auto i = mlir::dyn_cast<mlir::IntegerType>(ty)) {
       return mlir::IntegerType::get(ctx, i.getWidth(), i.getSignedness());
    }
@@ -707,6 +719,9 @@ static mlir::Type cloneTypeToContext(mlir::Type ty, mlir::MLIRContext* ctx) {
       return db::IntervalType::get(ctx, iv.getUnit());
    if (auto ref = mlir::dyn_cast<util::RefType>(ty))
       return util::RefType::get(ctx, cloneTypeToContext(ref.getElementType(), ctx));
+   if (auto buf = mlir::dyn_cast<util::BufferType>(ty))
+      return util::BufferType::get(ctx, cloneTypeToContext(buf.getT(), ctx));
+   if (mlir::isa<util::VarLen32Type>(ty)) return util::VarLen32Type::get(ctx);
    llvm_unreachable("cloneTypeToContext: unsupported type for cross-context layout clone");
 }
 
@@ -884,7 +899,7 @@ static void ensureSyntheticMapHasPeerInputs(subop::ExecutionStepOp syntheticBuil
       subop::Member member = tableMemberForIdentifier(tableTy, mm, leaf);
       assert(member && "residual filter rewrite: synthetic table scan must contain peer predicate input");
       tuples::ColumnDefAttr def = synthCm.createDef(scope, leaf);
-      def.getColumn().type = mm.getType(member);
+      def.getColumn().type = cloneTypeToContext(mm.getType(member), ctx);
       gatherPairs.push_back({member, def});
       newInputs.push_back(synthCm.createRef(&def.getColumn()));
    }
@@ -964,9 +979,22 @@ static mlir::Value cloneResidualPredicateExprToSynthetic(mlir::Value v, mlir::IR
    if (auto c = mlir::dyn_cast<db::ConstantOp>(op)) {
       out = b.create<db::ConstantOp>(loc, cloneTypeToContext(c.getType(), ctx),
                                      cloneResidualAttrToContext(c.getValue(), ctx));
+   } else if (auto c = mlir::dyn_cast<mlir::arith::ConstantOp>(op)) {
+      out = b.create<mlir::arith::ConstantOp>(
+         loc, mlir::cast<mlir::TypedAttr>(cloneResidualAttrToContext(c.getValue(), ctx)));
    } else if (auto cast = mlir::dyn_cast<db::CastOp>(op)) {
       out = b.create<db::CastOp>(loc, cloneTypeToContext(cast.getType(), ctx),
                                  cloneResidualPredicateExprToSynthetic(cast.getVal(), mapping, b, ctx));
+   } else if (auto cmpi = mlir::dyn_cast<mlir::arith::CmpIOp>(op)) {
+      out = b.create<mlir::arith::CmpIOp>(
+         loc, cmpi.getPredicate(),
+         cloneResidualPredicateExprToSynthetic(cmpi.getLhs(), mapping, b, ctx),
+         cloneResidualPredicateExprToSynthetic(cmpi.getRhs(), mapping, b, ctx));
+   } else if (auto ori = mlir::dyn_cast<mlir::arith::OrIOp>(op)) {
+      out = b.create<mlir::arith::OrIOp>(
+         loc,
+         cloneResidualPredicateExprToSynthetic(ori.getLhs(), mapping, b, ctx),
+         cloneResidualPredicateExprToSynthetic(ori.getRhs(), mapping, b, ctx));
    } else if (auto cmp = mlir::dyn_cast<db::CmpOp>(op)) {
       out = b.create<db::CmpOp>(
          loc, cmp.getPredicate(),
@@ -1148,71 +1176,49 @@ static void moveSimplePredicateProducerBeforeResidualMap(subop::ExecutionStepOp 
    residualMap->setOperand(0, predMap.getResult());
 }
 
-static void eraseDeadOpsInMapBlock(subop::MapOp map) {
-   mlir::Block& block = map.getFn().front();
-   auto ret = mlir::cast<tuples::ReturnOp>(block.getTerminator());
-   llvm::DenseSet<mlir::Operation*> live;
-   std::function<void(mlir::Value)> markValue = [&](mlir::Value v) {
-      mlir::Operation* def = v.getDefiningOp();
-      if (!def || def->getBlock() != &block || !live.insert(def).second) return;
-      for (mlir::Value operand : def->getOperands()) markValue(operand);
-   };
-   for (mlir::Value v : ret->getOperands()) markValue(v);
-   llvm::SmallVector<mlir::Operation*, 8> erase;
-   for (mlir::Operation& op : block.without_terminator()) {
-      if (!live.contains(&op)) erase.push_back(&op);
-   }
-   for (mlir::Operation* op : erase) op->erase();
+static void replaceRefIfSameColumn(tuples::ColumnRefAttr& ref,
+                                   tuples::ColumnRefAttr oldRef,
+                                   tuples::ColumnRefAttr newRef) {
+   if (ref && &ref.getColumn() == &oldRef.getColumn()) ref = newRef;
 }
 
-static mlir::Value splitResidualPredicateMapResults(subop::MapOp map) {
+static mlir::Value splitResidualPredicateMapResults(subop::MapOp map,
+                                                    tuples::ColumnRefAttr& pred0Ref,
+                                                    tuples::ColumnRefAttr& pred1Ref) {
    if (map.getComputedCols().size() <= 1) return map.getResult();
    auto* ctx = map.getContext();
-   mlir::Block& originalBlock = map.getFn().front();
-   auto originalRet = mlir::cast<tuples::ReturnOp>(originalBlock.getTerminator());
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    llvm::SmallVector<mlir::Attribute> originalComputed(map.getComputedCols().begin(), map.getComputedCols().end());
-   llvm::SmallVector<mlir::Attribute> originalInputs(map.getInputCols().begin(), map.getInputCols().end());
-   llvm::SmallVector<mlir::Value> originalRetVals(originalRet->getOperands().begin(), originalRet->getOperands().end());
-   assert(originalComputed.size() == originalRetVals.size() &&
-          "residual predicate map must return one value per computed column");
 
    mlir::Value stream = map.getResult();
    mlir::Operation* insertAfter = map.getOperation();
    llvm::SmallVector<mlir::Operation*, 4> newMaps;
    for (size_t i = 1; i < originalComputed.size(); ++i) {
+      auto originalDef = mlir::cast<tuples::ColumnDefAttr>(originalComputed[i]);
+      tuples::ColumnRefAttr originalRef = cm.createRef(&originalDef.getColumn());
+      auto [scope, leaf] = cm.getName(&originalDef.getColumn());
+      tuples::ColumnDefAttr splitDef = cm.createDef(cm.getUniqueScope(scope + "$split"), leaf);
+      splitDef.getColumn().type = originalDef.getColumn().type;
+      tuples::ColumnRefAttr splitRef = cm.createRef(&splitDef.getColumn());
+
       mlir::OpBuilder b(insertAfter);
       b.setInsertionPointAfter(insertAfter);
       auto nextMap = b.create<subop::MapOp>(map.getLoc(), tuples::TupleStreamType::get(ctx), stream,
-                                            b.getArrayAttr({originalComputed[i]}),
-                                            mlir::ArrayAttr::get(ctx, originalInputs));
+                                            b.getArrayAttr({splitDef}),
+                                            b.getArrayAttr({originalRef}));
       mlir::Block* block = new mlir::Block();
-      for (mlir::Attribute inputAttr : originalInputs) {
-         auto ref = mlir::cast<tuples::ColumnRefAttr>(inputAttr);
-         block->addArgument(ref.getColumn().type, map.getLoc());
-      }
+      block->addArgument(originalRef.getColumn().type, map.getLoc());
       nextMap.getFn().push_back(block);
-
-      mlir::IRMapping mapping;
-      for (unsigned argIdx = 0; argIdx < originalBlock.getNumArguments(); ++argIdx) {
-         mapping.map(originalBlock.getArgument(argIdx), block->getArgument(argIdx));
-      }
       mlir::OpBuilder rb(ctx);
       rb.setInsertionPointToStart(block);
-      mlir::Value cloned = cloneResidualPredicateExprToSynthetic(originalRetVals[i], mapping, rb, ctx);
-      rb.create<tuples::ReturnOp>(map.getLoc(), mlir::ValueRange{cloned});
+      rb.create<tuples::ReturnOp>(map.getLoc(), mlir::ValueRange{block->getArgument(0)});
+
+      replaceRefIfSameColumn(pred0Ref, originalRef, splitRef);
+      replaceRefIfSameColumn(pred1Ref, originalRef, splitRef);
 
       stream = nextMap.getResult();
       insertAfter = nextMap.getOperation();
       newMaps.push_back(nextMap.getOperation());
-   }
-
-   {
-      mlir::OpBuilder b(originalRet);
-      auto newRet = b.create<tuples::ReturnOp>(originalRet.getLoc(), mlir::ValueRange{originalRetVals.front()});
-      originalRet.erase();
-      (void)newRet;
-      map.setComputedColsAttr(mlir::ArrayAttr::get(ctx, mlir::ArrayRef<mlir::Attribute>{originalComputed.front()}));
-      eraseDeadOpsInMapBlock(map);
    }
 
    map.getResult().replaceUsesWithIf(stream, [&](mlir::OpOperand& use) {
@@ -1256,6 +1262,8 @@ static mlir::Value insertResidualFilterUnionAfterPredicates(mlir::Value stream,
                                            b.getArrayAttr({unionRef}));
    stream.replaceUsesWithIf(filter.getRes(), [&](mlir::OpOperand& use) {
       mlir::Operation* owner = use.getOwner();
+      if (owner->getBlock() != filter->getBlock()) return false;
+      if (!filter->isBeforeInBlock(owner)) return false;
       return owner != map.getOperation() && owner != filter.getOperation();
    });
    return filter.getRes();
@@ -1301,7 +1309,7 @@ static subop::MapOp createResidualPredicateMapAfterTableScan(subop::ExecutionSte
       subop::Member member = tableMemberForIdentifier(tableTy, mm, leaf);
       assert(member && "residual filter rewrite: synthetic table scan must contain peer predicate input");
       tuples::ColumnDefAttr def = synthCm.createDef(scope, leaf);
-      def.getColumn().type = mm.getType(member);
+      def.getColumn().type = cloneTypeToContext(mm.getType(member), ctx);
       gatherPairs.push_back({member, def});
       mapInputs.push_back(synthCm.createRef(&def.getColumn()));
    }
@@ -1371,7 +1379,6 @@ static bool rewriteSyntheticResidualFiltersAsFilterPreds(subop::ExecutionStepOp 
       simplePred1Ref = materializedColumnForMember(mat, predMember1);
       assert(simplePred1Ref && "residual filter rewrite: simple predicate materialize missing for q1");
    }
-
    subop::MapOp syntheticMap = synthResidual ? synthResidual->predMap
                                              : createResidualPredicateMapAfterTableScan(
                                                   syntheticBuild, peerResidual0 ? peerResidual0->predMap
@@ -1401,8 +1408,6 @@ static bool rewriteSyntheticResidualFiltersAsFilterPreds(subop::ExecutionStepOp 
    } else {
       pred0Ref = appendTrueResidualPredicateToSyntheticMap(syntheticMap, pred0);
    }
-   setMaterializeMapping(mat, predMember0, pred0Ref);
-
    tuples::ColumnRefAttr pred1Ref;
    if (peerResidual1) {
       if (synthResidual && peerResidual0 && residualFilterFingerprint(*peerResidual0) ==
@@ -1421,10 +1426,11 @@ static bool rewriteSyntheticResidualFiltersAsFilterPreds(subop::ExecutionStepOp 
    } else {
       pred1Ref = appendTrueResidualPredicateToSyntheticMap(syntheticMap, pred1);
    }
-   setMaterializeMapping(mat, predMember1, pred1Ref);
 
    mlir::Value residualInputStream = syntheticMap.getStream();
-   mlir::Value finalPredicateStream = splitResidualPredicateMapResults(syntheticMap);
+   mlir::Value finalPredicateStream = splitResidualPredicateMapResults(syntheticMap, pred0Ref, pred1Ref);
+   setMaterializeMapping(mat, predMember0, pred0Ref);
+   setMaterializeMapping(mat, predMember1, pred1Ref);
    if (mlir::Operation* finalPredDef = finalPredicateStream.getDefiningOp()) {
       rewireStreamUsesAfterAnchorInStep(residualInputStream, finalPredicateStream, finalPredDef,
                                         llvm::ArrayRef<mlir::Operation*>{finalPredDef});
@@ -1445,7 +1451,8 @@ static void collectSemanticKeyToMemberFromMaterialize(
    lingodb::compiler::dialect::tuples::ColumnManager& cm, llvm::StringMap<subop::Member>& out) {
    if (!mat) return;
    for (auto& [member, colRef] : mat.getMapping().getMapping()) {
-      if (member == linkM || member == hashM) continue;
+      llvm::StringRef memName = mm.getName(member);
+      if (member == linkM || member == hashM || isJoinBufferInternalMemberName(memName)) continue;
       auto [scope, leaf] = cm.getName(&colRef.getColumn());
       if (mm.getType(member) != colRef.getColumn().type) continue;
       out.try_emplace(columnSemanticKey(scope, leaf), member);
@@ -2324,7 +2331,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
       if (!tableMem) return false;
 
       tuples::ColumnDefAttr colDef = cm.createDef(spec.scope, spec.leaf);
-      colDef.getColumn().type = spec.colType;
+      colDef.getColumn().type = cloneTypeToContext(spec.colType, ctx);
 
       // Chain union-only gathers on the current materialize stream (clone build chain + prior
       // union-only gathers), not from hashMapOp each time.

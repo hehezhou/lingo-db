@@ -604,7 +604,7 @@ void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, ll
 
    auto insertCacheGetAtExecutionGroupStart = [&](ExecutionGroupOp group, mlir::Type stateTy, uint64_t key) -> mlir::Value {
       auto loc = group->getLoc();
-      mlir::OpBuilder builder(stateTy.getContext());
+      mlir::OpBuilder builder(group.getContext());
       builder.setInsertionPointToStart(&group.getSubOps().front());
       auto step = builder.create<ExecutionStepOp>(loc, mlir::TypeRange{stateTy}, mlir::ValueRange{},
                                                   builder.getArrayAttr({builder.getBoolAttr(false)}));

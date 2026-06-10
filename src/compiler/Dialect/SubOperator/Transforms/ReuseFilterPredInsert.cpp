@@ -8,6 +8,7 @@
 #include "lingodb/compiler/Dialect/SubOperator/Utils.h"
 #include "lingodb/compiler/Dialect/TupleStream/TupleStreamDialect.h"
 #include "lingodb/compiler/Dialect/DB/IR/DBOps.h"
+#include "lingodb/compiler/Dialect/util/UtilTypes.h"
 #include "lingodb/runtime/ExternalDataSourceProperty.h"
 #include "lingodb/utility/Serialization.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -24,6 +25,44 @@ static std::optional<unsigned> parseFilterPredMemberSlot(llvm::StringRef memberN
    unsigned slot = 0;
    if (memberName.getAsInteger(10, slot)) return std::nullopt;
    return slot;
+}
+
+static mlir::Type cloneFilterPredTypeToContext(mlir::Type ty, mlir::MLIRContext* ctx) {
+   if (!ty) return ty;
+   if (auto nullable = mlir::dyn_cast<lingodb::compiler::dialect::db::NullableType>(ty))
+      return lingodb::compiler::dialect::db::NullableType::get(
+         cloneFilterPredTypeToContext(nullable.getType(), ctx));
+   if (auto tuple = mlir::dyn_cast<mlir::TupleType>(ty)) {
+      llvm::SmallVector<mlir::Type> types;
+      for (mlir::Type elem : tuple.getTypes()) types.push_back(cloneFilterPredTypeToContext(elem, ctx));
+      return mlir::TupleType::get(ctx, types);
+   }
+   if (auto i = mlir::dyn_cast<mlir::IntegerType>(ty))
+      return mlir::IntegerType::get(ctx, i.getWidth(), i.getSignedness());
+   if (mlir::isa<mlir::IndexType>(ty)) return mlir::IndexType::get(ctx);
+   if (auto f = mlir::dyn_cast<mlir::FloatType>(ty)) {
+      if (f.isF64()) return mlir::Float64Type::get(ctx);
+      if (f.isF32()) return mlir::Float32Type::get(ctx);
+      if (f.isF16()) return mlir::Float16Type::get(ctx);
+   }
+   if (auto c = mlir::dyn_cast<lingodb::compiler::dialect::db::CharType>(ty))
+      return lingodb::compiler::dialect::db::CharType::get(ctx, c.getLen());
+   if (mlir::isa<lingodb::compiler::dialect::db::StringType>(ty))
+      return lingodb::compiler::dialect::db::StringType::get(ctx);
+   if (auto d = mlir::dyn_cast<lingodb::compiler::dialect::db::DateType>(ty))
+      return lingodb::compiler::dialect::db::DateType::get(ctx, d.getUnit());
+   if (auto t = mlir::dyn_cast<lingodb::compiler::dialect::db::TimestampType>(ty))
+      return lingodb::compiler::dialect::db::TimestampType::get(ctx, t.getUnit());
+   if (auto dec = mlir::dyn_cast<lingodb::compiler::dialect::db::DecimalType>(ty))
+      return lingodb::compiler::dialect::db::DecimalType::get(ctx, dec.getP(), dec.getS());
+   if (auto ref = mlir::dyn_cast<lingodb::compiler::dialect::util::RefType>(ty))
+      return lingodb::compiler::dialect::util::RefType::get(
+         ctx, cloneFilterPredTypeToContext(ref.getElementType(), ctx));
+   if (auto buf = mlir::dyn_cast<lingodb::compiler::dialect::util::BufferType>(ty))
+      return lingodb::compiler::dialect::util::BufferType::get(ctx, cloneFilterPredTypeToContext(buf.getT(), ctx));
+   if (mlir::isa<lingodb::compiler::dialect::util::VarLen32Type>(ty))
+      return lingodb::compiler::dialect::util::VarLen32Type::get(ctx);
+   llvm_unreachable("filter pred insert: unsupported cross-context column type");
 }
 
 static subop::StateMembersAttr appendMember(mlir::MLIRContext* ctx, subop::StateMembersAttr members,
@@ -1528,7 +1567,7 @@ static subop::GatherOp insertFilterColumnGatherRightAfterScan(
       assert(mem && "write_pred: could not find table member for filter column");
       std::string scope = cm.getUniqueScope("reuse_write_pred_col");
       tuples::ColumnDefAttr def = cm.createDef(scope, f.columnName);
-      def.getColumn().type = mm.getType(mem);
+      def.getColumn().type = cloneFilterPredTypeToContext(mm.getType(mem), ctx);
       mappingPairs.push_back({mem, def});
    }
    if (mappingPairs.empty()) return {};
