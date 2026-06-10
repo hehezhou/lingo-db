@@ -2333,10 +2333,29 @@ static std::optional<size_t> getMixedHashIndexedViewFilterPredIndex(mlir::Type t
 }
 
 static unsigned getMixedHashIndexedViewFilterPredIndex(subop::MixedHashIndexedViewType mixed) {
+   auto packPredMask = [](unsigned predOrdinal, unsigned predSlotCount) {
+      return (predSlotCount << 16) | predOrdinal;
+   };
    llvm::StringRef predMemberName = mixed.getFilterPredMemberName().getValue();
-   if (predMemberName == "filter_pred$0") return 0;
-   if (predMemberName == "filter_pred$1") return 1;
-   assert(false && "mixed HIV predicate bloom index is only reserved for filter_pred$0/$1");
+   auto parsePredSlot = [](llvm::StringRef name) -> std::optional<unsigned> {
+      if (!name.consume_front("filter_pred$")) return std::nullopt;
+      unsigned slot = 0;
+      if (name.getAsInteger(10, slot)) return std::nullopt;
+      return slot;
+   };
+   auto& memberManager = mixed.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   llvm::SmallVector<std::pair<unsigned, subop::Member>, 4> predMembers;
+   for (subop::Member member : mixed.getValueMembers().getMembers()) {
+      if (auto slot = parsePredSlot(memberManager.getName(member))) predMembers.push_back({*slot, member});
+   }
+   llvm::sort(predMembers, [](const auto& a, const auto& b) { return a.first < b.first; });
+   assert(predMembers.size() <= 8 &&
+          "mixed HIV runtime wrapper currently accepts up to 8 physical predicate bloom selectors");
+   for (unsigned i = 0; i < predMembers.size(); ++i) {
+      if (memberManager.getName(predMembers[i].second) == predMemberName)
+         return packPredMask(i, predMembers.size());
+   }
+   assert(false && "mixed HIV predicate member must exist in value members");
    return 0;
 }
 
@@ -3964,19 +3983,32 @@ class CreateHashIndexedViewLowering : public SubOpConversionPattern<subop::Creat
       mlir::Value htView;
       if (mlir::isa<subop::MixedHashIndexedViewType>(createOp.getType())) {
          auto& memberManager = getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-         std::optional<subop::Member> pred0Member;
-         std::optional<subop::Member> pred1Member;
+         auto parsePredSlot = [](llvm::StringRef name) -> std::optional<unsigned> {
+            if (!name.consume_front("filter_pred$")) return std::nullopt;
+            unsigned slot = 0;
+            if (name.getAsInteger(10, slot)) return std::nullopt;
+            return slot;
+         };
+         llvm::SmallVector<std::pair<unsigned, subop::Member>, 4> predMembers;
          for (subop::Member member : bufferType.getMembers().getMembers()) {
-            if (memberManager.getName(member) == "filter_pred$0") pred0Member = member;
-            if (memberManager.getName(member) == "filter_pred$1") pred1Member = member;
+            if (auto slot = parsePredSlot(memberManager.getName(member))) predMembers.push_back({*slot, member});
          }
-         assert(pred0Member && pred1Member && "mixed HIV pred tag build expects filter_pred$0/$1");
-         auto pred0Offset = getStoredMemberByteOffset(bufferType.getMembers(), *pred0Member, typeConverter);
-         auto pred1Offset = getStoredMemberByteOffset(bufferType.getMembers(), *pred1Member, typeConverter);
-         assert(pred0Offset && pred1Offset && "could not compute mixed HIV predicate offsets");
-         auto pred0OffsetVal = rewriter.create<arith::ConstantIndexOp>(createOp->getLoc(), *pred0Offset);
-         auto pred1OffsetVal = rewriter.create<arith::ConstantIndexOp>(createOp->getLoc(), *pred1Offset);
-         htView = rt::HashIndexedView::buildWithPredFlags(rewriter, createOp->getLoc())({adaptor.getSource(), pred0OffsetVal, pred1OffsetVal})[0];
+         llvm::sort(predMembers, [](const auto& a, const auto& b) { return a.first < b.first; });
+         assert(!predMembers.empty() && predMembers.size() <= 8 &&
+                "mixed HIV pred tag build expects 1..8 physical filter_pred members");
+         llvm::SmallVector<mlir::Value, 10> args;
+         args.push_back(adaptor.getSource());
+         args.push_back(rewriter.create<arith::ConstantIndexOp>(createOp->getLoc(), predMembers.size()));
+         for (unsigned i = 0; i < 8; ++i) {
+            size_t offset = 0;
+            if (i < predMembers.size()) {
+               auto predOffset = getStoredMemberByteOffset(bufferType.getMembers(), predMembers[i].second, typeConverter);
+               assert(predOffset && "could not compute mixed HIV predicate offset");
+               offset = *predOffset;
+            }
+            args.push_back(rewriter.create<arith::ConstantIndexOp>(createOp->getLoc(), offset));
+         }
+         htView = rt::HashIndexedView::buildWithPredFlags(rewriter, createOp->getLoc())(args)[0];
       } else {
          htView = rt::HashIndexedView::build(rewriter, createOp->getLoc())({adaptor.getSource()})[0];
       }

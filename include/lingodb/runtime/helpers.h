@@ -17,11 +17,25 @@ namespace lingodb::runtime {
 alignas(4096) extern uint16_t bloomMasks[2048];
 extern bool useFilterPredBloomAdaptation;
 static constexpr uint16_t hashTagMask = 0x3fff;
-static constexpr uint8_t filterPred0Selector = 1;
-static constexpr uint8_t filterPred1Selector = 2;
+static inline uint64_t floorPowerOfTwo(uint64_t v) {
+   if (v == 0) return 0;
+   uint64_t p = 1;
+   while ((p << 1) && (p << 1) <= v) p <<= 1;
+   return p;
+}
 
-static inline uint16_t predBloomTag(size_t hash, uint8_t predIndex) {
-   return bloomMasks[((hash >> (64 - 10)) << 1) | predIndex];
+static inline uint64_t predBloomBucketSize(uint64_t predSlotCount) {
+   if (predSlotCount <= 1) return 2048;
+   uint64_t bucketSize = 2048 / predSlotCount;
+   bucketSize = floorPowerOfTwo(bucketSize);
+   return bucketSize ? bucketSize : 1;
+}
+
+static inline uint16_t predBloomTag(size_t hash, uint64_t predOrdinal, uint64_t predSlotCount) {
+   uint64_t highBits = hash >> (64 - 11);
+   uint64_t bucketSize = predBloomBucketSize(predSlotCount);
+   uint64_t slot = ((highBits & (bucketSize - 1)) * predSlotCount) + predOrdinal;
+   return bloomMasks[slot & 2047];
 }
 
 struct MemoryHelper {
@@ -210,14 +224,16 @@ T* tag(T* ptr, T* previousPtr, size_t hash) {
    return res;
 }
 template <typename T>
-T* tagWithFilterPreds(T* ptr, T* previousPtr, size_t hash, uint8_t predSelectors) {
+T* tagWithFilterPreds(T* ptr, T* previousPtr, size_t hash, uint64_t predSelectors, uint64_t predSlotCount) {
    auto asInt = reinterpret_cast<uintptr_t>(ptr);
    uint16_t previousTag = reinterpret_cast<uintptr_t>(previousPtr);
    uint16_t currentTag = bloomMasks[hash >> (64 - 11)];
    if (useFilterPredBloomAdaptation) {
       currentTag = 0;
-      if (predSelectors & filterPred0Selector) currentTag |= predBloomTag(hash, 0);
-      if (predSelectors & filterPred1Selector) currentTag |= predBloomTag(hash, 1);
+      for (uint64_t predOrdinal = 0; predOrdinal < predSlotCount && predOrdinal < 64; ++predOrdinal) {
+         if (predSelectors & (uint64_t{1} << predOrdinal))
+            currentTag |= predBloomTag(hash, predOrdinal, predSlotCount);
+      }
    }
    return reinterpret_cast<T*>(asInt << 16 | (currentTag | previousTag));
 }
@@ -234,9 +250,12 @@ bool matchesHashTag(T* ptr, size_t hash) {
    return !(tag & ~entry);
 }
 template <typename T>
-bool matchesHashTagMasked(T* ptr, size_t hash, uint8_t predIndex) {
+bool matchesHashTagMasked(T* ptr, size_t hash, uint32_t packedPredMask) {
    uint16_t entry = reinterpret_cast<uintptr_t>(ptr);
-   uint16_t tag = useFilterPredBloomAdaptation ? predBloomTag(hash, predIndex) : bloomMasks[hash >> (64 - 11)];
+   uint64_t predOrdinal = packedPredMask & 0xffff;
+   uint64_t predSlotCount = packedPredMask >> 16;
+   uint16_t tag = useFilterPredBloomAdaptation ? predBloomTag(hash, predOrdinal, predSlotCount)
+                                               : bloomMasks[hash >> (64 - 11)];
    return !(tag & ~entry);
 }
 template <typename T>

@@ -45,6 +45,18 @@ struct CrossQueryStateMatchPair {
    bool enableFilterPredReuse = true;
 };
 
+struct CrossQueryStateMatchEntry {
+   int query = -1;
+   mlir::Value state;
+};
+
+struct CrossQueryStateMatchGroup {
+   uint64_t cacheKey = 0;
+   llvm::SmallVector<CrossQueryStateMatchEntry, 8> entries;
+   /// Per-group: insert union / synthetic / consumer \c filter_pred$N when peer external filters differ.
+   bool enableFilterPredReuse = true;
+};
+
 struct ModuleReuseInfo {
    // Per execution_step: which canonicalized states are read/written.
    struct StepRW {
@@ -102,7 +114,9 @@ void forEachBufferJoinChainPartner(mlir::Value chainRootBuffer, const ModuleReus
 llvm::SmallVector<CrossQueryStateMatchPair, 64>
 collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> queries);
 
+llvm::SmallVector<CrossQueryStateMatchGroup, 64>
+collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> queries);
+
 } // namespace lingodb::compiler::dialect::subop
 
 #endif
-

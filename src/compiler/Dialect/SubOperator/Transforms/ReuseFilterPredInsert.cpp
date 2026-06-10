@@ -155,6 +155,16 @@ bool valueMembersContainMemberNamed(mlir::MLIRContext* ctx, subop::StateMembersA
    return false;
 }
 
+static bool valueMembersContainAnyFilterPred(mlir::MLIRContext* ctx, subop::StateMembersAttr members) {
+   auto* d = ctx->getLoadedDialect<subop::SubOperatorDialect>();
+   assert(d);
+   auto& mm = d->getMemberManager();
+   for (auto m : members.getMembers()) {
+      if (parseFilterPredMemberSlot(mm.getName(m))) return true;
+   }
+   return false;
+}
+
 static mlir::Type extendHashMapTypeWithPred(mlir::Type t, subop::Member predMember);
 static subop::HashIndexedViewType extendHashIndexedViewWithPredMemberIfMissing(mlir::MLIRContext* ctx,
                                                                               subop::HashIndexedViewType hiv,
@@ -164,7 +174,7 @@ static void syncCreateHashIndexedViewResultType(subop::CreateHashIndexedView chi
    mlir::Value src = chiv.getSource();
    auto bufTy = mlir::dyn_cast<subop::BufferType>(src.getType());
    if (!bufTy) return;
-   if (!valueMembersContainMemberNamed(ctx, bufTy.getMembers(), "filter_pred$0")) return;
+   if (!valueMembersContainAnyFilterPred(ctx, bufTy.getMembers())) return;
    subop::Member linkM = chiv.getLinkMember().getMember();
    subop::Member hashM = chiv.getHashMember().getMember();
    llvm::SmallVector<subop::Member> vals;

@@ -977,4 +977,222 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    return res;
 }
 
+BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
+   llvm::ArrayRef<mlir::ModuleOp> queries,
+   llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
+   lingodb::catalog::Catalog* catalog) {
+   (void)catalog;
+   assert(queries.size() >= 2 && "batch reuse needs at least two queries");
+
+   BatchReusePlanRewriteResult res;
+   res.numTargetsPerQuery.resize(queries.size(), 0);
+   res.numTargetsNoTablePerQuery.resize(queries.size(), 0);
+
+   llvm::SmallVector<ModuleReuseInfo, 8> reuseEarly;
+   reuseEarly.reserve(queries.size());
+   for (mlir::ModuleOp q : queries) reuseEarly.push_back(collectModuleReuseInfo(q));
+
+   llvm::SmallVector<llvm::SmallVector<CacheTarget, 16>, 8> targetsByQuery(queries.size());
+   struct DonorGroup {
+      const CrossQueryStateMatchGroup* group = nullptr;
+      int donorQuery = -1;
+      mlir::Value donorState;
+      CacheTarget donorTarget;
+   };
+   llvm::SmallVector<DonorGroup, 32> donorGroups;
+   llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>> consumerSlotByCacheKeyAndQuery;
+
+   auto countNoTable = [](llvm::ArrayRef<CacheTarget> targets) -> size_t {
+      size_t n = 0;
+      for (const CacheTarget& t : targets) {
+         if (!mlir::isa<TableType>(t.state.getType())) n++;
+      }
+      return n;
+   };
+
+   for (const CrossQueryStateMatchGroup& g : groups) {
+      if (g.entries.size() < 2) continue;
+      const CrossQueryStateMatchEntry* donor = nullptr;
+      for (const CrossQueryStateMatchEntry& e : g.entries) {
+         if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
+         if (!e.state) continue;
+         if (!donor || e.query < donor->query) donor = &e;
+      }
+      if (!donor) continue;
+
+      mlir::Value donorTargetState =
+         resolveCacheTargetStateForReuse(donor->state, reuseEarly[donor->query]);
+      assert(donorTargetState && "batch reuse donor target must resolve");
+      assert(!mlir::isa<ThreadLocalType>(donorTargetState.getType()) &&
+             "batch reuse must never target thread_local-wrapped states");
+
+      donorGroups.push_back(DonorGroup{
+         &g, donor->query, donor->state,
+         CacheTarget{donorTargetState, g.cacheKey, g.enableFilterPredReuse}});
+
+      for (const CrossQueryStateMatchEntry& e : g.entries) {
+         if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
+         mlir::Value targetState = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
+         assert(targetState && "batch reuse consumer target must resolve");
+         assert(!mlir::isa<ThreadLocalType>(targetState.getType()) &&
+                "batch reuse must never target thread_local-wrapped states");
+         targetsByQuery[e.query].push_back(CacheTarget{targetState, g.cacheKey, g.enableFilterPredReuse});
+         consumerSlotByCacheKeyAndQuery[g.cacheKey][static_cast<unsigned>(e.query)] =
+            static_cast<unsigned>(e.query);
+      }
+   }
+
+   for (size_t i = 0; i < targetsByQuery.size(); ++i) {
+      res.numTargetsPerQuery[i] = targetsByQuery[i].size();
+      res.numTargetsNoTablePerQuery[i] = countNoTable(targetsByQuery[i]);
+   }
+   if (donorGroups.empty()) return res;
+
+   mlir::ModuleOp firstQuery = queries.front();
+   mlir::MLIRContext* ctx = firstQuery.getContext();
+   res.synthetic = mlir::OwningOpRef<mlir::ModuleOp>(mlir::ModuleOp::create(mlir::UnknownLoc::get(ctx)));
+
+   auto firstGroup = getSingleExecutionGroup(firstQuery);
+   auto firstMain = firstQuery.lookupSymbol<mlir::func::FuncOp>("main");
+   assert(firstMain && "expected func @main");
+
+   auto synthMain = mlir::func::FuncOp::create(firstMain.getLoc(), "main", firstMain.getFunctionType());
+   res.synthetic->push_back(synthMain);
+   auto* entry = synthMain.addEntryBlock();
+   mlir::OpBuilder fb = mlir::OpBuilder::atBlockBegin(entry);
+   auto synthGroup = fb.create<ExecutionGroupOp>(firstGroup.getLoc(), mlir::TypeRange{}, mlir::ValueRange{});
+   auto& synthBlock = synthGroup.getSubOps().emplaceBlock();
+   mlir::OpBuilder gb = mlir::OpBuilder::atBlockBegin(&synthBlock);
+   gb.create<ExecutionGroupReturnOp>(firstGroup.getLoc(), mlir::ValueRange{});
+   fb.create<mlir::func::ReturnOp>(firstMain.getLoc());
+
+   llvm::SmallVector<CacheTarget, 64> targetsSynthetic;
+   llvm::SmallVector<mlir::IRMapping, 8> donorMappings(queries.size());
+
+   for (size_t qi = 0; qi < queries.size(); ++qi) {
+      llvm::SmallVector<CacheTarget, 16> donorTargets;
+      for (const DonorGroup& dg : donorGroups) {
+         if (static_cast<size_t>(dg.donorQuery) == qi) donorTargets.push_back(dg.donorTarget);
+      }
+      if (donorTargets.empty()) continue;
+
+      ExecutionGroupOp donorGroup = getSingleExecutionGroup(queries[qi]);
+      llvm::DenseSet<mlir::Value> neededStates = expandNeededStatesFromTargets(donorTargets, reuseEarly[qi]);
+      llvm::SmallVector<ExecutionStepOp, 32> stepsToClone =
+         collectCreateAndWriteStepsForStates(donorGroup, reuseEarly[qi], neededStates);
+      stepsToClone = augmentStepsWithOperandProducerClosure(donorGroup, stepsToClone);
+      donorMappings[qi] = cloneExecutionStepsToQuery0(synthGroup, stepsToClone);
+
+      for (const CacheTarget& t : donorTargets) {
+         mlir::Value mapped = donorMappings[qi].lookupOrNull(t.state);
+         if (!mapped && !t.state.getDefiningOp()) {
+            if (auto itW = reuseEarly[qi].writerStepsByState.find(t.state);
+                itW != reuseEarly[qi].writerStepsByState.end() && !itW->second.empty()) {
+               auto lastWriter = itW->second.back();
+               if (lastWriter.getNumResults() == 1) mapped = donorMappings[qi].lookupOrNull(lastWriter.getResult(0));
+            }
+         }
+         assert(mapped && "batch reuse target must map into synthetic module");
+         targetsSynthetic.push_back(CacheTarget{mapped, t.cacheKey, t.enableFilterPredReuse});
+      }
+   }
+
+   res.numTargetsSyntheticMapped = targetsSynthetic.size();
+   res.numTargetsSyntheticMappedNoTable = countNoTable(targetsSynthetic);
+   if (targetsSynthetic.empty()) return res;
+
+   auto reuseSynthetic = collectModuleReuseInfo(*res.synthetic);
+   ClonedJoinBufferBuildSitesByKey joinBuildSites =
+      recordClonedJoinBufferBuildSites(*res.synthetic, targetsSynthetic, reuseSynthetic);
+
+   CachedJoinBufferLayoutsByKey producerLayoutsByKey;
+   CachedAggregateLayoutsByKey aggregateLayoutsByKey;
+
+   extendSyntheticJoinBuffersToColumnUnionForGroups(*res.synthetic, queries, groups, targetsSynthetic,
+                                                    &producerLayoutsByKey);
+
+   // TODO(batch-reuse): generalize aggregate payload union to true N-way groups. Join-buffer reuse
+   // already materializes per-query filter_pred$N slots for all group entries above.
+   for (const DonorGroup& dg : donorGroups) {
+      const CrossQueryStateMatchEntry* firstPeer = nullptr;
+      for (const CrossQueryStateMatchEntry& e : dg.group->entries) {
+         if (e.query == dg.donorQuery) continue;
+         if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
+         firstPeer = &e;
+         break;
+      }
+      if (!firstPeer) continue;
+      CrossQueryStateMatchPair pair;
+      pair.queryA = dg.donorQuery;
+      pair.queryB = firstPeer->query;
+      pair.stateA = dg.donorState;
+      pair.stateB = firstPeer->state;
+      pair.cacheKey = dg.group->cacheKey;
+      pair.enableFilterPredReuse = dg.group->enableFilterPredReuse;
+      llvm::SmallVector<CrossQueryStateMatchPair, 1> pairMatches{pair};
+      const mlir::IRMapping& donorMapping = donorMappings[dg.donorQuery];
+      extendSyntheticAggregateHashTablesToPayloadUnion(*res.synthetic, queries[dg.donorQuery],
+                                                       queries[firstPeer->query], pairMatches, targetsSynthetic,
+                                                       donorMapping, &aggregateLayoutsByKey);
+   }
+
+   insertSyntheticFilterPredsAfterColumnUnionForGroups(*res.synthetic, queries, groups, targetsSynthetic,
+                                                       producerLayoutsByKey, joinBuildSites);
+
+   {
+      auto reuseSyntheticAfterLayout = collectModuleReuseInfo(*res.synthetic);
+      llvm::SmallVector<CacheTarget, 64> cachePutTargets;
+      cachePutTargets.reserve(targetsSynthetic.size());
+      for (const CacheTarget& t : targetsSynthetic) {
+         cachePutTargets.push_back(CacheTarget{t.state, t.cacheKey, /*enableFilterPredReuse=*/false});
+      }
+      insertCachePutsForTargets(*res.synthetic, cachePutTargets, &reuseSyntheticAfterLayout);
+      refreshCachedJoinLayoutsFromSyntheticCachePuts(*res.synthetic, targetsSynthetic, producerLayoutsByKey);
+   }
+
+   llvm::SmallVector<llvm::SmallVector<ConsumerCacheGetProbeClosure, 4>, 8> probeClosuresByQuery(queries.size());
+   for (size_t qi = 0; qi < queries.size(); ++qi) {
+      injectCacheGetsAndDeleteConstructionSteps(queries[qi], targetsByQuery[qi], &reuseEarly[qi],
+                                                /*joinBufferHashmapLayoutAlreadyApplied=*/true,
+                                                /*joinBufferWritePredAlreadyApplied=*/true);
+      for (const CacheTarget& t : targetsByQuery[qi]) {
+         if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
+            unsigned slot = static_cast<unsigned>(qi);
+            if (auto itByQuery = consumerSlotByCacheKeyAndQuery.find(t.cacheKey);
+                itByQuery != consumerSlotByCacheKeyAndQuery.end()) {
+               if (auto itSlot = itByQuery->second.find(static_cast<unsigned>(qi));
+                   itSlot != itByQuery->second.end()) {
+                  slot = itSlot->second;
+               }
+            }
+            std::optional<unsigned> consumerQ =
+               t.enableFilterPredReuse ? std::optional<unsigned>(slot) : std::nullopt;
+            alignConsumerModulesToCachedJoinLayout(queries[qi], it->second, t.cacheKey, consumerQ,
+                                                   &probeClosuresByQuery[qi]);
+         }
+         if (auto it = aggregateLayoutsByKey.find(t.cacheKey); it != aggregateLayoutsByKey.end()) {
+            unsigned slot = static_cast<unsigned>(qi);
+            if (auto itByQuery = consumerSlotByCacheKeyAndQuery.find(t.cacheKey);
+                itByQuery != consumerSlotByCacheKeyAndQuery.end()) {
+               if (auto itSlot = itByQuery->second.find(static_cast<unsigned>(qi));
+                   itSlot != itByQuery->second.end()) {
+                  slot = itSlot->second;
+               }
+            }
+            alignConsumerModulesToCachedAggregateLayout(queries[qi], it->second, t.cacheKey, slot);
+         }
+      }
+      for (const CacheTarget& t : targetsByQuery[qi]) {
+         resyncConsumerCachedHivCarrierTypesFromCacheGet(queries[qi], t.cacheKey);
+      }
+      for (ConsumerCacheGetProbeClosure& probe : probeClosuresByQuery[qi]) {
+         finalizeConsumerCachedJoinProbeColumnAttrs(queries[qi], probe);
+      }
+      syncProbeGatherMappingsInModule(queries[qi]);
+      applyProbePredFiltersForConsumerClosures(queries[qi], probeClosuresByQuery[qi]);
+   }
+
+   return res;
+}
+
 } // namespace lingodb::compiler::dialect::subop

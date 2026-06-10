@@ -29,6 +29,14 @@ struct ReusePlanRewriteResult {
    size_t numTargetsQuery0MappedNoTable = 0;
 };
 
+struct BatchReusePlanRewriteResult {
+   mlir::OwningOpRef<mlir::ModuleOp> synthetic;
+   llvm::SmallVector<size_t, 8> numTargetsPerQuery;
+   llvm::SmallVector<size_t, 8> numTargetsNoTablePerQuery;
+   size_t numTargetsSyntheticMapped = 0;
+   size_t numTargetsSyntheticMappedNoTable = 0;
+};
+
 // Three-stage pipeline:
 // 1) analysis: provided by StateExtraction (collectModuleReuseInfo, buildStateMatchProfiles)
 // 2) match: provided by StateExtraction (collectCrossQueryStateMatchPairs)
@@ -40,6 +48,11 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    mlir::ModuleOp query0,
    mlir::ModuleOp query1,
    llvm::ArrayRef<CrossQueryStateMatchPair> matches,
+   lingodb::catalog::Catalog* catalog = nullptr);
+
+BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
+   llvm::ArrayRef<mlir::ModuleOp> queries,
+   llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
    lingodb::catalog::Catalog* catalog = nullptr);
 
 /// \p reuseBeforeMutation must reflect the module **before** `rewriteHashmapTypesInModule` runs on

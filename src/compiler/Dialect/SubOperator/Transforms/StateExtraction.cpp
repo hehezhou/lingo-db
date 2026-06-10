@@ -50,8 +50,22 @@ static std::string renderExternalDataSourceDescrMatchString(
    using lingodb::runtime::FilterDescription;
    using lingodb::runtime::FilterOp;
 
+   auto normalizeMappingMemberName = [](llvm::StringRef name) -> std::string {
+      size_t dollar = name.rfind('$');
+      if (dollar == llvm::StringRef::npos || dollar + 1 >= name.size()) return name.str();
+      for (char c : name.drop_front(dollar + 1)) {
+         if (c < '0' || c > '9') return name.str();
+      }
+      return name.take_front(dollar).str();
+   };
+
    llvm::SmallVector<ExternalDatasourceProperty::Mapping, 8> mappingSorted(mapping.begin(), mapping.end());
-   llvm::sort(mappingSorted, [](const auto& a, const auto& b) { return a.memberName < b.memberName; });
+   llvm::sort(mappingSorted, [&](const auto& a, const auto& b) {
+      std::string am = normalizeMappingMemberName(a.memberName);
+      std::string bm = normalizeMappingMemberName(b.memberName);
+      if (am != bm) return am < bm;
+      return a.identifier < b.identifier;
+   });
 
    llvm::SmallVector<FilterDescription, 8> filters;
    if (includeFilters) {
@@ -114,7 +128,7 @@ static std::string renderExternalDataSourceDescrMatchString(
    ss << ";mapping=[";
    for (size_t i = 0; i < mappingSorted.size(); i++) {
       if (i) ss << ",";
-      ss << mappingSorted[i].memberName << "->" << mappingSorted[i].identifier;
+      ss << normalizeMappingMemberName(mappingSorted[i].memberName) << "->" << mappingSorted[i].identifier;
    }
    ss << "]";
    auto renderFilterList = [&](llvm::ArrayRef<FilterDescription> list) {
@@ -3486,77 +3500,20 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       }
    }
 
-   // O(n^2) pair enumeration. Time is not important; avoids building giant string keys.
-   llvm::SmallVector<const StateMatchProfile*, 256> all;
-   llvm::DenseMap<int, const QueryModel*> modelByQueryId;
-   for (auto& m : models) {
-      modelByQueryId[m.id] = &m;
-      for (auto& p : m.profiles) {
-         if (!p.eligible) continue;
-         all.push_back(&p);
-      }
-   }
-
    mlir::OpPrintingFlags flags;
+   llvm::SmallVector<CrossQueryStateMatchGroup, 64> groups = collectCrossQueryStateMatchGroups(queries);
    size_t printed = 0;
-   for (size_t i = 0; i < all.size(); i++) {
-      for (size_t j = i + 1; j < all.size(); j++) {
-         auto* a = all[i];
-         auto* b = all[j];
-         if (a->queryId == b->queryId) continue;
-         if (mlir::isa<subop::PreAggrHtType>(a->value.getType()) ||
-             mlir::isa<subop::PreAggrHtType>(b->value.getType()))
-            continue;
-         if (a->constructionHash != b->constructionHash) continue;
-         if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
-         if (a->depTokensSorted != b->depTokensSorted) continue;
-         const QueryModel* modelA = modelByQueryId.lookup(a->queryId);
-         const QueryModel* modelB = modelByQueryId.lookup(b->queryId);
-         assert(modelA && modelB && "missing query model for profile");
-         if (profilesDefinitelyDisjointByFilters(*a, modelA->reuse, *b, modelB->reuse)) {
-            continue;
-         }
-
-         os << "\n// -- match_pair --\n";
-         os << "//   query[" << a->queryId << "] ";
-         a->value.printAsOperand(os, flags);
+   for (const CrossQueryStateMatchGroup& g : groups) {
+      os << "\n// -- match_group cache_key=" << g.cacheKey
+         << " filter_pred_reuse=" << (g.enableFilterPredReuse ? "true" : "false") << " --\n";
+      for (const CrossQueryStateMatchEntry& e : g.entries) {
+         os << "//   query[" << e.query << "] ";
+         e.state.printAsOperand(os, flags);
          os << "\n";
-         os << "//   query[" << b->queryId << "] ";
-         b->value.printAsOperand(os, flags);
-         os << "\n";
-         printed++;
-         if (printed >= 100) {
-            os << "\n// ... truncated match_pairs (max 100) ...\n";
-            return;
-         }
       }
-   }
-   for (size_t i = 0; i < all.size(); i++) {
-      for (size_t j = i + 1; j < all.size(); j++) {
-         auto* a = all[i];
-         auto* b = all[j];
-         if (a->queryId == b->queryId) continue;
-         if (!mlir::isa<subop::PreAggrHtType>(a->value.getType())) continue;
-         if (!mlir::isa<subop::PreAggrHtType>(b->value.getType())) continue;
-         assert(!a->aggregateGroupKeyFingerprint.empty() && "eligible aggregate profile must carry group-key fingerprint");
-         assert(!b->aggregateGroupKeyFingerprint.empty() && "eligible aggregate profile must carry group-key fingerprint");
-         if (aggregateDependencyFingerprint(a->depTokensSorted) !=
-             aggregateDependencyFingerprint(b->depTokensSorted))
-            continue;
-         if (a->aggregateGroupKeyFingerprint != b->aggregateGroupKeyFingerprint) continue;
-
-         os << "\n// -- match_pair aggregate --\n";
-         os << "//   query[" << a->queryId << "] ";
-         a->value.printAsOperand(os, flags);
-         os << "\n";
-         os << "//   query[" << b->queryId << "] ";
-         b->value.printAsOperand(os, flags);
-         os << "\n";
-         printed++;
-         if (printed >= 100) {
-            os << "\n// ... truncated match_pairs (max 100) ...\n";
-            return;
-         }
+      if (++printed >= 100) {
+         os << "\n// ... truncated match_groups (max 100) ...\n";
+         return;
       }
    }
    if (printed == 0) os << "// (no matches)\n";
@@ -3566,8 +3523,8 @@ ModuleReuseInfo collectModuleReuseInfo(mlir::ModuleOp moduleOp) {
    return analyzeModuleForMatchAndReuse(moduleOp).reuse;
 }
 
-llvm::SmallVector<CrossQueryStateMatchPair, 64>
-collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> queries) {
+llvm::SmallVector<CrossQueryStateMatchGroup, 64>
+collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> queries) {
    assert(queries.size() >= 2 && "need at least two modules to compare");
 
    struct QueryModel {
@@ -3652,91 +3609,98 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       appendToBucket(hivProfilesByRelaxedHash, hivRelaxedHashOrder, hash, p);
    }
 
-   llvm::SmallVector<CrossQueryStateMatchPair, 64> out;
+   llvm::SmallVector<CrossQueryStateMatchGroup, 64> out;
    llvm::DenseSet<mlir::Value> matchedStates;
+
+   auto appendGroupFromBucket = [&](llvm::ArrayRef<const StateMatchProfile*> bucket,
+                                    llvm::function_ref<bool(const StateMatchProfile&)> seedOk,
+                                    llvm::function_ref<bool(const StateMatchProfile&, const StateMatchProfile&)> peerOk,
+                                    llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
+                                    bool enableFilterPredReuse) {
+      for (size_t i = 0; i < bucket.size(); i++) {
+         auto* a = bucket[i];
+         if (matchedStates.contains(a->value)) continue;
+         if (!seedOk(*a)) continue;
+
+         llvm::SmallVector<const StateMatchProfile*, 8> members;
+         members.push_back(a);
+         llvm::DenseSet<int> seenQueries;
+         seenQueries.insert(a->queryId);
+         for (size_t j = i + 1; j < bucket.size(); j++) {
+            auto* b = bucket[j];
+            if (matchedStates.contains(b->value)) continue;
+            if (seenQueries.contains(b->queryId)) continue;
+            if (!peerOk(*a, *b)) continue;
+            members.push_back(b);
+            seenQueries.insert(b->queryId);
+         }
+         if (members.size() < 2) continue;
+
+         std::string k = keyForSeed(*a);
+         uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
+
+         CrossQueryStateMatchGroup g;
+         g.cacheKey = cacheKey;
+         g.enableFilterPredReuse = enableFilterPredReuse;
+         for (const StateMatchProfile* p : members) {
+            g.entries.push_back(CrossQueryStateMatchEntry{p->queryId, p->value});
+            matchedStates.insert(p->value);
+         }
+         out.push_back(std::move(g));
+      }
+   };
 
    for (uint64_t hash : constructionHashOrder) {
       auto bucketIt = profilesByConstructionHash.find(hash);
       assert(bucketIt != profilesByConstructionHash.end());
       auto& bucket = bucketIt->second;
-      for (size_t i = 0; i < bucket.size(); i++) {
-         for (size_t j = i + 1; j < bucket.size(); j++) {
-            auto* a = bucket[i];
-            auto* b = bucket[j];
-            if (a->queryId == b->queryId) continue;
-            if (matchedStates.contains(a->value) || matchedStates.contains(b->value)) continue;
-            if (mlir::isa<subop::PreAggrHtType>(a->value.getType()) ||
-                mlir::isa<subop::PreAggrHtType>(b->value.getType()))
-               continue;
-            if (a->constructionHash != b->constructionHash) continue;
-            if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
-            if (a->depTokensSorted != b->depTokensSorted) continue;
-            const QueryModel* modelA = modelByQueryId.lookup(a->queryId);
-            const QueryModel* modelB = modelByQueryId.lookup(b->queryId);
+      appendGroupFromBucket(
+         bucket,
+         [](const StateMatchProfile& p) {
+            return !mlir::isa<subop::PreAggrHtType>(p.value.getType());
+         },
+         [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+            if (mlir::isa<subop::PreAggrHtType>(b.value.getType())) return false;
+            if (a.constructionHash != b.constructionHash) return false;
+            if (a.typeFingerprintStr != b.typeFingerprintStr) return false;
+            if (a.depTokensSorted != b.depTokensSorted) return false;
+            const QueryModel* modelA = modelByQueryId.lookup(a.queryId);
+            const QueryModel* modelB = modelByQueryId.lookup(b.queryId);
             assert(modelA && modelB && "missing query model for profile");
-            if (mlir::isa<subop::HashIndexedViewType>(a->value.getType()) &&
-                mlir::isa<subop::HashIndexedViewType>(b->value.getType())) {
-               if (a->hasUnsupportedResidualTableFilter || b->hasUnsupportedResidualTableFilter) continue;
-               if (!complexResidualMatchAllowed(*a, modelA, *b, modelB)) continue;
+            if (mlir::isa<subop::HashIndexedViewType>(a.value.getType()) &&
+                mlir::isa<subop::HashIndexedViewType>(b.value.getType())) {
+               if (a.hasUnsupportedResidualTableFilter || b.hasUnsupportedResidualTableFilter) return false;
+               if (!complexResidualMatchAllowed(a, modelA, b, modelB)) return false;
             }
-            if (profilesDefinitelyDisjointByFilters(*a, modelA->reuse, *b, modelB->reuse)) {
-               continue;
-            }
-
-            std::string k = makeKeyStr(*a);
-            uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
-
-            CrossQueryStateMatchPair p;
-            p.queryA = a->queryId;
-            p.queryB = b->queryId;
-            p.stateA = a->value;
-            p.stateB = b->value;
-            p.cacheKey = cacheKey;
-            out.push_back(p);
-            matchedStates.insert(a->value);
-            matchedStates.insert(b->value);
-            break;
-         }
-      }
+            // TODO(batch-reuse): Restore filter-disjoint pruning as part of clustering / reuse cost modeling.
+            (void)profilesDefinitelyDisjointByFilters;
+            return true;
+         },
+         makeKeyStr, /*enableFilterPredReuse=*/true);
    }
 
    for (uint64_t hash : hivRelaxedHashOrder) {
       auto bucketIt = hivProfilesByRelaxedHash.find(hash);
       assert(bucketIt != hivProfilesByRelaxedHash.end());
       auto& bucket = bucketIt->second;
-      for (size_t i = 0; i < bucket.size(); i++) {
-         auto* a = bucket[i];
-         if (matchedStates.contains(a->value)) continue;
-         if (!mlir::isa<subop::HashIndexedViewType>(a->value.getType())) continue;
-         for (size_t j = i + 1; j < bucket.size(); j++) {
-            auto* b = bucket[j];
-            if (a->queryId == b->queryId) continue;
-            if (matchedStates.contains(b->value)) continue;
-            if (!mlir::isa<subop::HashIndexedViewType>(b->value.getType())) continue;
-            if (a->hasUnsupportedResidualTableFilter || b->hasUnsupportedResidualTableFilter) continue;
-            if (a->typeFingerprintStr != b->typeFingerprintStr) continue;
-            if (a->depTokensSorted != b->depTokensSorted) continue;
-            const QueryModel* modelA = modelByQueryId.lookup(a->queryId);
-            const QueryModel* modelB = modelByQueryId.lookup(b->queryId);
+      appendGroupFromBucket(
+         bucket,
+         [](const StateMatchProfile& p) {
+            return mlir::isa<subop::HashIndexedViewType>(p.value.getType());
+         },
+         [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+            if (!mlir::isa<subop::HashIndexedViewType>(b.value.getType())) return false;
+            if (a.hasUnsupportedResidualTableFilter || b.hasUnsupportedResidualTableFilter) return false;
+            if (a.typeFingerprintStr != b.typeFingerprintStr) return false;
+            if (a.depTokensSorted != b.depTokensSorted) return false;
+            const QueryModel* modelA = modelByQueryId.lookup(a.queryId);
+            const QueryModel* modelB = modelByQueryId.lookup(b.queryId);
             assert(modelA && modelB && "missing query model for HIV relaxed profile");
-            if (!complexResidualMatchAllowed(*a, modelA, *b, modelB)) continue;
-            if (profilesDefinitelyDisjointByFilters(*a, modelA->reuse, *b, modelB->reuse)) continue;
-
-            std::string k = makeRelaxedHivKeyStr(*a);
-            uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
-
-            CrossQueryStateMatchPair p;
-            p.queryA = a->queryId;
-            p.queryB = b->queryId;
-            p.stateA = a->value;
-            p.stateB = b->value;
-            p.cacheKey = cacheKey;
-            out.push_back(p);
-            matchedStates.insert(a->value);
-            matchedStates.insert(b->value);
-            break;
-         }
-      }
+            if (!complexResidualMatchAllowed(a, modelA, b, modelB)) return false;
+            // TODO(batch-reuse): Restore filter-disjoint pruning as part of clustering / reuse cost modeling.
+            return true;
+         },
+         makeRelaxedHivKeyStr, /*enableFilterPredReuse=*/true);
    }
 
    // Aggregate hash tables match on table/filter dependencies plus group-key identity. Payload value
@@ -3757,33 +3721,37 @@ collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       auto bucketIt = aggregateProfilesByMatchHash.find(hash);
       assert(bucketIt != aggregateProfilesByMatchHash.end());
       auto& bucket = bucketIt->second;
-      for (size_t i = 0; i < bucket.size(); i++) {
-         auto* a = bucket[i];
-         if (matchedStates.contains(a->value)) continue;
-         for (size_t j = i + 1; j < bucket.size(); j++) {
-            auto* b = bucket[j];
-            if (a->queryId == b->queryId) continue;
-            if (matchedStates.contains(b->value)) continue;
-            if (aggregateDependencyFingerprint(a->depTokensSorted) !=
-                aggregateDependencyFingerprint(b->depTokensSorted))
-               continue;
-            if (a->aggregateGroupKeyFingerprint != b->aggregateGroupKeyFingerprint) continue;
+      appendGroupFromBucket(
+         bucket,
+         [](const StateMatchProfile& p) {
+            return mlir::isa<subop::PreAggrHtType>(p.value.getType());
+         },
+         [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+            if (!mlir::isa<subop::PreAggrHtType>(b.value.getType())) return false;
+            if (aggregateDependencyFingerprint(a.depTokensSorted) !=
+                aggregateDependencyFingerprint(b.depTokensSorted))
+               return false;
+            return a.aggregateGroupKeyFingerprint == b.aggregateGroupKeyFingerprint;
+         },
+         aggregateMatchKeyStr, /*enableFilterPredReuse=*/false);
+   }
+   return out;
+}
 
-            std::string k = aggregateMatchKeyStr(*a);
-            uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
-
-            CrossQueryStateMatchPair p;
-            p.queryA = a->queryId;
-            p.queryB = b->queryId;
-            p.stateA = a->value;
-            p.stateB = b->value;
-            p.cacheKey = cacheKey;
-            p.enableFilterPredReuse = false;
-            out.push_back(p);
-            matchedStates.insert(a->value);
-            matchedStates.insert(b->value);
-            break;
-         }
+llvm::SmallVector<CrossQueryStateMatchPair, 64>
+collectCrossQueryStateMatchPairs(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> queries) {
+   llvm::SmallVector<CrossQueryStateMatchPair, 64> out;
+   for (const CrossQueryStateMatchGroup& g : collectCrossQueryStateMatchGroups(queries)) {
+      if (g.entries.size() < 2) continue;
+      for (size_t i = 1; i < g.entries.size(); ++i) {
+         CrossQueryStateMatchPair p;
+         p.queryA = g.entries[0].query;
+         p.queryB = g.entries[i].query;
+         p.stateA = g.entries[0].state;
+         p.stateB = g.entries[i].state;
+         p.cacheKey = g.cacheKey;
+         p.enableFilterPredReuse = g.enableFilterPredReuse;
+         out.push_back(p);
       }
    }
    return out;

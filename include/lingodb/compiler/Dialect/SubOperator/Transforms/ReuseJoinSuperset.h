@@ -89,6 +89,14 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
                                              const mlir::IRMapping& donorToSynthetic,
                                              CachedJoinBufferLayoutsByKey* outLayouts = nullptr);
 
+/// Batch form of \c extendSyntheticJoinBuffersToColumnUnion. Each reuse group is widened once and may carry
+/// \c filter_pred$N slots for every participating query index.
+void extendSyntheticJoinBuffersToColumnUnionForGroups(
+   mlir::ModuleOp synthetic, llvm::ArrayRef<mlir::ModuleOp> queries,
+   llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
+   llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+   CachedJoinBufferLayoutsByKey* outLayouts = nullptr);
+
 void extendSyntheticAggregateHashTablesToPayloadUnion(mlir::ModuleOp synthetic, mlir::ModuleOp query0,
                                                       mlir::ModuleOp query1,
                                                       llvm::ArrayRef<CrossQueryStateMatchPair> matches,
@@ -122,6 +130,13 @@ void insertSyntheticFilterPredsAfterColumnUnion(
    mlir::ModuleOp synthetic, mlir::ModuleOp query0, mlir::ModuleOp query1,
    llvm::ArrayRef<CrossQueryStateMatchPair> matches, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
    const CachedJoinBufferLayoutsByKey& layoutsByKey, const ClonedJoinBufferBuildSitesByKey& buildSites);
+
+void insertSyntheticFilterPredsAfterColumnUnionForGroups(
+   mlir::ModuleOp synthetic, llvm::ArrayRef<mlir::ModuleOp> queries,
+   llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
+   llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+   const CachedJoinBufferLayoutsByKey& layoutsByKey,
+   const ClonedJoinBufferBuildSitesByKey& buildSites);
 
 /// Retag cached HIV probe closures to MixedHIV so scan_list applies the stored filter_pred$N slot directly.
 void applyProbePredFiltersForConsumerClosures(mlir::ModuleOp consumer,

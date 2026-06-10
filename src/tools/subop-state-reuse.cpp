@@ -406,8 +406,8 @@ int main(int argc, char** argv) {
 
    // Usage:
    // - subop-state-reuse <db_dir> <sql_or_json>
-   // - subop-state-reuse <db_dir> <sql_file_a> <sql_file_b>
-   assert(positionalArgs.size() == 3 || positionalArgs.size() == 4);
+   // - subop-state-reuse <db_dir> <sql_file_a> <sql_file_b> [sql_file_c ...]
+   assert(positionalArgs.size() >= 3);
    std::string dbDir = positionalArgs[1];
 
    lingodb::compiler::support::eval::init();
@@ -417,8 +417,8 @@ int main(int argc, char** argv) {
    auto session = lingodb::runtime::Session::createSession(dbDir, /*eagerLoading*/ true);
 
    llvm::SmallVector<std::string, 16> queries;
-   if (positionalArgs.size() == 4) {
-      for (int fi = 2; fi <= 3; fi++) {
+   if (positionalArgs.size() >= 4) {
+      for (size_t fi = 2; fi < positionalArgs.size(); fi++) {
          auto fileOrErr = llvm::MemoryBuffer::getFile(positionalArgs[fi]);
          assert(!fileOrErr.getError());
          queries.push_back((*fileOrErr)->getBuffer().str());
@@ -451,12 +451,14 @@ int main(int argc, char** argv) {
          queries.push_back(buf.str());
       }
    }
+   assert(queries.size() >= 2 && "subop-state-reuse batch input must contain at least two queries");
 
    struct QueryRun {
-      std::unique_ptr<mlir::MLIRContext> ctx;
       std::unique_ptr<lingodb::execution::Frontend> frontend;
       mlir::ModuleOp module;
    };
+   auto sharedMlirContext = std::make_unique<mlir::MLIRContext>();
+   lingodb::execution::initializeContext(*sharedMlirContext, /*includeLLVM*/ true);
    std::vector<QueryRun> runs;
    runs.reserve(queries.size());
 
@@ -471,12 +473,9 @@ int main(int argc, char** argv) {
       std::string sql = queries[i];
 
       QueryRun run;
-      run.ctx = std::make_unique<mlir::MLIRContext>();
-      lingodb::execution::initializeContext(*run.ctx, /*includeLLVM*/ true);
-
       run.frontend = lingodb::execution::createSQLFrontend();
       run.frontend->setCatalog(catalog.get());
-      run.frontend->setContext(run.ctx.get());
+      run.frontend->setContext(sharedMlirContext.get());
       run.frontend->loadFromString(sql);
 
       auto& feErr = run.frontend->getError();
@@ -508,59 +507,56 @@ int main(int argc, char** argv) {
    }
 
    // If we have at least two queries, detect matches and inject cache_put/cache_get to reuse states.
-   assert(runs.size() == 2);
    llvm::SmallVector<std::pair<int, mlir::ModuleOp>, 8> qmods;
    for (size_t i = 0; i < runs.size(); i++) {
       qmods.push_back({static_cast<int>(i), runs[i].module});
    }
-   llvm::SmallVector<lingodb::compiler::dialect::subop::CrossQueryStateMatchPair, 64> matches;
-   if (!skipReuseRewrite) matches = lingodb::compiler::dialect::subop::collectCrossQueryStateMatchPairs(qmods);
+   llvm::SmallVector<lingodb::compiler::dialect::subop::CrossQueryStateMatchGroup, 64> groups;
+   if (!skipReuseRewrite) groups = lingodb::compiler::dialect::subop::collectCrossQueryStateMatchGroups(qmods);
    if (printMatches) {
       lingodb::compiler::dialect::subop::printCrossQueryStateMatches(qmods, llvm::outs());
-   }
-   // Only inject reuse for the first two modules for now.
-   llvm::SmallVector<lingodb::compiler::dialect::subop::CrossQueryStateMatchPair, 64> firstPair;
-   for (auto& m : matches) {
-      if ((m.queryA == 0 && m.queryB == 1) || (m.queryA == 1 && m.queryB == 0)) {
-         // Normalize to (0,1).
-         if (m.queryA == 0) firstPair.push_back(m);
-         else {
-            auto mm = m;
-            std::swap(mm.queryA, mm.queryB);
-            std::swap(mm.stateA, mm.stateB);
-            firstPair.push_back(mm);
-         }
-      }
    }
    const char* dumpSubOpDir = std::getenv("LINGODB_DUMP_SUBOP_DIR");
    if (dumpSubOpDir) {
       const std::string base(dumpSubOpDir);
-      auto dumpPlan = [&](mlir::ModuleOp mod, llvm::StringRef scenarioDir) {
+      auto dumpPlan = [&](mlir::ModuleOp mod, const llvm::Twine& scenarioDir) {
          const std::string dir = (base + "/" + scenarioDir).str();
          llvm::sys::fs::create_directories(dir);
          dumpModuleToFile(mod, dir + "/consumer-subop.mlir");
       };
-      dumpPlan(runs[0].module, "plan-query0-test.sql");
-      dumpPlan(runs[1].module, "plan-query1-test2.sql");
+      for (size_t i = 0; i < runs.size(); ++i) {
+         dumpPlan(runs[i].module, "plan-query" + llvm::Twine(i));
+      }
    }
 
    auto tRewrite = std::chrono::high_resolution_clock::now();
-   lingodb::compiler::dialect::subop::ReusePlanRewriteResult rewriteRes;
+   lingodb::compiler::dialect::subop::BatchReusePlanRewriteResult rewriteRes;
    if (!skipReuseRewrite) {
-      rewriteRes = lingodb::compiler::dialect::subop::rewritePlansWithSyntheticQuery0(
-         runs[0].module, runs[1].module, firstPair, catalog.get());
+      llvm::SmallVector<mlir::ModuleOp, 8> modules;
+      for (auto& r : runs) modules.push_back(r.module);
+      rewriteRes = lingodb::compiler::dialect::subop::rewritePlansWithSyntheticQueryBatch(
+         modules, groups, catalog.get());
+   } else {
+      rewriteRes.numTargetsPerQuery.resize(runs.size(), 0);
+      rewriteRes.numTargetsNoTablePerQuery.resize(runs.size(), 0);
    }
    const double rewriteMs = skipReuseRewrite ? 0.0 : millisSince(tRewrite);
    optimizationMs += rewriteMs;
    if (skipReuseRewrite) {
       llvm::outs() << "\n// reuse_rewrite: skipped (--no-reuse-rewrite)\n";
    }
-   llvm::outs() << "\n// reuse_targets: query[0]=" << rewriteRes.numTargetsQuery0
-                  << " query[1]=" << rewriteRes.numTargetsQuery1 << "\n";
-   llvm::outs() << "\n// reuse_targets_no_table: query[0]=" << rewriteRes.numTargetsQuery0NoTable
-                  << " query[1]=" << rewriteRes.numTargetsQuery1NoTable << "\n";
-   llvm::outs() << "\n// reuse_targets_q0_mapped: " << rewriteRes.numTargetsQuery0Mapped << "\n";
-   llvm::outs() << "\n// reuse_targets_q0_mapped_no_table: " << rewriteRes.numTargetsQuery0MappedNoTable << "\n";
+   auto printSizeArray = [](llvm::raw_ostream& os, llvm::StringRef label, llvm::ArrayRef<size_t> values) {
+      os << "\n// " << label << ": per_query=[";
+      for (size_t i = 0; i < values.size(); ++i) {
+         if (i) os << ",";
+         os << values[i];
+      }
+      os << "]\n";
+   };
+   printSizeArray(llvm::outs(), "reuse_targets", rewriteRes.numTargetsPerQuery);
+   printSizeArray(llvm::outs(), "reuse_targets_no_table", rewriteRes.numTargetsNoTablePerQuery);
+   llvm::outs() << "\n// reuse_targets_synthetic_mapped: " << rewriteRes.numTargetsSyntheticMapped << "\n";
+   llvm::outs() << "\n// reuse_targets_synthetic_mapped_no_table: " << rewriteRes.numTargetsSyntheticMappedNoTable << "\n";
 
    // With `LINGODB_DUMP_SUBOP_DIR`, replay lowering into `snapshots/` by default.
    // Set `LINGODB_DUMP_LOWERING=0` to write only `consumer-subop.mlir`.
@@ -580,15 +576,19 @@ int main(int argc, char** argv) {
       };
 
       const std::string base(dumpSubOpDir);
-      if (rewriteRes.query0 && rewriteRes.numTargetsQuery0Mapped > 0) {
-         dumpScenario(*rewriteRes.query0, base + "/rewrite-synthetic-query0", "rewrite-synthetic-query0");
+      if (rewriteRes.synthetic && rewriteRes.numTargetsSyntheticMapped > 0) {
+         dumpScenario(*rewriteRes.synthetic, base + "/rewrite-synthetic-batch", "rewrite-synthetic-batch");
       }
-      dumpScenario(runs[0].module, base + "/rewrite-query0-test.sql", "rewrite-query0-test.sql");
-      dumpScenario(runs[1].module, base + "/rewrite-query1-test2.sql", "rewrite-query1-test2.sql");
+      for (size_t i = 0; i < runs.size(); ++i) {
+         std::string scenarioName = ("rewrite-query" + llvm::Twine(i)).str();
+         dumpScenario(runs[i].module, base + "/" + scenarioName, scenarioName);
+      }
    }
 
-   if (mlir::failed(mlir::verify(runs[0].module)) || mlir::failed(mlir::verify(runs[1].module)) ||
-       (rewriteRes.query0 && mlir::failed(mlir::verify(*rewriteRes.query0)))) {
+   bool verifyFailed = false;
+   for (auto& r : runs) verifyFailed |= mlir::failed(mlir::verify(r.module));
+   verifyFailed |= (rewriteRes.synthetic && mlir::failed(mlir::verify(*rewriteRes.synthetic)));
+   if (verifyFailed) {
       llvm::errs() << kToolName << ": MLIR verification failed after cross-query reuse rewrite"
                    << " (optimization_ms=" << optimizationMs << ")\n";
       return 1;
@@ -598,27 +598,27 @@ int main(int argc, char** argv) {
    // Enable via env var: LINGODB_REUSE_PRINT_REWRITTEN=1
    const bool printRewritten = (std::getenv("LINGODB_REUSE_PRINT_REWRITTEN") != nullptr);
    if (printRewritten) {
-      if (rewriteRes.numTargetsQuery0Mapped > 0) {
-         assert(rewriteRes.query0);
+      if (rewriteRes.numTargetsSyntheticMapped > 0) {
+         assert(rewriteRes.synthetic);
          llvm::outs() << "\n// ============================\n";
-         llvm::outs() << "// query[0] (synthetic) subop layer (post-rewrite)\n";
+         llvm::outs() << "// synthetic batch subop layer (post-rewrite)\n";
          llvm::outs() << "// ============================\n";
-         (*rewriteRes.query0)->print(llvm::outs());
+         (*rewriteRes.synthetic)->print(llvm::outs());
          llvm::outs() << "\n";
       }
       llvm::outs() << "\n// ============================\n";
       llvm::outs() << "// Step layout vs SubOpToControlFlow stderr ordinal\n";
       llvm::outs() << "// ============================\n";
-      if (rewriteRes.query0 && rewriteRes.numTargetsQuery0Mapped > 0) {
-         llvm::outs() << "// query[0] (synthetic) — same indices as lowering uses for that module\n";
-         lingodb::compiler::dialect::subop::printTopLevelExecutionStepLayout(*rewriteRes.query0, llvm::outs());
+      if (rewriteRes.synthetic && rewriteRes.numTargetsSyntheticMapped > 0) {
+         llvm::outs() << "// synthetic batch — same indices as lowering uses for that module\n";
+         lingodb::compiler::dialect::subop::printTopLevelExecutionStepLayout(*rewriteRes.synthetic, llvm::outs());
       }
-      for (size_t i = 0; i < 2; i++) {
+      for (size_t i = 0; i < runs.size(); i++) {
          llvm::outs() << "\n// --- query[" << i << "] execution_step layout (post-rewrite IR) ---\n";
          lingodb::compiler::dialect::subop::printTopLevelExecutionStepLayout(runs[i].module, llvm::outs());
       }
 
-      for (size_t i = 0; i < 2; i++) {
+      for (size_t i = 0; i < runs.size(); i++) {
          llvm::outs() << "\n// ============================\n";
          llvm::outs() << "// query[" << i << "] subop layer (post-rewrite)\n";
          llvm::outs() << "// ============================\n";
@@ -639,8 +639,7 @@ int main(int argc, char** argv) {
 
    SubOpExecuteTiming totalExec;
    SubOpExecuteTiming segmentSynthetic;
-   SubOpExecuteTiming segmentConsumer0;
-   SubOpExecuteTiming segmentConsumer1;
+   llvm::SmallVector<SubOpExecuteTiming, 8> consumerSegments(runs.size());
    llvm::SmallVector<SubOpExecuteTiming, 8> timingPerRun;
 
    // `putCachedState` stores raw pointers into memory registered on the **allocating**
@@ -674,13 +673,13 @@ int main(int argc, char** argv) {
       };
       // When cross-query rewrite could not map any donor state into the synthetic module, it only
       // contains an empty execution_group shell — skip JIT for that shell.
-      if (rewriteRes.numTargetsQuery0Mapped > 0) {
-         runOne(*rewriteRes.query0, "// query[0] (synthetic) execute", segmentSynthetic, std::nullopt);
+      if (rewriteRes.numTargetsSyntheticMapped > 0) {
+         runOne(*rewriteRes.synthetic, "// synthetic batch execute", segmentSynthetic, std::nullopt);
       } else {
-         if (verboseTiming) llvm::outs() << "\n// (skip synthetic execute: reuse_targets_q0_mapped==0)\n";
+         if (verboseTiming) llvm::outs() << "\n// (skip synthetic execute: reuse_targets_synthetic_mapped==0)\n";
       }
       for (size_t i = 0; i < runs.size(); i++) {
-         SubOpExecuteTiming& seg = (i == 0) ? segmentConsumer0 : segmentConsumer1;
+         SubOpExecuteTiming& seg = consumerSegments[i];
          runOne(runs[i].module, "// query[" + std::to_string(i) + "] execute", seg, static_cast<unsigned>(i));
       }
    }
@@ -705,8 +704,7 @@ int main(int argc, char** argv) {
    printPerRun("execution_time", [](const SubOpExecuteTiming& t) { return t.executionTime; });
 
    SubOpExecuteTiming consumersOnly;
-   consumersOnly.add(segmentConsumer0);
-   consumersOnly.add(segmentConsumer1);
+   for (const SubOpExecuteTiming& seg : consumerSegments) consumersOnly.add(seg);
    if (verboseTiming) {
       llvm::outs() << "// timing_note: executionTime_ms is run-sql `executionTime` (generated main() only).\n";
       llvm::outs() << "// timing_note: shared ExecutionContext keeps cache_put pointers valid across runs;\n";
@@ -717,11 +715,13 @@ int main(int argc, char** argv) {
       printPerRun("llvm_jit", [](const SubOpExecuteTiming& t) { return t.llvmJitMs(); });
       printPerRun("execute_wall", [](const SubOpExecuteTiming& t) { return t.wallMs; });
 
-      if (rewriteRes.numTargetsQuery0Mapped > 0) {
+      if (rewriteRes.numTargetsSyntheticMapped > 0) {
          printTimingSegment(llvm::outs(), "synthetic_ir", segmentSynthetic);
       }
-      printTimingSegment(llvm::outs(), "consumer_q0_ir", segmentConsumer0);
-      printTimingSegment(llvm::outs(), "consumer_q1_ir", segmentConsumer1);
+      for (size_t i = 0; i < consumerSegments.size(); ++i) {
+         std::string segmentName = ("consumer_q" + llvm::Twine(i) + "_ir").str();
+         printTimingSegment(llvm::outs(), segmentName, consumerSegments[i]);
+      }
       printTimingSegment(llvm::outs(), "consumers_only_ir", consumersOnly);
       printTimingSegment(llvm::outs(), "all_execute_runs", totalExec);
    }

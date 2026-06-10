@@ -652,11 +652,32 @@ class PtrHashTagMatchesMaskedLowering : public OpConversionPattern<util::PtrHash
          globalOp = rewriter.create<mlir::LLVM::GlobalOp>(loc, mlir::LLVM::LLVMArrayType::get(rewriter.getI16Type(), 2048), true, mlir::LLVM::Linkage::External, "bloomMasks", mlir::Attribute());
       }
       mlir::Value bloomMaskPtr = rewriter.create<mlir::LLVM::AddressOfOp>(loc, globalOp);
-      Value shiftAmount = rewriter.create<mlir::LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(54));
-      Value slot = rewriter.create<LLVM::LShrOp>(loc, adaptor.getHash(), shiftAmount);
-      slot = rewriter.create<LLVM::ShlOp>(loc, slot, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(1)));
-      if (op.getMask() == 1) {
-         slot = rewriter.create<LLVM::OrOp>(loc, slot, rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(1)));
+      uint64_t packedPredMask = op.getMask();
+      uint64_t predOrdinal = packedPredMask & 0xffff;
+      uint64_t predSlotCount = packedPredMask >> 16;
+      uint64_t bucketSize = 2048;
+      if (predSlotCount > 1) {
+         bucketSize = 2048 / predSlotCount;
+         uint64_t pow2 = 1;
+         while ((pow2 << 1) && (pow2 << 1) <= bucketSize) pow2 <<= 1;
+         bucketSize = pow2;
+      }
+      Value highBitsShiftAmount = rewriter.create<mlir::LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(53));
+      Value highBits = rewriter.create<LLVM::LShrOp>(loc, adaptor.getHash(), highBitsShiftAmount);
+      Value slot = rewriter.create<LLVM::AndOp>(
+         loc, highBits,
+         rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(bucketSize - 1)));
+      if (predSlotCount > 1) {
+         slot = rewriter.create<LLVM::MulOp>(
+            loc, slot,
+            rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(),
+                                              rewriter.getI64IntegerAttr(predSlotCount)));
+      }
+      if (predOrdinal) {
+         slot = rewriter.create<LLVM::AddOp>(
+            loc, slot,
+            rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI64Type(),
+                                              rewriter.getI64IntegerAttr(predOrdinal)));
       }
       Value tagPtr = rewriter.create<LLVM::GEPOp>(loc, bloomMaskPtr.getType(), rewriter.getI16Type(), bloomMaskPtr, ValueRange{slot});
       Value adaptedTag = rewriter.create<LLVM::LoadOp>(loc, rewriter.getI16Type(), tagPtr);
