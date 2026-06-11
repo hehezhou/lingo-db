@@ -443,6 +443,7 @@ static bool isTransparentDepCarrierType(mlir::Type t) {
 
 /// State produced by a lone `get_external` in an execution_step (table or external hash index, etc.).
 static bool isGetExternalLeafState(mlir::Value v);
+static std::optional<uint64_t> getCacheGetKeyForState(mlir::Value v);
 
 struct RWFlags {
    bool read = false;
@@ -566,27 +567,23 @@ static StateDepEligibility resolveDepEligibilityRec(
       return {true, {}};
    }
 
-   unsigned nTransparent = 0;
    unsigned nOther = 0;
-   mlir::Value soleTransparent;
+   llvm::SmallVector<mlir::Value, 4> transparentPreds;
    llvm::SmallVector<mlir::Value, 4> leafPreds;
    for (mlir::Value p : preds) {
       if (isTransparentStateValue(p, transparentStates)) {
-         nTransparent++;
-         soleTransparent = p;
+         transparentPreds.push_back(p);
          continue;
       }
       if (isGetExternalLeafState(p)) {
          leafPreds.push_back(p);
          continue;
       }
+      if (getCacheGetKeyForState(p)) {
+         leafPreds.push_back(p);
+         continue;
+      }
       nOther++;
-   }
-
-   // Transparent carriers are not independent states: at most one direct transparent pred; its
-   // external deps are folded in below. Other state preds are allowed but make reuse ineligible.
-   if (nTransparent > 1) {
-      assert(false && "state must not have multiple direct transparent predecessors");
    }
 
    if (nOther > 0) {
@@ -600,19 +597,22 @@ static StateDepEligibility resolveDepEligibilityRec(
 
    for (mlir::Value p : leafPreds) {
       auto itD = tableDescrByTableState.find(p);
-      assert(itD != tableDescrByTableState.end() && "get_external leaf predecessor must have GetExternal descr");
       if (mlir::isa<subop::TableType>(p.getType())) {
+         assert(itD != tableDescrByTableState.end() && "get_external table leaf predecessor must have descr");
          out.depTokensSorted.push_back(std::string("table:") + itD->second);
       } else if (mlir::isa<subop::ExternalHashIndexType>(p.getType())) {
+         assert(itD != tableDescrByTableState.end() && "get_external hash-index leaf predecessor must have descr");
          out.depTokensSorted.push_back(std::string("externalhashindex:") + itD->second);
+      } else if (std::optional<uint64_t> cacheKey = getCacheGetKeyForState(p)) {
+         out.depTokensSorted.push_back(std::string("cache:") + std::to_string(*cacheKey));
       } else {
-         llvm_unreachable("get_external leaf predecessor must be table or externalhashindex");
+         llvm_unreachable("leaf predecessor must be get_external table/externalhashindex or cache_get");
       }
    }
 
-   if (nTransparent == 1) {
+   for (mlir::Value transparentPred : transparentPreds) {
       StateDepEligibility inner =
-         resolveDepEligibilityRec(soleTransparent, dag, transparentStates, tableDescrByTableState, visiting);
+         resolveDepEligibilityRec(transparentPred, dag, transparentStates, tableDescrByTableState, visiting);
       if (!inner.eligible) {
          visiting.erase(stateCanon);
          return {false, {}};
@@ -679,6 +679,15 @@ llvm::DenseMap<mlir::Value, RWFlags> analyzeStepStateRW(subop::ExecutionStepOp s
             res[key].write = true;
             continue;
          }
+      if (auto sort = mlir::dyn_cast<subop::CreateSortedViewOp>(&op)) {
+         mlir::Value src = sort.getToSort();
+         assert(isStateType(src.getType()) || isThreadLocalOfStateType(src.getType()));
+         res[canonicalizeStateValueDeep(src)].read = true;
+         mlir::Value out = sort.getResult();
+         assert(isStateType(out.getType()) || isThreadLocalOfStateType(out.getType()));
+         res[canonicalizeStateValueDeep(out)].write = true;
+         continue;
+      }
       if (auto lookup = mlir::dyn_cast<subop::LookupOp>(&op)) {
          mlir::Value st = lookup.getState();
          assert(isStateType(st.getType()) || isThreadLocalOfStateType(st.getType()));
@@ -997,6 +1006,29 @@ static bool isGetExternalLeafState(mlir::Value v) {
    return mlir::isa<subop::TableType, subop::ExternalHashIndexType>(v.getType());
 }
 
+static std::optional<uint64_t> getCacheGetKeyForState(mlir::Value v) {
+   if (!v) return std::nullopt;
+   v = canonicalizeStateValueDeep(v);
+   if (auto* def = v.getDefiningOp()) {
+      if (auto get = mlir::dyn_cast<subop::CacheGetOp>(def)) {
+         return static_cast<uint64_t>(get.getKey());
+      }
+      if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(def)) {
+         auto& block = step.getSubOps().front();
+         auto ret = mlir::dyn_cast<subop::ExecutionStepReturnOp>(block.getTerminator());
+         if (!ret) return std::nullopt;
+         for (unsigned i = 0; i < ret.getNumOperands() && i < step.getNumResults(); ++i) {
+            if (step.getResult(i) != v) continue;
+            mlir::Value returned = ret.getOperand(i);
+            if (auto get = returned.getDefiningOp<subop::CacheGetOp>()) {
+               return static_cast<uint64_t>(get.getKey());
+            }
+         }
+      }
+   }
+   return std::nullopt;
+}
+
 // Keep small string helpers for type fingerprints / debug keys.
 llvm::SmallVector<std::string, 4> sortedUniqueStrings(llvm::ArrayRef<std::string> in) {
    llvm::SmallVector<std::string, 4> xs(in.begin(), in.end());
@@ -1030,6 +1062,16 @@ static std::string sanitizeBaseName(llvm::StringRef name) {
       if (c < '0' || c > '9') return base.str();
    }
    return base.substr(0, pos).str();
+}
+
+static std::string normalizeGeneratedResultMemberName(llvm::StringRef name) {
+   std::string base = sanitizeBaseName(name);
+   size_t underscore = base.rfind('_');
+   if (underscore == std::string::npos || underscore + 1 >= base.size()) return base;
+   for (char c : llvm::StringRef(base).drop_front(underscore + 1)) {
+      if (c < '0' || c > '9') return base;
+   }
+   return base.substr(0, underscore);
 }
 
 /// Like `sanitizeBaseName` for scopes/columns, but keeps compiler member slot suffixes (`member$0` vs `member$1`).
@@ -1087,6 +1129,63 @@ static uint64_t hashType(mlir::Type t) {
 
 static uint64_t hashOpName(mlir::Operation& op) {
    return static_cast<uint64_t>(llvm::hash_value(op.getName().getStringRef()));
+}
+
+struct StateHashEnv {
+   llvm::DenseMap<mlir::Value, uint64_t> hashByState;
+   const llvm::DenseSet<mlir::Value>* transparentStates = nullptr;
+   const StateDependencyGraph* depGraph = nullptr;
+   const llvm::DenseMap<mlir::Value, std::string>* tableDescrByTableState = nullptr;
+
+   uint64_t get(mlir::Value state) const {
+      llvm::DenseSet<mlir::Value> visiting;
+      return getRec(state, visiting);
+   }
+
+   uint64_t getRec(mlir::Value state, llvm::DenseSet<mlir::Value>& visiting) const {
+      state = canonicalizeStateValueDeep(state);
+      if (auto cacheKey = getCacheGetKeyForState(state)) return *cacheKey;
+      auto it = hashByState.find(state);
+      if (it != hashByState.end()) return it->second;
+
+      if (transparentStates && depGraph && transparentStates->contains(state)) {
+         auto inserted = visiting.insert(state);
+         assert(inserted.second && "transparent state hash resolution must be acyclic");
+         llvm::SmallVector<uint64_t, 4> predHashes;
+         for (mlir::Value pred : directPredecessorsInDepGraph(state, *depGraph)) {
+            pred = canonicalizeStateValueDeep(pred);
+            if (pred == state) continue;
+            if (isGetExternalLeafState(pred)) {
+               uint64_t h = hashType(pred.getType());
+               if (tableDescrByTableState) {
+                  if (auto it = tableDescrByTableState->find(pred); it != tableDescrByTableState->end()) {
+                     h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(it->second)));
+                     h = hashCombineU64(h, hashType(pred.getType()));
+                  }
+               }
+               predHashes.push_back(h);
+               continue;
+            }
+            predHashes.push_back(getRec(pred, visiting));
+         }
+         llvm::sort(predHashes);
+         uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef("transparent_state_deps")));
+         h = hashCombineU64(h, hashType(state.getType()));
+         for (uint64_t predHash : predHashes) h = hashCombineU64(h, predHash);
+         visiting.erase(state);
+         return h;
+      }
+
+      assert(it != hashByState.end() && "state must have a hash value");
+      llvm_unreachable("state must have a hash value");
+   }
+};
+
+static uint64_t provisionalStateHash(mlir::Value state, unsigned ordinal) {
+   uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef("state_provisional")));
+   h = hashCombineU64(h, hashType(state.getType()));
+   h = hashCombineU64(h, ordinal);
+   return h;
 }
 
 static std::string fingerprintSortedMemberPairs(subop::MemberManager& mm, llvm::ArrayRef<subop::Member> members);
@@ -1306,8 +1405,11 @@ static bool residualPredicateMapComplexForRelaxedHiv(subop::MapOp map,
    return false;
 }
 
+std::string normalizedSubopStateTypeFingerprint(subop::MemberManager& mm, mlir::Type t);
+
 struct StepDagHasher {
    subop::ExecutionStepOp step;
+   mlir::Value targetState;
    mlir::Type targetStateType;
    const llvm::DenseMap<mlir::Value, std::string>* tableDescrByTableState = nullptr;
    subop::MemberManager* memberManager = nullptr;
@@ -1317,6 +1419,7 @@ struct StepDagHasher {
    const llvm::SmallSet<std::string, 8>* joinKeyColumnIdentifiersSanitized = nullptr;
    const llvm::DenseMap<mlir::Value, lingodb::runtime::ExternalDatasourceProperty>* externalDatasourceByTableState =
       nullptr;
+   const StateHashEnv* stateHashEnv = nullptr;
    llvm::DenseMap<mlir::Value, uint64_t> memo;
    llvm::DenseMap<const lingodb::compiler::dialect::tuples::Column*, uint64_t> columnHashByColumn;
    llvm::DenseMap<const lingodb::compiler::dialect::tuples::Column*, mlir::Value> refStateByColumn;
@@ -1423,7 +1526,6 @@ struct StepDagHasher {
       assert(memberManager);
       state = canonicalizeStateValueDeep(state);
       uint64_t h = hashString("state_column");
-      h = hashCombineU64(h, hashExternalLeaf(state));
       if (externalDatasourceByTableState) {
          auto itDs = externalDatasourceByTableState->find(state);
          if (itDs == externalDatasourceByTableState->end()) {
@@ -1435,6 +1537,7 @@ struct StepDagHasher {
             }
          }
          if (itDs != externalDatasourceByTableState->end() && mlir::isa<subop::TableType>(state.getType())) {
+            h = hashCombineU64(h, hashExternalLeaf(state));
             h = hashCombineU64(h, hashString(itDs->second.tableName));
             llvm::StringRef memberName = memberManager->getName(member);
             std::string memberNameSan = sanitizeBaseName(memberName);
@@ -1451,7 +1554,14 @@ struct StepDagHasher {
             return hashCombineU64(h, hashMlirType(colTy));
          }
       }
-      h = hashCombineU64(h, hashMemberSemantic(member));
+      assert(stateHashEnv && "non-table state column hashing requires state hash environment");
+      h = hashCombineU64(h, stateHashEnv->get(state));
+      auto members = getMembersForStateValue(state);
+      auto itMember = llvm::find(members, member);
+      assert(itMember != members.end() && "scanned member must belong to state payload layout");
+      uint64_t memberPos = static_cast<uint64_t>(std::distance(members.begin(), itMember));
+      h = hashCombineU64(h, hashString("member_pos"));
+      h = hashCombineU64(h, memberPos);
       return hashCombineU64(h, hashMlirType(colTy));
    }
 
@@ -1868,8 +1978,11 @@ struct StepDagHasher {
          return hashScanRefsOp(scan);
       }
 
-      assert(false && "unsupported tuple-stream producer in relaxed join construction hash");
-      return 0;
+      uint64_t h = hashCombineU64(hashOpName(*def), hashOp(*def));
+      llvm::SmallVector<uint64_t, 8> selectedHashes(selected.begin(), selected.end());
+      llvm::sort(selectedHashes);
+      for (uint64_t selectedHash : selectedHashes) h = hashCombineU64(h, selectedHash);
+      return h;
    }
 
    uint64_t hashMaterializeOpRelaxed(subop::MaterializeOp mat) {
@@ -1890,6 +2003,33 @@ struct StepDagHasher {
    }
 
    uint64_t hashMaterializeOp(subop::MaterializeOp mat) {
+      if (mlir::isa<subop::ResultTableType>(mat.getState().getType())) {
+         auto rt = mlir::cast<subop::ResultTableType>(mat.getState().getType());
+         llvm::ArrayRef<subop::Member> resultMembers = rt.getMembers().getMembers();
+         uint64_t h = hashCombineU64(hashOpName(*mat.getOperation()), hashString("result_table_materialize"));
+         std::string typeFp = normalizedSubopStateTypeFingerprint(*memberManager, rt);
+         h = hashCombineU64(h, hashString(typeFp));
+         llvm::SmallVector<std::tuple<unsigned, std::string, uint64_t>, 16> fields;
+         for (auto& [member, colRef] : mat.getMapping().getMapping()) {
+            auto itMember = llvm::find(resultMembers, member);
+            assert(itMember != resultMembers.end() && "result_table materialize member must belong to result layout");
+            unsigned ordinal = static_cast<unsigned>(std::distance(resultMembers.begin(), itMember));
+            auto [scope, leaf] = columnManager->getName(&colRef.getColumn());
+            std::string colSem = sanitizeScopeName(scope);
+            colSem.push_back('.');
+            colSem.append(normalizeGeneratedResultMemberName(leaf));
+            uint64_t colH = hashString(colSem);
+            colH = hashCombineU64(colH, hashMlirType(colRef.getColumn().type));
+            fields.push_back({ordinal, normalizeGeneratedResultMemberName(memberManager->getName(member)), colH});
+         }
+         llvm::sort(fields, [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
+         for (const auto& [ordinal, memberName, colH] : fields) {
+            h = hashCombineU64(h, ordinal);
+            h = hashCombineU64(h, hashString(memberName));
+            h = hashCombineU64(h, colH);
+         }
+         return h;
+      }
       uint64_t h = hashCombineU64(hashOpName(*mat.getOperation()), hashValue(mat.getStream()));
       h = hashCombineU64(h, hashValue(mat.getState()));
       for (auto& [member, colRef] : mat.getMapping().getMapping()) {
@@ -2029,10 +2169,21 @@ struct StepDagHasher {
       memo[v] = 0;
       uint64_t h = 0;
       if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(v)) {
-         h = hashExternalLeaf(canonicalizeStateValueDeep(ba));
+         mlir::Value state = canonicalizeStateValueDeep(ba);
+         if (stateHashEnv && (isStateType(state.getType()) || isThreadLocalOfStateType(state.getType())) &&
+             !isGetExternalLeafState(state)) {
+            h = stateHashEnv->get(state);
+         } else {
+            h = hashExternalLeaf(state);
+         }
       } else if (auto* def = v.getDefiningOp()) {
          if (mlir::isa<subop::ExecutionStepOp>(def)) {
-            h = hashExternalLeaf(v);
+            if (stateHashEnv && (isStateType(v.getType()) || isThreadLocalOfStateType(v.getType())) &&
+                !isGetExternalLeafState(v)) {
+               h = stateHashEnv->get(v);
+            } else {
+               h = hashExternalLeaf(v);
+            }
             memo[v] = h;
             return h;
          }
@@ -2101,6 +2252,21 @@ struct StepDagHasher {
    uint64_t hashStepReturnGraph() {
       auto& block = step.getSubOps().front();
       auto ret = mlir::cast<subop::ExecutionStepReturnOp>(block.getTerminator());
+      if (targetState && mlir::isa<subop::ResultTableType>(targetStateType) &&
+          ret.getNumOperands() > 0 && isCreateOnlyExecutionStep(step)) {
+         bool returnsOnlyTarget = true;
+         for (auto v : ret.getInputs()) {
+            if (canonicalizeStateValueDeep(v) != canonicalizeStateValueDeep(targetState)) {
+               returnsOnlyTarget = false;
+               break;
+            }
+         }
+         if (returnsOnlyTarget) {
+            uint64_t h = hashString("result_table_create_return");
+            std::string typeFp = normalizedSubopStateTypeFingerprint(*memberManager, targetStateType);
+            return hashCombineU64(h, hashString(typeFp));
+         }
+      }
       uint64_t h = 0;
       for (auto v : ret.getInputs()) h = hashCombineU64(h, hashValue(v));
       if (h != 0) return h;
@@ -2327,6 +2493,7 @@ struct StateMatchProfile {
    int queryId = -1;
    mlir::Value value;
    bool eligible = false;
+   uint64_t stateHash = 0;
    llvm::SmallVector<std::string, 8> depTokensSorted;
    llvm::SmallVector<uint64_t, 8> constructionStepHashes;
    uint64_t constructionHash = 0;
@@ -2661,6 +2828,31 @@ static ModuleMatchAndReuseAnalysis analyzeModuleForMatchAndReuse(mlir::ModuleOp 
    return a;
 }
 
+static StateHashEnv buildStateHashEnv(const ModuleMatchAndReuseAnalysis& module, const StateDependencyGraph& depGraph,
+                                      const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState) {
+   StateHashEnv env;
+   env.transparentStates = &module.transparentStates;
+   env.depGraph = &depGraph;
+   env.tableDescrByTableState = &tableDescrByTableState;
+   unsigned ordinal = 0;
+   for (mlir::Value state : module.statesSorted) {
+      state = canonicalizeStateValueDeep(state);
+      if (module.transparentStates.contains(state)) continue;
+      if (auto cacheKey = getCacheGetKeyForState(state)) {
+         env.hashByState[state] = *cacheKey;
+         continue;
+      }
+      if (auto it = tableDescrByTableState.find(state); it != tableDescrByTableState.end()) {
+         uint64_t h = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(it->second)));
+         h = hashCombineU64(h, hashType(state.getType()));
+         env.hashByState[state] = h;
+         continue;
+      }
+      env.hashByState[state] = provisionalStateHash(state, ordinal++);
+   }
+   return env;
+}
+
 static void assertTableStatesHaveNoStateDependencies(const ModuleMatchAndReuseAnalysis& module,
                                                      const StateDependencyGraph& depGraph) {
    for (mlir::Value state : module.statesSorted) {
@@ -2686,6 +2878,7 @@ static llvm::SmallVector<mlir::Value, 64> collectReuseCandidateStates(mlir::Modu
          if (itCreated->second < 0) continue;
          // Special states are only folded into dependency equality; they are never reused directly.
          if (isSpecialNonReuseStateValue(key, a.transparentStates)) continue;
+         if (getCacheGetKeyForState(key)) continue;
          // Carrier states that are not transparent are also not concrete reuse targets.
          if (isTransparentDepCarrierType(key.getType())) continue;
          candidates.push_back(key);
@@ -2736,7 +2929,8 @@ static bool determineStateReuseEligibility(
 /// Phase 4: construction hash and type fingerprint (eligible states only).
 static StateConstructionMatchHashes computeEligibleStateMatchHashes(
    mlir::Value state, llvm::ArrayRef<int> constructionStepIndices, const ModuleMatchAndReuseAnalysis& module,
-   const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState, subop::MemberManager& memberManager,
+   const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState, const StateHashEnv& stateHashEnv,
+   subop::MemberManager& memberManager,
    lingodb::compiler::dialect::tuples::ColumnManager& columnManager) {
    const bool isHiv = mlir::isa<subop::HashIndexedViewType>(state.getType());
    std::optional<JoinHivMatchDetails> joinHivDetails;
@@ -2753,11 +2947,13 @@ static StateConstructionMatchHashes computeEligibleStateMatchHashes(
       assert(itS != module.stepByIndex.end());
       StepDagHasher hasher;
       hasher.step = itS->second;
+      hasher.targetState = state;
       hasher.targetStateType = state.getType();
       hasher.tableDescrByTableState = &tableDescrByTableState;
       hasher.memberManager = &memberManager;
       hasher.columnManager = &columnManager;
       hasher.externalDatasourceByTableState = &module.reuse.externalDatasourceByTableState;
+      hasher.stateHashEnv = &stateHashEnv;
       if (joinHivDetails) {
          hasher.joinIndexMemberNamesSanitized = &joinHivDetails->indexMemberNamesSanitized;
          hasher.joinKeyColumnAttrHashes = &joinHivDetails->joinKeyColumnAttrHashes;
@@ -2798,6 +2994,7 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
 
    // Phase 2: same-step RW → state dependency DAG.
    StateDependencyGraph depGraph = buildStateDependencyGraphFromStepRw(stepRw.rwByStep);
+   StateHashEnv stateHashEnv = buildStateHashEnv(module, depGraph, tableDescrByTableState);
    assertTableStatesHaveNoStateDependencies(module, depGraph);
 
    llvm::SmallVector<mlir::Value, 64> candidates = collectReuseCandidateStates(moduleOp, module);
@@ -2818,6 +3015,7 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
       prof.queryId = queryId;
       prof.value = state;
       prof.eligible = eligible;
+      prof.stateHash = stateHashEnv.get(state);
       prof.depTokensSorted.assign(depElig.depTokensSorted.begin(), depElig.depTokensSorted.end());
 
       if (prof.eligible) {
@@ -2839,7 +3037,7 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
             prof.hasUnsupportedResidualTableFilter = hasAnyResidualFilter && !prof.hasResidualTableFilter;
          }
          StateConstructionMatchHashes hashes = computeEligibleStateMatchHashes(
-            state, constructionStepIndices, module, tableDescrByTableState, memberManager,
+            state, constructionStepIndices, module, tableDescrByTableState, stateHashEnv, memberManager,
             tupDialect->getColumnManager());
          prof.constructionStepHashes.assign(hashes.constructionStepHashes.begin(), hashes.constructionStepHashes.end());
          prof.constructionHash = hashes.constructionHash;
@@ -3446,6 +3644,7 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
             mlir::OpPrintingFlags dbgFlags;
             p.value.printAsOperand(os, dbgFlags);
             os << " eligible=" << (p.eligible ? "true" : "false");
+            os << " state_hash=" << p.stateHash;
             os << " h=" << p.constructionHash;
             os << " step_hashes=[";
             for (size_t i = 0; i < p.constructionStepHashes.size(); i++) {
@@ -3482,6 +3681,7 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
             mlir::OpPrintingFlags dbgFlags;
             p.value.printAsOperand(os, dbgFlags);
             os << " eligible=" << (p.eligible ? "true" : "false");
+            os << " state_hash=" << p.stateHash;
             os << " type=" << ty;
             os << " deps=" << deps;
             if (!p.aggregateGroupKeyFingerprint.empty()) {
@@ -3500,15 +3700,53 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
       }
    }
 
+   {
+      os << "\n// ==== debug: eligible result_table profiles (capped) ====\n";
+      size_t cap = 20;
+      for (auto& m : models) {
+         size_t printedDbg = 0;
+         for (auto& p : m.profiles) {
+            if (!mlir::isa<subop::ResultTableType>(p.value.getType())) continue;
+            std::string deps = joinSortedStrings(p.depTokensSorted);
+            os << "//   query[" << m.id << "] ";
+            mlir::OpPrintingFlags dbgFlags;
+            p.value.printAsOperand(os, dbgFlags);
+            os << " eligible=" << (p.eligible ? "true" : "false");
+            os << " state_hash=" << p.stateHash;
+            os << " h=" << p.constructionHash;
+            os << " step_hashes=[";
+            for (size_t i = 0; i < p.constructionStepHashes.size(); i++) {
+               if (i) os << ",";
+               os << p.constructionStepHashes[i];
+            }
+            os << "]";
+            os << " type_fp=" << p.typeFingerprintStr;
+            os << " deps=" << deps << "\n";
+            if (++printedDbg >= cap) break;
+         }
+         if (printedDbg == 0) os << "//   query[" << m.id << "] (none)\n";
+      }
+   }
+
    mlir::OpPrintingFlags flags;
    llvm::SmallVector<CrossQueryStateMatchGroup, 64> groups = collectCrossQueryStateMatchGroups(queries);
    size_t printed = 0;
    for (const CrossQueryStateMatchGroup& g : groups) {
       os << "\n// -- match_group cache_key=" << g.cacheKey
-         << " filter_pred_reuse=" << (g.enableFilterPredReuse ? "true" : "false") << " --\n";
+         << " filter_pred_reuse=" << (g.enableFilterPredReuse ? "true" : "false")
+         << " requires_join_layout_union=" << (g.requiresJoinLayoutUnion ? "true" : "false") << " --\n";
       for (const CrossQueryStateMatchEntry& e : g.entries) {
          os << "//   query[" << e.query << "] ";
          e.state.printAsOperand(os, flags);
+         for (auto& m : models) {
+            if (m.id != e.query) continue;
+            for (auto& p : m.profiles) {
+               if (p.value != e.state) continue;
+               os << " state_hash=" << p.stateHash;
+               break;
+            }
+            break;
+         }
          os << "\n";
       }
       if (++printed >= 100) {
@@ -3641,7 +3879,38 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
 
          CrossQueryStateMatchGroup g;
          g.cacheKey = cacheKey;
-         g.enableFilterPredReuse = enableFilterPredReuse;
+         bool allHiv = true;
+         bool sameStoredHivLayout = true;
+         std::optional<std::string> firstStoredHivLayout;
+         for (const StateMatchProfile* p : members) {
+            if (!mlir::isa<subop::HashIndexedViewType>(p->value.getType())) {
+               allHiv = false;
+               break;
+            }
+            if (!firstStoredHivLayout) {
+               firstStoredHivLayout = p->storedValueMembersFingerprint;
+            } else if (*firstStoredHivLayout != p->storedValueMembersFingerprint) {
+               sameStoredHivLayout = false;
+            }
+         }
+         if (allHiv && sameStoredHivLayout) g.requiresJoinLayoutUnion = false;
+         bool needsFilterPredReuse = enableFilterPredReuse;
+         if (needsFilterPredReuse && allHiv) {
+            needsFilterPredReuse = false;
+            for (const StateMatchProfile* p : members) {
+               if (p->hasResidualTableFilter || p->hasComplexResidualTableFilter) {
+                  needsFilterPredReuse = true;
+                  break;
+               }
+               const QueryModel* model = modelByQueryId.lookup(p->queryId);
+               assert(model && "missing query model for profile");
+               if (!decodeSimpleMatchFiltersAlongShadowChain(p->value, model->reuse).empty()) {
+                  needsFilterPredReuse = true;
+                  break;
+               }
+            }
+         }
+         g.enableFilterPredReuse = needsFilterPredReuse;
          for (const StateMatchProfile* p : members) {
             g.entries.push_back(CrossQueryStateMatchEntry{p->queryId, p->value});
             matchedStates.insert(p->value);

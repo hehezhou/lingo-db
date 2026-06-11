@@ -515,6 +515,7 @@ int main(int argc, char** argv) {
    if (!skipReuseRewrite) groups = lingodb::compiler::dialect::subop::collectCrossQueryStateMatchGroups(qmods);
    if (printMatches) {
       lingodb::compiler::dialect::subop::printCrossQueryStateMatches(qmods, llvm::outs());
+      llvm::outs().flush();
    }
    const char* dumpSubOpDir = std::getenv("LINGODB_DUMP_SUBOP_DIR");
    if (dumpSubOpDir) {
@@ -557,6 +558,14 @@ int main(int argc, char** argv) {
    printSizeArray(llvm::outs(), "reuse_targets_no_table", rewriteRes.numTargetsNoTablePerQuery);
    llvm::outs() << "\n// reuse_targets_synthetic_mapped: " << rewriteRes.numTargetsSyntheticMapped << "\n";
    llvm::outs() << "\n// reuse_targets_synthetic_mapped_no_table: " << rewriteRes.numTargetsSyntheticMappedNoTable << "\n";
+   if (printMatches && !skipReuseRewrite) {
+      llvm::SmallVector<std::pair<int, mlir::ModuleOp>, 8> postRewriteQmods;
+      for (size_t i = 0; i < runs.size(); i++) {
+         postRewriteQmods.push_back({static_cast<int>(i), runs[i].module});
+      }
+      llvm::outs() << "\n// ==== post-rewrite cross-query state matches ====\n";
+      lingodb::compiler::dialect::subop::printCrossQueryStateMatches(postRewriteQmods, llvm::outs());
+   }
 
    // With `LINGODB_DUMP_SUBOP_DIR`, replay lowering into `snapshots/` by default.
    // Set `LINGODB_DUMP_LOWERING=0` to write only `consumer-subop.mlir`.

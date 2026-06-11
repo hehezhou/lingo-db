@@ -1,4 +1,5 @@
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorInterfaces.h"
+#include "lingodb/compiler/Dialect/SubOperator/SubOperatorOps.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/StateUsageTransformer.h"
 #include "mlir/IR/Builders.h"
 using namespace lingodb::compiler::dialect;
@@ -15,6 +16,13 @@ void SubOpStateUsageTransformer::updateValue(mlir::Value oldValue, mlir::Type ne
          if (callBeforeFn) { callBeforeFn(stateUsingSubOp.getOperation()); }
          stateUsingSubOp.updateStateType(*this, oldValue, newType);
          if (callAfterFn) { callAfterFn(stateUsingSubOp.getOperation()); }
+      } else if (auto nested = mlir::dyn_cast_or_null<subop::NestedExecutionGroupOp>(user)) {
+         mlir::Block& body = nested.getSubOps().front();
+         for (mlir::OpOperand& operand : nested->getOpOperands()) {
+            if (operand.get() != oldValue) continue;
+            unsigned idx = operand.getOperandNumber();
+            if (idx < body.getNumArguments()) body.getArgument(idx).setType(newType);
+         }
       } else {
          user->dump();
          assert(false);

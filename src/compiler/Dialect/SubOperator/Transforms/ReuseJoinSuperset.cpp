@@ -48,6 +48,16 @@ static std::string columnSemanticKey(llvm::StringRef scope, llvm::StringRef leaf
    return (scope + "\x1f" + leaf).str();
 }
 
+static std::string aggregatePayloadScopeSemantic(llvm::StringRef scope) {
+   if (!scope.starts_with("oj")) return scope.str();
+   llvm::StringRef tail = scope.drop_front(2);
+   if (tail.empty()) return scope.str();
+   for (char c : tail) {
+      if (c < '0' || c > '9') return scope.str();
+   }
+   return "oj";
+}
+
 static constexpr llvm::StringRef kReuseFilterPredScope = "reuse_filter_pred";
 
 static bool isFilterPredPayloadColumn(llvm::StringRef memberName, llvm::StringRef leaf) {
@@ -166,15 +176,14 @@ static subop::MapOp findJoinHashMapBeforeMaterialize(mlir::Block& body, subop::M
 }
 
 /// Join-build hash map key column → buffer \c materialize member (not HIV value-member slot order).
-static llvm::StringRef joinKeyMemberNameFromBuildStep(subop::ExecutionStepOp buildStep, subop::Member linkMember,
-                                                      subop::Member hashMember, subop::MemberManager& mm,
-                                                      tuples::ColumnManager& cm) {
+static std::string joinKeyMemberNameFromBuildStep(subop::ExecutionStepOp buildStep, subop::Member linkMember,
+                                                  subop::Member hashMember, subop::MemberManager& mm,
+                                                  tuples::ColumnManager& cm) {
    subop::MaterializeOp mat = findJoinBufferMaterializeInStep(buildStep);
    assert(mat && "join superset: build step must materialize join buffer");
    mlir::Block& body = buildStep.getSubOps().front();
    subop::MapOp hashMap = findJoinHashMapBeforeMaterialize(body, mat);
-   assert(hashMap && "join superset: hash map must precede buffer materialize");
-   assert(!hashMap.getInputCols().empty() && "join hash map must have key input columns");
+   if (!hashMap || hashMap.getInputCols().empty()) return "";
    auto keyRef = mlir::cast<tuples::ColumnRefAttr>(hashMap.getInputCols()[0]);
    auto [keyScope, keyLeaf] = cm.getName(&keyRef.getColumn());
    for (auto& [member, colRef] : mat.getMapping().getMapping()) {
@@ -182,7 +191,7 @@ static llvm::StringRef joinKeyMemberNameFromBuildStep(subop::ExecutionStepOp bui
       auto [scope, leaf] = cm.getName(&colRef.getColumn());
       if (scope == keyScope && leaf == keyLeaf) return mm.getName(member);
    }
-   llvm_unreachable("join superset: materialize must map hash-map key column to a buffer member");
+   return "";
 }
 
 static mlir::Value resolveJoinMergedBuffer(mlir::Value hivOrBuf, mlir::ModuleOp module, const ModuleReuseInfo& reuse) {
@@ -294,6 +303,13 @@ static subop::ExecutionStepOp findJoinBufferBuildStepForHiv(mlir::ModuleOp modul
    if (subop::ExecutionStepOp step = findJoinBufferBuildStepFromWriterChain(buf, reuse)) return step;
    if (subop::ExecutionStepOp step = findBufferBuildStepWithTableMaterialize(buf, reuse)) return step;
    return findBufferBuildStepWithTableScan(module);
+}
+
+static subop::ExecutionStepOp findStrictJoinBufferBuildStepForHiv(mlir::ModuleOp module, mlir::Value hiv,
+                                                                  const ModuleReuseInfo& reuse) {
+   mlir::Value buf = resolveJoinMergedBuffer(hiv, module, reuse);
+   if (subop::ExecutionStepOp step = findJoinBufferBuildStepFromWriterChain(buf, reuse)) return step;
+   return findBufferBuildStepWithTableMaterialize(buf, reuse);
 }
 
 static subop::ExecutionStepOp findBufferBuildStepWithTableMaterialize(mlir::Value mergedBuffer,
@@ -617,7 +633,7 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
    assert(chiv && "join superset: HIV must have create_hash_indexed_view writer");
    plan.linkMember = chiv.getLinkMember().getMember();
    plan.hashMember = chiv.getHashMember().getMember();
-   llvm::StringRef joinKeyMemberName;
+   std::string joinKeyMemberName;
    subop::ExecutionStepOp buildStep = findJoinBufferBuildStepForHiv(modA, hivA, reuseA);
    assert(buildStep && "join superset: HIV build step required for union plan");
    joinKeyMemberName = joinKeyMemberNameFromBuildStep(buildStep, plan.linkMember, plan.hashMember, mm, cm);
@@ -1570,6 +1586,39 @@ static subop::HashIndexedViewType asHashIndexedViewLayoutType(mlir::Type type) {
    return nullptr;
 }
 
+static bool sameMemberTypeSequence(subop::MemberManager& mmA, subop::StateMembersAttr a,
+                                   subop::MemberManager& mmB, subop::StateMembersAttr b) {
+   auto as = a.getMembers();
+   auto bs = b.getMembers();
+   if (as.size() != bs.size()) return false;
+   for (size_t i = 0; i < as.size(); ++i) {
+      std::string typeA;
+      std::string typeB;
+      llvm::raw_string_ostream osA(typeA);
+      llvm::raw_string_ostream osB(typeB);
+      mmA.getType(as[i]).print(osA);
+      mmB.getType(bs[i]).print(osB);
+      osA.flush();
+      osB.flush();
+      if (typeA != typeB) return false;
+   }
+   return true;
+}
+
+static bool hashIndexedViewLayoutsArePhysicallyCompatible(mlir::Value a, mlir::Value b) {
+   auto hivA = asHashIndexedViewLayoutType(a.getType());
+   auto hivB = asHashIndexedViewLayoutType(b.getType());
+   if (!hivA || !hivB) return false;
+   if (hivA.getCompareHashForLookup() != hivB.getCompareHashForLookup()) return false;
+   auto* dialectA = a.getContext()->getLoadedDialect<subop::SubOperatorDialect>();
+   auto* dialectB = b.getContext()->getLoadedDialect<subop::SubOperatorDialect>();
+   assert(dialectA && dialectB);
+   auto& mmA = dialectA->getMemberManager();
+   auto& mmB = dialectB->getMemberManager();
+   return sameMemberTypeSequence(mmA, hivA.getKeyMembers(), mmB, hivB.getKeyMembers()) &&
+          sameMemberTypeSequence(mmA, hivA.getValueMembers(), mmB, hivB.getValueMembers());
+}
+
 static std::optional<std::string> firstFilterPredMemberName(subop::StateMembersAttr members,
                                                             subop::MemberManager& mm) {
    std::optional<std::string> best;
@@ -2011,6 +2060,22 @@ static void refreshTableStateTypesInModule(mlir::ModuleOp module, mlir::Value ta
       auto [it, inserted] = widenedScanRefByColumn.try_emplace(oldCol);
       if (inserted) it->second = transformer.createReplacementColumn(oldRef, entryRefTy);
       scan.setRefAttr(it->second);
+   });
+   module.walk([&](subop::MapOp map) {
+      llvm::SmallVector<mlir::Attribute> computed;
+      bool changed = false;
+      computed.reserve(map.getComputedCols().size());
+      for (auto attr : map.getComputedCols()) {
+         auto def = mlir::cast<tuples::ColumnDefAttr>(attr);
+         auto it = widenedScanRefByColumn.find(&def.getColumn());
+         if (it != widenedScanRefByColumn.end()) {
+            computed.push_back(it->second);
+            changed = true;
+         } else {
+            computed.push_back(attr);
+         }
+      }
+      if (changed) map.setComputedColsAttr(mlir::ArrayAttr::get(ctx, computed));
    });
 }
 
@@ -2765,7 +2830,7 @@ static subop::Member cloneMemberToContext(subop::Member srcMember, mlir::MLIRCon
 static std::string aggregateColumnSemanticKey(tuples::ColumnRefAttr col,
                                               tuples::ColumnManager& cm) {
    auto [scope, leaf] = cm.getName(&col.getColumn());
-   return columnSemanticKey(scope, leaf);
+   return columnSemanticKey(aggregatePayloadScopeSemantic(scope), leaf);
 }
 
 static mlir::Value stripCastLikeForAggregateSemantic(mlir::Value v) {
@@ -2780,6 +2845,44 @@ static mlir::Value stripCastLikeForAggregateSemantic(mlir::Value v) {
       }
       return v;
    }
+}
+
+static bool aggregateExprContainsValue(mlir::Value root, mlir::Value needle, llvm::DenseSet<void*>& seen) {
+   root = stripCastLikeForAggregateSemantic(root);
+   if (root == needle) return true;
+   if (!seen.insert(root.getAsOpaquePointer()).second) return false;
+   mlir::Operation* def = root.getDefiningOp();
+   if (!def) return false;
+   for (mlir::Value operand : def->getOperands()) {
+      if (aggregateExprContainsValue(operand, needle, seen)) return true;
+   }
+   return false;
+}
+
+static bool aggregateExprContainsValue(mlir::Value root, mlir::Value needle) {
+   llvm::DenseSet<void*> seen;
+   return aggregateExprContainsValue(root, needle, seen);
+}
+
+static std::optional<unsigned> findAggregateInputArgIndex(mlir::Value root, mlir::Block& block, unsigned numCols,
+                                                         llvm::DenseSet<void*>& seen) {
+   root = stripCastLikeForAggregateSemantic(root);
+   if (!seen.insert(root.getAsOpaquePointer()).second) return std::nullopt;
+   if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(root)) {
+      if (barg.getOwner() == &block && barg.getArgNumber() < numCols) return barg.getArgNumber();
+      return std::nullopt;
+   }
+   mlir::Operation* def = root.getDefiningOp();
+   if (!def) return std::nullopt;
+   for (mlir::Value operand : def->getOperands()) {
+      if (auto idx = findAggregateInputArgIndex(operand, block, numCols, seen)) return idx;
+   }
+   return std::nullopt;
+}
+
+static std::optional<unsigned> findAggregateInputArgIndex(mlir::Value root, mlir::Block& block, unsigned numCols) {
+   llvm::DenseSet<void*> seen;
+   return findAggregateInputArgIndex(root, block, numCols, seen);
 }
 
 static std::string aggregatePayloadSemanticKeyForReturn(subop::ReduceOp reduce, unsigned memberIdx,
@@ -2813,6 +2916,11 @@ static std::string aggregatePayloadSemanticKeyForReturn(subop::ReduceOp reduce, 
          }
       }
    }
+   if (auto inputIdx = findAggregateInputArgIndex(returned, block, numCols)) {
+      auto col = mlir::cast<tuples::ColumnRefAttr>(reduce.getColumns()[*inputIdx]);
+      if (aggregateExprContainsValue(returned, current)) return "sum:" + aggregateColumnSemanticKey(col, cm);
+      return aggregateColumnSemanticKey(col, cm);
+   }
    llvm_unreachable("aggregate union: unsupported reduce payload update expression");
 }
 
@@ -2843,6 +2951,27 @@ struct AggregatePayloadMemberInfo {
    tuples::ColumnRefAttr sourceColumn;
 };
 
+static tuples::ColumnRefAttr resolveAggregatePayloadSourceColumn(subop::ReduceOp reduceOp, unsigned payloadIdx) {
+   mlir::Block& block = reduceOp.getRegion().front();
+   auto ret = mlir::cast<tuples::ReturnOp>(block.getTerminator());
+   const unsigned numCols = reduceOp.getColumns().size();
+   mlir::Value current = block.getArgument(numCols + payloadIdx);
+
+   mlir::Value returned = stripCastLikeForAggregateSemantic(ret.getOperand(payloadIdx));
+   if (auto inputIdx = findAggregateInputArgIndex(returned, block, numCols))
+      return mlir::cast<tuples::ColumnRefAttr>(reduceOp.getColumns()[*inputIdx]);
+
+   auto* def = returned.getDefiningOp();
+   if (!def || def->getName().getStringRef() != "db.add")
+      abortAggregateUnionUnsupported("aggregate payload is neither passthrough nor additive");
+   mlir::Value lhs = stripCastLikeForAggregateSemantic(def->getOperand(0));
+   mlir::Value rhs = stripCastLikeForAggregateSemantic(def->getOperand(1));
+   mlir::Value payload = lhs == current ? rhs : lhs;
+   if (auto inputIdx = findAggregateInputArgIndex(payload, block, numCols))
+      return mlir::cast<tuples::ColumnRefAttr>(reduceOp.getColumns()[*inputIdx]);
+   abortAggregateUnionUnsupported("aggregate additive payload source is not an input column");
+}
+
 static llvm::SmallVector<AggregatePayloadMemberInfo, 16>
 collectAggregatePayloadMembers(mlir::ModuleOp module, mlir::Value aggregateState) {
    auto* ctx = module.getContext();
@@ -2852,38 +2981,48 @@ collectAggregatePayloadMembers(mlir::ModuleOp module, mlir::Value aggregateState
    assert(ht && "aggregate payload collection requires optimistic_ht-like state");
    subop::PreAggrHtFragmentType fragTy = fragmentTypeForAggregateHt(ht);
 
-   subop::ReduceOp reduceOp = nullptr;
-   subop::ReduceOp firstReduce = nullptr;
+   llvm::SmallVector<subop::ReduceOp, 4> reduceOps;
    module.walk([&](subop::ReduceOp reduce) {
-      if (!firstReduce) firstReduce = reduce;
       auto refTy = mlir::dyn_cast<subop::LookupEntryRefType>(reduce.getRef().getColumn().type);
       if (!refTy || refTy.getState() != fragTy) return mlir::WalkResult::advance();
-      reduceOp = reduce;
-      return mlir::WalkResult::interrupt();
+      reduceOps.push_back(reduce);
+      return mlir::WalkResult::advance();
    });
-   if (!reduceOp) reduceOp = firstReduce;
-   if (!reduceOp) llvm_unreachable("aggregate union: expected reduce op for aggregate hash table");
+   module.walk([&](subop::ReduceOp reduce) {
+      auto refTy = mlir::dyn_cast<subop::LookupEntryRefType>(reduce.getRef().getColumn().type);
+      if (!refTy || refTy.getState() != ht) return mlir::WalkResult::advance();
+      reduceOps.push_back(reduce);
+      return mlir::WalkResult::advance();
+   });
+   if (reduceOps.empty()) llvm_unreachable("aggregate union: expected reduce op for aggregate hash table");
 
-   llvm::SmallVector<AggregatePayloadMemberInfo, 16> out;
-   for (unsigned i = 0; i < reduceOp.getMembers().size(); ++i) {
-      auto member = mlir::cast<subop::MemberAttr>(reduceOp.getMembers()[i]).getMember();
-      tuples::ColumnRefAttr sourceColumn;
-      std::string semanticKey = aggregatePayloadSemanticKeyForReturn(reduceOp, i, cm);
-      if (semanticKey != "count:*") {
-         mlir::Block& block = reduceOp.getRegion().front();
-         auto ret = mlir::cast<tuples::ReturnOp>(block.getTerminator());
-         const unsigned numCols = reduceOp.getColumns().size();
-         mlir::Value current = block.getArgument(numCols + i);
-         mlir::Value returned = stripCastLikeForAggregateSemantic(ret.getOperand(i));
-         auto* def = returned.getDefiningOp();
-         assert(def && def->getName().getStringRef() == "db.add" && "aggregate sum payload must be db.add");
-         mlir::Value lhs = stripCastLikeForAggregateSemantic(def->getOperand(0));
-         mlir::Value rhs = stripCastLikeForAggregateSemantic(def->getOperand(1));
-         mlir::Value payload = lhs == current ? rhs : lhs;
-         auto barg = mlir::cast<mlir::BlockArgument>(payload);
-         sourceColumn = mlir::cast<tuples::ColumnRefAttr>(reduceOp.getColumns()[barg.getArgNumber()]);
+   llvm::DenseMap<subop::Member, AggregatePayloadMemberInfo> byMember;
+   auto recordMember = [&](subop::Member member, std::string semanticKey, tuples::ColumnRefAttr sourceColumn) {
+      AggregatePayloadMemberInfo info{std::move(semanticKey), member, mm.getType(member), sourceColumn};
+      auto it = byMember.find(member);
+      if (it == byMember.end() || (it->second.semanticKey == "identity" && info.semanticKey != "identity")) {
+         byMember[member] = std::move(info);
       }
-      out.push_back({semanticKey, member, mm.getType(member), sourceColumn});
+   };
+   for (subop::ReduceOp reduceOp : reduceOps) {
+      for (unsigned i = 0; i < reduceOp.getMembers().size(); ++i) {
+         auto member = mlir::cast<subop::MemberAttr>(reduceOp.getMembers()[i]).getMember();
+         tuples::ColumnRefAttr sourceColumn;
+         std::string semanticKey = aggregatePayloadSemanticKeyForReturn(reduceOp, i, cm);
+         if (semanticKey != "count:*" && semanticKey != "identity") {
+            sourceColumn = resolveAggregatePayloadSourceColumn(reduceOp, i);
+         }
+         recordMember(member, std::move(semanticKey), sourceColumn);
+      }
+   }
+   llvm::SmallVector<AggregatePayloadMemberInfo, 16> out;
+   for (subop::Member member : ht.getValueMembers().getMembers()) {
+      auto it = byMember.find(member);
+      if (it != byMember.end()) {
+         out.push_back(std::move(it->second));
+      } else {
+         out.push_back({"identity", member, mm.getType(member), {}});
+      }
    }
    return out;
 }
@@ -3478,7 +3617,23 @@ aggregateSemanticToConsumerMembers(const CachedAggregateLayout& layout, unsigned
 struct ConsumerAggregateAlignment {
    subop::PreAggrHtType ht;
    llvm::DenseMap<subop::Member, subop::Member> memberRemap;
+   llvm::DenseMap<subop::Member, subop::Member> keyMemberRemap;
 };
+
+static llvm::DenseMap<subop::Member, subop::Member>
+buildAggregateKeyMemberRemap(subop::PreAggrHtType oldHt, subop::PreAggrHtType alignedHt) {
+   llvm::DenseMap<subop::Member, subop::Member> remap;
+   auto& mm = oldHt.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   llvm::ArrayRef<subop::Member> oldKeys = oldHt.getKeyMembers().getMembers();
+   llvm::ArrayRef<subop::Member> alignedKeys = alignedHt.getKeyMembers().getMembers();
+   assert(oldKeys.size() == alignedKeys.size() && "aggregate cache_get key layout must preserve arity");
+   for (size_t i = 0; i < oldKeys.size(); ++i) {
+      if (mm.getType(oldKeys[i]) != mm.getType(alignedKeys[i]))
+         llvm_unreachable("aggregate cache_get key layout must preserve key member types");
+      if (oldKeys[i] != alignedKeys[i]) remap[oldKeys[i]] = alignedKeys[i];
+   }
+   return remap;
+}
 
 static ConsumerAggregateAlignment buildConsumerAggregateAlignment(const CachedAggregateLayout& layout,
                                                                   unsigned consumerIdx, mlir::MLIRContext* ctx) {
@@ -4712,6 +4867,7 @@ void extendSyntheticJoinBuffersToColumnUnionForGroups(
       auto itG = groupByKey.find(t.cacheKey);
       if (itG == groupByKey.end()) continue;
       const CrossQueryStateMatchGroup& group = *itG->second;
+      if (!group.requiresJoinLayoutUnion) continue;
       if (!asHashIndexedViewLayoutType(t.state.getType())) continue;
 
       const CrossQueryStateMatchEntry* donor = nullptr;
@@ -4737,6 +4893,13 @@ void extendSyntheticJoinBuffersToColumnUnionForGroups(
           !asHashIndexedViewLayoutType(hivPeer.getType())) {
          continue;
       }
+      if (hashIndexedViewLayoutsArePhysicallyCompatible(hivDonor, hivPeer)) {
+         continue;
+      }
+      if (!findStrictJoinBufferBuildStepForHiv(queries[donor->query], hivDonor, reuseDonor) ||
+          !findStrictJoinBufferBuildStepForHiv(queries[firstPeer->query], hivPeer, reusePeer)) {
+         continue;
+      }
 
       JoinBufferUnionPlan plan =
          buildUnionPlan(hivDonor, hivPeer, reuseDonor, reusePeer, queries[donor->query],
@@ -4758,6 +4921,7 @@ void extendSyntheticJoinBuffersToColumnUnionForGroups(
          const ModuleReuseInfo& reuseExtra = reuseByQuery[entry.query];
          mlir::Value hivExtra = resolveCacheTargetStateForReuse(entry.state, reuseExtra);
          if (!asHashIndexedViewLayoutType(hivExtra.getType())) continue;
+         if (!findStrictJoinBufferBuildStepForHiv(queries[entry.query], hivExtra, reuseExtra)) continue;
          extraPeerHivs.push_back({queries[entry.query], hivExtra});
          extraPeerReuses.push_back(&reuseExtra);
       }
@@ -4807,6 +4971,13 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
       mlir::Value hivB = resolveCacheTargetStateForReuse(m.stateB, reuse1);
       if (!asHashIndexedViewLayoutType(hivA.getType()) ||
           !asHashIndexedViewLayoutType(hivB.getType())) {
+         continue;
+      }
+      if (hashIndexedViewLayoutsArePhysicallyCompatible(hivA, hivB)) {
+         continue;
+      }
+      if (!findStrictJoinBufferBuildStepForHiv(query0, hivA, reuse0) ||
+          !findStrictJoinBufferBuildStepForHiv(query1, hivB, reuse1)) {
          continue;
       }
 
@@ -4904,6 +5075,7 @@ void alignConsumerModulesToCachedAggregateLayout(mlir::ModuleOp consumer, const 
       if (cacheKey && static_cast<uint64_t>(get.getKey()) != *cacheKey) return;
       auto oldHt = mlir::dyn_cast<subop::PreAggrHtType>(get.getResult().getType());
       if (!oldHt) return;
+      alignment.keyMemberRemap = buildAggregateKeyMemberRemap(oldHt, alignedHt);
       get.getResult().setType(alignedHt);
 
       llvm::DenseSet<void*> closure;
@@ -4947,7 +5119,10 @@ void alignConsumerModulesToCachedAggregateLayout(mlir::ModuleOp consumer, const 
          bool changed = false;
          for (auto [member, col] : gather.getMapping().getMapping()) {
             subop::Member outMember = member;
-            if (auto it = memberRemap.find(member); it != memberRemap.end()) {
+            if (auto it = alignment.keyMemberRemap.find(member); it != alignment.keyMemberRemap.end()) {
+               outMember = it->second;
+               changed = true;
+            } else if (auto it = memberRemap.find(member); it != memberRemap.end()) {
                outMember = it->second;
                changed = true;
             }
@@ -5048,26 +5223,25 @@ void refreshCachedJoinLayoutsFromSyntheticCachePuts(mlir::ModuleOp synthetic,
                                                     CachedJoinBufferLayoutsByKey& layoutsByKey) {
    auto& mm = synthetic.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    for (const CacheTarget& t : targetsInSynthetic) {
+      auto itPrevLayout = layoutsByKey.find(t.cacheKey);
+      if (itPrevLayout == layoutsByKey.end()) continue;
       synthetic.walk([&](subop::CachePutOp put) {
          if (static_cast<uint64_t>(put.getKey()) != t.cacheKey) return;
          auto hivTy = asHashIndexedViewLayoutType(put.getState().getType());
          if (!hivTy) return;
-         const CachedJoinBufferLayout* prev = nullptr;
-         if (auto it = layoutsByKey.find(t.cacheKey); it != layoutsByKey.end()) prev = &it->second;
+         const CachedJoinBufferLayout* prev = &itPrevLayout->second;
 
          CachedJoinBufferLayout layout;
          layout.producerHiv = hivTy;
-         if (prev) {
-            layout.query0SemanticKeys = prev->query0SemanticKeys;
-            layout.query1SemanticKeys = prev->query1SemanticKeys;
-            layout.query0SlotInUnion = prev->query0SlotInUnion;
-            layout.query1SlotInUnion = prev->query1SlotInUnion;
-         }
+         layout.query0SemanticKeys = prev->query0SemanticKeys;
+         layout.query1SemanticKeys = prev->query1SemanticKeys;
+         layout.query0SlotInUnion = prev->query0SlotInUnion;
+         layout.query1SlotInUnion = prev->query1SlotInUnion;
          size_t idx = 0;
          for (subop::Member m : hivTy.getValueMembers().getMembers()) {
             layout.payloadMembers.push_back(m);
             layout.payloadColumnTypes.push_back(mm.getType(m));
-            if (prev && idx < prev->payloadSemanticKeys.size()) {
+            if (idx < prev->payloadSemanticKeys.size()) {
                layout.payloadSemanticKeys.push_back(prev->payloadSemanticKeys[idx]);
             } else if (auto predSlot = parseFilterPredMemberSlot(mm.getName(m))) {
                layout.payloadSemanticKeys.push_back(reuseFilterPredSemanticKey(*predSlot));

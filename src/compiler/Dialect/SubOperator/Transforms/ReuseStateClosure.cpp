@@ -99,9 +99,17 @@ static mlir::Type executionStepBodyArgTypeForOperand(mlir::Value operand, mlir::
    return operand.getType();
 }
 
-/// Keep `execution_step` result types and body entry types aligned with `execution_step_return`
-/// and step operands. When \p closureFilter is non-null, only touch steps that reach the join
-/// buffer / HIV closure (derived from `computeJoinBufferHivSsaClosure`).
+static bool nestedExecutionGroupTouchesClosure(subop::NestedExecutionGroupOp nested,
+                                               const llvm::DenseSet<void*>& closure) {
+   if (opOperandsOrNestedBlockArgsTouchClosure(nested.getOperation(), closure)) return true;
+   for (mlir::OpResult r : nested.getResults()) {
+      if (opaqueClosureContains(closure, r)) return true;
+   }
+   return false;
+}
+
+/// Keep region-carrying state op ports aligned with their region entry / return values. When
+/// \p closureFilter is non-null, only touch ops that reach the join buffer / HIV closure.
 void synchronizeExecutionStepPortTypes(mlir::ModuleOp module, const llvm::DenseSet<void*>* closureFilter) {
    for (;;) {
       bool changed = false;
@@ -118,6 +126,18 @@ void synchronizeExecutionStepPortTypes(mlir::ModuleOp module, const llvm::DenseS
             }
          }
       });
+      module.walk([&](subop::NestedExecutionGroupReturnOp ret) {
+         auto nested = mlir::dyn_cast<subop::NestedExecutionGroupOp>(ret->getParentOp());
+         if (!nested || nested.getNumResults() != ret.getNumOperands()) return;
+         if (closureFilter && !nestedExecutionGroupTouchesClosure(nested, *closureFilter)) return;
+         for (unsigned i = 0; i < nested.getNumResults(); ++i) {
+            mlir::Type t = ret.getOperand(i).getType();
+            if (t != nested.getResult(i).getType()) {
+               nested.getResult(i).setType(t);
+               changed = true;
+            }
+         }
+      });
       module.walk([&](subop::ExecutionStepOp step) {
          if (closureFilter && !executionStepTouchesClosure(step, *closureFilter)) return;
          mlir::Block& body = step.getSubOps().front();
@@ -129,6 +149,17 @@ void synchronizeExecutionStepPortTypes(mlir::ModuleOp module, const llvm::DenseS
             wt = executionStepBodyArgTypeForOperand(step.getOperand(i), tlsAttr);
             if (body.getArgument(i).getType() != wt) {
                body.getArgument(i).setType(wt);
+               changed = true;
+            }
+         }
+      });
+      module.walk([&](subop::NestedExecutionGroupOp nested) {
+         if (closureFilter && !nestedExecutionGroupTouchesClosure(nested, *closureFilter)) return;
+         mlir::Block& body = nested.getSubOps().front();
+         for (unsigned i = 0; i < nested.getNumOperands() && i < body.getNumArguments(); ++i) {
+            mlir::Type t = nested.getOperand(i).getType();
+            if (body.getArgument(i).getType() != t) {
+               body.getArgument(i).setType(t);
                changed = true;
             }
          }

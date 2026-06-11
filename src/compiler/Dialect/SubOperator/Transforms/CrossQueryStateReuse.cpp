@@ -977,7 +977,7 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    return res;
 }
 
-BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
+static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
    llvm::ArrayRef<mlir::ModuleOp> queries,
    llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
    lingodb::catalog::Catalog* catalog) {
@@ -991,6 +991,10 @@ BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
    llvm::SmallVector<ModuleReuseInfo, 8> reuseEarly;
    reuseEarly.reserve(queries.size());
    for (mlir::ModuleOp q : queries) reuseEarly.push_back(collectModuleReuseInfo(q));
+   llvm::DenseMap<uint64_t, bool> requiresJoinLayoutUnionByKey;
+   for (const CrossQueryStateMatchGroup& g : groups) {
+      requiresJoinLayoutUnionByKey[g.cacheKey] = g.requiresJoinLayoutUnion;
+   }
 
    llvm::SmallVector<llvm::SmallVector<CacheTarget, 16>, 8> targetsByQuery(queries.size());
    struct DonorGroup {
@@ -1156,6 +1160,7 @@ BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
                                                 /*joinBufferHashmapLayoutAlreadyApplied=*/true,
                                                 /*joinBufferWritePredAlreadyApplied=*/true);
       for (const CacheTarget& t : targetsByQuery[qi]) {
+         if (!requiresJoinLayoutUnionByKey.lookup(t.cacheKey)) continue;
          if (auto it = producerLayoutsByKey.find(t.cacheKey); it != producerLayoutsByKey.end()) {
             unsigned slot = static_cast<unsigned>(qi);
             if (auto itByQuery = consumerSlotByCacheKeyAndQuery.find(t.cacheKey);
@@ -1193,6 +1198,66 @@ BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
    }
 
    return res;
+}
+
+static void appendSyntheticProducerSteps(mlir::ModuleOp dst, mlir::ModuleOp src) {
+   ExecutionGroupOp dstGroup = getSingleExecutionGroup(dst);
+   ExecutionGroupOp srcGroup = getSingleExecutionGroup(src);
+   mlir::Block& dstBlock = dstGroup.getSubOps().front();
+   mlir::Block& srcBlock = srcGroup.getSubOps().front();
+   mlir::Operation* dstTerminator = dstBlock.getTerminator();
+   assert(dstTerminator && "synthetic execution_group must have a terminator");
+
+   mlir::IRMapping mapping;
+   for (mlir::Operation& op : srcBlock.without_terminator()) {
+      auto* cloned = op.clone(mapping);
+      dstBlock.getOperations().insert(mlir::Block::iterator(dstTerminator), cloned);
+   }
+}
+
+BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
+   llvm::ArrayRef<mlir::ModuleOp> queries,
+   llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
+   lingodb::catalog::Catalog* catalog) {
+   BatchReusePlanRewriteResult total;
+   total.numTargetsPerQuery.resize(queries.size(), 0);
+   total.numTargetsNoTablePerQuery.resize(queries.size(), 0);
+
+   llvm::SmallVector<CrossQueryStateMatchGroup, 64> currentGroups(groups.begin(), groups.end());
+   constexpr unsigned maxFixedPointIterations = 8;
+   for (unsigned iter = 0; iter < maxFixedPointIterations; ++iter) {
+      if (currentGroups.empty()) break;
+
+      BatchReusePlanRewriteResult one =
+         rewritePlansWithSyntheticQueryBatchOnce(queries, currentGroups, catalog);
+      bool madeProgress = one.numTargetsSyntheticMapped > 0;
+      if (!madeProgress) break;
+
+      for (size_t qi = 0; qi < queries.size(); ++qi) {
+         if (qi < one.numTargetsPerQuery.size()) total.numTargetsPerQuery[qi] += one.numTargetsPerQuery[qi];
+         if (qi < one.numTargetsNoTablePerQuery.size())
+            total.numTargetsNoTablePerQuery[qi] += one.numTargetsNoTablePerQuery[qi];
+      }
+      total.numTargetsSyntheticMapped += one.numTargetsSyntheticMapped;
+      total.numTargetsSyntheticMappedNoTable += one.numTargetsSyntheticMappedNoTable;
+
+      if (one.synthetic) {
+         if (!total.synthetic) {
+            total.synthetic = std::move(one.synthetic);
+         } else {
+            appendSyntheticProducerSteps(*total.synthetic, *one.synthetic);
+         }
+      }
+
+      llvm::SmallVector<std::pair<int, mlir::ModuleOp>, 8> qmods;
+      qmods.reserve(queries.size());
+      for (size_t qi = 0; qi < queries.size(); ++qi) {
+         qmods.push_back({static_cast<int>(qi), queries[qi]});
+      }
+      currentGroups = collectCrossQueryStateMatchGroups(qmods);
+   }
+
+   return total;
 }
 
 } // namespace lingodb::compiler::dialect::subop

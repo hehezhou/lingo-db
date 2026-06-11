@@ -55,6 +55,8 @@ struct CrossQueryStateMatchGroup {
    llvm::SmallVector<CrossQueryStateMatchEntry, 8> entries;
    /// Per-group: insert union / synthetic / consumer \c filter_pred$N when peer external filters differ.
    bool enableFilterPredReuse = true;
+   /// False when matched HIV payload layouts are already physically equivalent and no union layout rewrite is needed.
+   bool requiresJoinLayoutUnion = true;
 };
 
 struct ModuleReuseInfo {
