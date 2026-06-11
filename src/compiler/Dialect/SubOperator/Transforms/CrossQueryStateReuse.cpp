@@ -1200,6 +1200,79 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
    return res;
 }
 
+static llvm::DenseMap<uint64_t, mlir::Value> collectCachePutStatesByKey(mlir::ModuleOp module) {
+   llvm::DenseMap<uint64_t, mlir::Value> out;
+   module.walk([&](subop::CachePutOp put) {
+      uint64_t key = static_cast<uint64_t>(put.getKey());
+      mlir::Value state = put.getState();
+      if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(state)) {
+         if (auto ownerStep = mlir::dyn_cast_or_null<ExecutionStepOp>(blockArg.getOwner()->getParentOp())) {
+            if (blockArg.getArgNumber() < ownerStep.getNumOperands()) {
+               state = ownerStep.getOperand(blockArg.getArgNumber());
+            }
+         }
+      }
+      auto it = out.find(key);
+      if (it == out.end()) {
+         out.try_emplace(key, state);
+         return;
+      }
+      assert(it->second == state &&
+             "synthetic module must not cache_put different states for the same key");
+   });
+   return out;
+}
+
+static std::optional<unsigned> parseFilterPredMemberSlotLocal(llvm::StringRef memberName) {
+   if (!memberName.consume_front("filter_pred$")) return std::nullopt;
+   unsigned slot = 0;
+   if (memberName.getAsInteger(10, slot)) return std::nullopt;
+   return slot;
+}
+
+static subop::HashIndexedViewType asHashIndexedViewLayoutTypeLocal(mlir::Type type) {
+   if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(type)) return hiv;
+   if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(type)) {
+      return subop::HashIndexedViewType::get(mixed.getContext(), mixed.getKeyMembers(), mixed.getValueMembers(),
+                                             mixed.getCompareHashForLookup());
+   }
+   return nullptr;
+}
+
+static std::optional<unsigned> highestFilterPredSlot(subop::HashIndexedViewType hiv) {
+   if (!hiv) return std::nullopt;
+   auto* ctx = hiv.getContext();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   std::optional<unsigned> bestSlot;
+   for (subop::Member m : hiv.getValueMembers().getMembers()) {
+      llvm::StringRef name = mm.getName(m);
+      auto slot = parseFilterPredMemberSlotLocal(name);
+      if (!slot) continue;
+      if (!bestSlot || *slot > *bestSlot) bestSlot = *slot;
+   }
+   return bestSlot;
+}
+
+static std::optional<std::pair<uint64_t, mlir::Value>>
+singleCacheGetReturnedByStep(ExecutionStepOp step) {
+   subop::CacheGetOp get;
+   bool multiple = false;
+   step.walk([&](subop::CacheGetOp op) {
+      if (get) {
+         multiple = true;
+         return mlir::WalkResult::interrupt();
+      }
+      get = op;
+      return mlir::WalkResult::advance();
+   });
+   if (!get || multiple) return std::nullopt;
+   if (step.getNumResults() != 1) return std::nullopt;
+   auto& body = step.getSubOps().front();
+   auto ret = mlir::dyn_cast<subop::ExecutionStepReturnOp>(body.getTerminator());
+   if (!ret || ret.getNumOperands() != 1 || ret.getOperand(0) != get.getRes()) return std::nullopt;
+   return std::make_pair(static_cast<uint64_t>(get.getKey()), get.getRes());
+}
+
 static void appendSyntheticProducerSteps(mlir::ModuleOp dst, mlir::ModuleOp src) {
    ExecutionGroupOp dstGroup = getSingleExecutionGroup(dst);
    ExecutionGroupOp srcGroup = getSingleExecutionGroup(src);
@@ -1208,11 +1281,78 @@ static void appendSyntheticProducerSteps(mlir::ModuleOp dst, mlir::ModuleOp src)
    mlir::Operation* dstTerminator = dstBlock.getTerminator();
    assert(dstTerminator && "synthetic execution_group must have a terminator");
 
+   llvm::DenseMap<uint64_t, mlir::Value> cachedStateByKey = collectCachePutStatesByKey(dst);
    mlir::IRMapping mapping;
    for (mlir::Operation& op : srcBlock.without_terminator()) {
+      if (auto step = mlir::dyn_cast<ExecutionStepOp>(&op)) {
+         if (auto cacheGet = singleCacheGetReturnedByStep(step)) {
+            auto it = cachedStateByKey.find(cacheGet->first);
+            if (it != cachedStateByKey.end()) {
+               if (!asHashIndexedViewLayoutTypeLocal(it->second.getType()) &&
+                   it->second.getType() == cacheGet->second.getType()) {
+                  mapping.map(cacheGet->second, it->second);
+                  mapping.map(step.getResult(0), it->second);
+                  continue;
+               }
+            }
+         }
+      }
       auto* cloned = op.clone(mapping);
       dstBlock.getOperations().insert(mlir::Block::iterator(dstTerminator), cloned);
    }
+}
+
+static CachedJoinBufferLayout cachedJoinLayoutFromHiv(subop::HashIndexedViewType hiv) {
+   CachedJoinBufferLayout layout;
+   layout.producerHiv = hiv;
+   auto& mm = hiv.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (subop::Member m : hiv.getValueMembers().getMembers()) {
+      layout.payloadMembers.push_back(m);
+      layout.payloadColumnTypes.push_back(mm.getType(m));
+      llvm::StringRef memberName = mm.getName(m);
+      if (auto slot = parseFilterPredMemberSlotLocal(memberName)) {
+         std::string semKey = "reuse_filter_pred";
+         semKey.push_back('\x1f');
+         semKey += llvm::Twine(*slot).str();
+         layout.payloadSemanticKeys.push_back(std::move(semKey));
+      } else {
+         layout.payloadSemanticKeys.push_back(std::string(memberName));
+      }
+   }
+   return layout;
+}
+
+static void alignSyntheticCacheGetDependenciesToCachedPuts(mlir::ModuleOp synthetic) {
+   llvm::DenseMap<uint64_t, subop::HashIndexedViewType> cachedHivByKey;
+   synthetic.walk([&](subop::CachePutOp put) {
+      if (auto hiv = asHashIndexedViewLayoutTypeLocal(put.getState().getType())) {
+         cachedHivByKey[static_cast<uint64_t>(put.getKey())] = hiv;
+      }
+   });
+   if (cachedHivByKey.empty()) return;
+
+   llvm::DenseSet<uint64_t> keysToAlign;
+   synthetic.walk([&](subop::CacheGetOp get) {
+      uint64_t key = static_cast<uint64_t>(get.getKey());
+      if (cachedHivByKey.contains(key)) keysToAlign.insert(key);
+   });
+   if (keysToAlign.empty()) return;
+
+   llvm::SmallVector<ConsumerCacheGetProbeClosure, 8> probeClosures;
+   for (uint64_t key : keysToAlign) {
+      subop::HashIndexedViewType hiv = cachedHivByKey.lookup(key);
+      std::optional<unsigned> predSlot = highestFilterPredSlot(hiv);
+      if (!predSlot || *predSlot < 2) continue;
+      CachedJoinBufferLayout layout = cachedJoinLayoutFromHiv(hiv);
+      alignConsumerModulesToCachedJoinLayout(synthetic, layout, key, predSlot, &probeClosures);
+      resyncConsumerCachedHivCarrierTypesFromCacheGet(synthetic, key);
+   }
+   if (probeClosures.empty()) return;
+   for (ConsumerCacheGetProbeClosure& probe : probeClosures) {
+      finalizeConsumerCachedJoinProbeColumnAttrs(synthetic, probe);
+   }
+   syncProbeGatherMappingsInModule(synthetic);
+   applyProbePredFiltersForConsumerClosures(synthetic, probeClosures);
 }
 
 BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
@@ -1247,6 +1387,7 @@ BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
          } else {
             appendSyntheticProducerSteps(*total.synthetic, *one.synthetic);
          }
+         alignSyntheticCacheGetDependenciesToCachedPuts(*total.synthetic);
       }
 
       llvm::SmallVector<std::pair<int, mlir::ModuleOp>, 8> qmods;

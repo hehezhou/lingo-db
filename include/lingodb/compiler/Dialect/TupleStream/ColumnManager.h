@@ -17,12 +17,15 @@ class ColumnManager {
    std::shared_ptr<Column> get(llvm::StringRef scope, llvm::StringRef attribute);
    ColumnDefAttr createDef(mlir::SymbolRefAttr name, mlir::Attribute fromExisting = mlir::Attribute());
    ColumnDefAttr createDef(llvm::StringRef scope, llvm::StringRef name, mlir::Attribute fromExisting = mlir::Attribute());
+   ColumnDefAttr createDef(llvm::StringRef scope, llvm::StringRef name, mlir::Type type,
+                           mlir::Attribute fromExisting = mlir::Attribute());
    ColumnDefAttr createDef(const Column* attr, mlir::Attribute fromExisting = mlir::Attribute());
 
    ColumnRefAttr createRef(mlir::SymbolRefAttr name);
    ColumnRefAttr createRef(const Column* attr);
 
    ColumnRefAttr createRef(llvm::StringRef scope, llvm::StringRef name);
+   ColumnRefAttr createRef(llvm::StringRef scope, llvm::StringRef name, mlir::Type type);
    std::pair<std::string, std::string> getName(const Column* attr);
 
    std::string getUniqueScope(llvm::StringRef base) {
@@ -37,6 +40,7 @@ class ColumnManager {
 
    private:
    mlir::MLIRContext* context;
+   std::shared_ptr<Column> get(llvm::StringRef scope, llvm::StringRef attribute, mlir::Type type);
    struct HashPair {
       template <class T1, class T2>
       size_t operator()(const std::pair<T1, T2>& p) const {
@@ -47,6 +51,7 @@ class ColumnManager {
    };
    llvm::StringMap<std::shared_ptr<Column>> attributes;
    llvm::DenseMap<const Column*, std::pair<std::string, std::string>> attributesRev;
+   llvm::DenseMap<const Column*, std::shared_ptr<Column>> attributesByPtr;
 
    llvm::StringMap<size_t> scopeUnifier;
 };
