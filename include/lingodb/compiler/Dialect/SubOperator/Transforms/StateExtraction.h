@@ -5,6 +5,7 @@
 #include "lingodb/runtime/ExternalDataSourceProperty.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include <llvm/Support/raw_ostream.h>
 
@@ -91,6 +92,12 @@ struct ModuleReuseInfo {
 };
 
 ModuleReuseInfo collectModuleReuseInfo(mlir::ModuleOp moduleOp);
+
+/// Recompute the construction hasher for \p state and return the same per-column identity hashes
+/// used by state construction hashing. Keys are addresses of tuple stream Column objects
+/// (`&ColumnRefAttr::getColumn()` / `&ColumnDefAttr::getColumn()`).
+llvm::DenseMap<const void*, uint64_t> collectStateConstructionColumnHashes(mlir::ModuleOp moduleOp,
+                                                                           mlir::Value state);
 
 /// Walk `mergedFromShadowState` from \p v toward predecessors; invoke \p fn on each shadow (not \p v).
 void forEachShadowChainPredecessor(mlir::Value v, const ModuleReuseInfo& reuse,

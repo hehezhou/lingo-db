@@ -98,6 +98,36 @@ static llvm::StringRef normalizeColumnIdentifier(llvm::StringRef identifier) {
    return stripMemberSuffix(identifier);
 }
 
+static uint64_t combinePayloadHash(uint64_t a, uint64_t b) {
+   return a ^ (b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2));
+}
+
+static uint64_t hashPayloadString(llvm::StringRef s) {
+   return static_cast<uint64_t>(llvm::hash_value(s));
+}
+
+static uint64_t hashPayloadType(mlir::Type type) {
+   if (!type) return 0;
+   std::string typeStr;
+   llvm::raw_string_ostream os(typeStr);
+   type.print(os);
+   return hashPayloadString(os.str());
+}
+
+static uint64_t payloadSyntheticColumnHash(llvm::StringRef scope, llvm::StringRef leaf, mlir::Type colType) {
+   uint64_t h = hashPayloadString("payload_synthetic_column");
+   h = combinePayloadHash(h, hashPayloadString(scope));
+   h = combinePayloadHash(h, hashPayloadString(leaf));
+   return combinePayloadHash(h, hashPayloadType(colType));
+}
+
+static uint64_t payloadColumnIdentityHash(tuples::ColumnRefAttr ref,
+                                          const llvm::DenseMap<const void*, uint64_t>& columnHashes) {
+   auto it = columnHashes.find(&ref.getColumn());
+   assert(it != columnHashes.end() && "payload column ref must have StateExtraction column identity hash");
+   return it->second;
+}
+
 static bool isPayloadMemberSlotName(llvm::StringRef name) { return name.starts_with("member$"); }
 static bool isJoinBufferInternalMemberName(llvm::StringRef name) {
    return name.starts_with("link$") || name.starts_with("hash$");
@@ -105,6 +135,7 @@ static bool isJoinBufferInternalMemberName(llvm::StringRef name) {
 
 struct PayloadColumnSpec {
    std::string semanticKey;
+   uint64_t semanticHash = 0;
    std::string scope;
    std::string leaf;
    mlir::Type colType;
@@ -140,9 +171,11 @@ static void ensureFilterPredUnionColumn(JoinBufferUnionPlan& plan, unsigned unio
    predSpec.leaf = llvm::Twine(unionSlot).str();
    predSpec.colType = mlir::IntegerType::get(ctx, 1);
    predSpec.semanticKey = semKey;
+   predSpec.semanticHash = payloadSyntheticColumnHash(predSpec.scope, predSpec.leaf, predSpec.colType);
    plan.payloadColumns.push_back(std::move(predSpec));
    llvm::sort(plan.payloadColumns, [](const PayloadColumnSpec& a, const PayloadColumnSpec& b) {
       if (a.isJoinKey != b.isJoinKey) return a.isJoinKey > b.isJoinKey;
+      if (a.semanticHash != b.semanticHash) return a.semanticHash < b.semanticHash;
       return a.semanticKey < b.semanticKey;
    });
    plan.payloadMemberTypes.clear();
@@ -384,15 +417,15 @@ static subop::ExecutionStepOp findBufferBuildStepWithTableScan(mlir::ModuleOp mo
    return found;
 }
 
-static void insertPayloadColumnSpec(llvm::StringMap<PayloadColumnSpec>& unionCols,
+static void insertPayloadColumnSpec(llvm::DenseMap<uint64_t, PayloadColumnSpec>& unionCols,
                                     PayloadColumnSpec spec,
                                     std::optional<unsigned> layoutSideIndex = std::nullopt);
 
 static void collectPayloadFromMaterialize(
    subop::MaterializeOp mat, llvm::StringRef linkMemberName, llvm::StringRef hashMemberName, subop::MemberManager& mm,
    lingodb::compiler::dialect::tuples::ColumnManager& cm, llvm::StringRef joinKeyMemberName,
-   llvm::StringMap<PayloadColumnSpec>& out, std::optional<unsigned> layoutSideIndex,
-   std::optional<unsigned> reuseQueryIndex) {
+   llvm::DenseMap<uint64_t, PayloadColumnSpec>& out, std::optional<unsigned> layoutSideIndex,
+   std::optional<unsigned> reuseQueryIndex, const llvm::DenseMap<const void*, uint64_t>& columnHashes) {
    for (auto& [member, colRef] : mat.getMapping().getMapping()) {
       llvm::StringRef memName = mm.getName(member);
       if (memName == linkMemberName || memName == hashMemberName || isJoinBufferInternalMemberName(memName))
@@ -405,10 +438,12 @@ static void collectPayloadFromMaterialize(
          spec.scope = kReuseFilterPredScope.str();
          spec.leaf = llvm::Twine(*reuseQueryIndex).str();
          spec.semanticKey = reuseFilterPredSemanticKey(*reuseQueryIndex);
+         spec.semanticHash = payloadSyntheticColumnHash(spec.scope, spec.leaf, spec.colType);
       } else {
          spec.scope = scope;
          spec.leaf = leaf;
          spec.semanticKey = columnSemanticKey(scope, leaf);
+         spec.semanticHash = payloadColumnIdentityHash(colRef, columnHashes);
       }
       insertPayloadColumnSpec(out, std::move(spec), layoutSideIndex);
    }
@@ -533,15 +568,16 @@ static unsigned countUnionPayloadLeavesOnTable(llvm::ArrayRef<PayloadColumnSpec>
    return overlap;
 }
 
-static void insertPayloadColumnSpec(llvm::StringMap<PayloadColumnSpec>& unionCols,
+static void insertPayloadColumnSpec(llvm::DenseMap<uint64_t, PayloadColumnSpec>& unionCols,
                                     PayloadColumnSpec spec,
                                     std::optional<unsigned> layoutSideIndex) {
+   assert(spec.semanticHash && "payload spec must carry a hash identity");
    auto markSide = [&](PayloadColumnSpec& existing) {
       if (layoutSideIndex && *layoutSideIndex == 0) existing.inQuery0 = true;
       if (layoutSideIndex && *layoutSideIndex == 1) existing.inQuery1 = true;
    };
 
-   auto it = unionCols.find(spec.semanticKey);
+   auto it = unionCols.find(spec.semanticHash);
    if (it != unionCols.end()) {
       markSide(it->second);
       it->second.isJoinKey |= spec.isJoinKey;
@@ -569,12 +605,12 @@ static void insertPayloadColumnSpec(llvm::StringMap<PayloadColumnSpec>& unionCol
       spec.isJoinKey |= existing.isJoinKey;
       markSide(spec);
       unionCols.erase(existingIt);
-      unionCols.try_emplace(spec.semanticKey, std::move(spec));
+      unionCols.try_emplace(spec.semanticHash, std::move(spec));
       return;
    }
 
    markSide(spec);
-   unionCols.try_emplace(spec.semanticKey, std::move(spec));
+   unionCols.try_emplace(spec.semanticHash, std::move(spec));
 }
 
 static subop::ScanRefsOp findTableScanForPayloadLeaf(subop::ExecutionStepOp buildStep, llvm::StringRef leaf,
@@ -610,10 +646,10 @@ static subop::ScanRefsOp findDonorTableScanInUnionPlan(subop::ExecutionStepOp bu
 
 static void ingestExternalTableColumnsFromBuildStepScan(subop::ExecutionStepOp buildStep,
                                                         const ModuleReuseInfo& reuse,
-                                                        llvm::StringMap<PayloadColumnSpec>& unionCols) {
+                                                        llvm::DenseMap<uint64_t, PayloadColumnSpec>& unionCols) {
    llvm::SmallVector<PayloadColumnSpec, 16> unionSpecs;
    unionSpecs.reserve(unionCols.size());
-   for (auto& it : unionCols) unionSpecs.push_back(it.getValue());
+   for (auto& it : unionCols) unionSpecs.push_back(it.second);
 
    auto& mm = buildStep.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    bool sawTableScan = false;
@@ -642,6 +678,7 @@ static void ingestExternalTableColumnsFromBuildStepScan(subop::ExecutionStepOp b
          spec.colType = memberTypeForIdentifier(tableTy, mm, leaf);
          assert(spec.colType && "external table mapping column must exist on scanned table type");
          spec.semanticKey = columnSemanticKey(spec.scope, spec.leaf);
+         spec.semanticHash = existing.semanticHash;
          spec.isJoinKey = existing.isJoinKey;
          spec.inQuery0 = existing.inQuery0;
          spec.inQuery1 = existing.inQuery1;
@@ -729,9 +766,10 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
    llvm::StringRef linkMemberName = mm.getName(plan.linkMember);
    llvm::StringRef hashMemberName = mm.getName(plan.hashMember);
 
-   llvm::StringMap<PayloadColumnSpec> unionCols;
+   llvm::DenseMap<uint64_t, PayloadColumnSpec> unionCols;
    auto ingestHiv = [&](mlir::Value h, const ModuleReuseInfo& reuse, mlir::ModuleOp mod,
                         unsigned layoutSideIndex, unsigned reuseQueryIndex) {
+      llvm::DenseMap<const void*, uint64_t> columnHashes = collectStateConstructionColumnHashes(mod, h);
       auto* hCtx = h.getContext();
       auto& hMm = hCtx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
       auto& hCm = hCtx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
@@ -744,7 +782,7 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
             return;
          }
          collectPayloadFromMaterialize(mat, linkMemberName, hashMemberName, hMm, hCm, joinKeyMemberName, unionCols,
-                                       layoutSideIndex, reuseQueryIndex);
+                                       layoutSideIndex, reuseQueryIndex, columnHashes);
       });
       if (enableFilterPredReuse) {
          PayloadColumnSpec predSpec;
@@ -752,7 +790,8 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
          predSpec.leaf = llvm::Twine(reuseQueryIndex).str();
          predSpec.colType = mlir::IntegerType::get(h.getContext(), 1);
          predSpec.semanticKey = reuseFilterPredSemanticKey(reuseQueryIndex);
-         unionCols.try_emplace(predSpec.semanticKey, predSpec);
+         predSpec.semanticHash = payloadSyntheticColumnHash(predSpec.scope, predSpec.leaf, predSpec.colType);
+         unionCols.try_emplace(predSpec.semanticHash, predSpec);
       }
       ingestExternalTableColumnsFromBuildStepScan(buildStep, reuse, unionCols);
    };
@@ -766,7 +805,8 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
          predSpec.leaf = llvm::Twine(unionSlot).str();
          predSpec.colType = mlir::IntegerType::get(hivA.getContext(), 1);
          predSpec.semanticKey = reuseFilterPredUnionSemanticKey(unionSlot);
-         unionCols.try_emplace(predSpec.semanticKey, predSpec);
+         predSpec.semanticHash = payloadSyntheticColumnHash(predSpec.scope, predSpec.leaf, predSpec.colType);
+         unionCols.try_emplace(predSpec.semanticHash, predSpec);
       }
    }
 
@@ -775,6 +815,7 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
    for (auto& it : unionCols) ordered.push_back(&it.second);
    llvm::sort(ordered, [](const PayloadColumnSpec* a, const PayloadColumnSpec* b) {
       if (a->isJoinKey != b->isJoinKey) return a->isJoinKey > b->isJoinKey;
+      if (a->semanticHash != b->semanticHash) return a->semanticHash < b->semanticHash;
       return a->semanticKey < b->semanticKey;
    });
    for (PayloadColumnSpec* p : ordered) {
@@ -791,15 +832,15 @@ static std::optional<unsigned> parseMemberSlot(llvm::StringRef name) {
    return slot;
 }
 
-/// Next `member$N` slot after \p bySemanticKey reuse set and already-assigned payload members.
-static unsigned nextPayloadMemberSlot(subop::MemberManager& mm, const llvm::StringMap<subop::Member>& bySemanticKey,
-                                        llvm::ArrayRef<subop::Member> assigned) {
+/// Next `member$N` slot after pre-existing and already-assigned payload members.
+static unsigned nextPayloadMemberSlot(subop::MemberManager& mm, const llvm::StringMap<subop::Member>& existingByName,
+                                      llvm::ArrayRef<subop::Member> assigned) {
    unsigned maxSlot = 0;
    auto bump = [&](subop::Member m) {
       if (auto slot = parseMemberSlot(mm.getName(m))) maxSlot = std::max(maxSlot, *slot + 1);
       if (auto predSlot = parseFilterPredMemberSlot(mm.getName(m))) maxSlot = std::max(maxSlot, *predSlot + 1);
    };
-   for (const auto& it : bySemanticKey) bump(it.second);
+   for (const auto& it : existingByName) bump(it.second);
    for (subop::Member m : assigned) bump(m);
    return maxSlot;
 }
@@ -1567,16 +1608,15 @@ static bool rewriteSyntheticResidualFiltersAsFilterPreds(subop::ExecutionStepOp 
    return true;
 }
 
-static void collectSemanticKeyToMemberFromMaterialize(
+static void collectSemanticHashToMemberFromMaterialize(
    subop::MaterializeOp mat, subop::Member linkM, subop::Member hashM, subop::MemberManager& mm,
-   lingodb::compiler::dialect::tuples::ColumnManager& cm, llvm::StringMap<subop::Member>& out) {
+   const llvm::DenseMap<const void*, uint64_t>& columnHashes, llvm::DenseMap<uint64_t, subop::Member>& out) {
    if (!mat) return;
    for (auto& [member, colRef] : mat.getMapping().getMapping()) {
       llvm::StringRef memName = mm.getName(member);
       if (member == linkM || member == hashM || isJoinBufferInternalMemberName(memName)) continue;
-      auto [scope, leaf] = cm.getName(&colRef.getColumn());
       if (mm.getType(member) != colRef.getColumn().type) continue;
-      out.try_emplace(columnSemanticKey(scope, leaf), member);
+      out.try_emplace(payloadColumnIdentityHash(colRef, columnHashes), member);
    }
 }
 
@@ -1584,12 +1624,17 @@ static void collectSemanticKeyToMemberFromMaterialize(
 /// Reuses existing buffer members (e.g. \c member$0, \c member$1) from materialize; new union columns get the next
 /// \c member$N slot via \c createMemberDirect (not semantic leaf names like \c s_comment$0).
 static void assignPayloadMembersForPlan(subop::MemberManager& mm, lingodb::compiler::dialect::tuples::ColumnManager& cm,
-                                        subop::MaterializeOp matOp, JoinBufferUnionPlan& plan) {
-   llvm::StringMap<subop::Member> bySemanticKey;
-   collectSemanticKeyToMemberFromMaterialize(matOp, plan.linkMember, plan.hashMember, mm, cm, bySemanticKey);
+                                        subop::MaterializeOp matOp, JoinBufferUnionPlan& plan,
+                                        const llvm::DenseMap<const void*, uint64_t>& columnHashes) {
+   llvm::DenseMap<uint64_t, subop::Member> bySemanticHash;
+   collectSemanticHashToMemberFromMaterialize(matOp, plan.linkMember, plan.hashMember, mm, columnHashes,
+                                              bySemanticHash);
    plan.payloadMembers.clear();
    plan.payloadMembers.reserve(plan.payloadColumns.size());
-   unsigned nextSlot = nextPayloadMemberSlot(mm, bySemanticKey, plan.payloadMembers);
+   llvm::SmallVector<subop::Member, 8> existingPayloadMembers;
+   for (auto& it : bySemanticHash) existingPayloadMembers.push_back(it.second);
+   llvm::StringMap<subop::Member> noSemanticMembers;
+   unsigned nextSlot = nextPayloadMemberSlot(mm, noSemanticMembers, existingPayloadMembers);
    if (subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(matOp.getState().getType())) {
       for (subop::Member m : bufTy.getMembers().getMembers()) {
          if (m == plan.linkMember || m == plan.hashMember) continue;
@@ -1607,7 +1652,8 @@ static void assignPayloadMembersForPlan(subop::MemberManager& mm, lingodb::compi
             "filter_pred$" + llvm::Twine(predIdx).str(), canonicalPredTy, /*allowTypeUpdate=*/false));
          continue;
       }
-      if (auto it = bySemanticKey.find(spec.semanticKey); it != bySemanticKey.end()) {
+      auto it = bySemanticHash.find(spec.semanticHash);
+      if (it != bySemanticHash.end()) {
          mlir::Type wantTy = cloneTypeToContext(spec.colType, synthCtx);
          if (mm.getType(it->second) != wantTy)
             llvm_unreachable("join superset: reused member type must match union column");
@@ -1767,10 +1813,12 @@ static void syncCreateHashIndexedViewFromBuffer(subop::CreateHashIndexedView chi
 }
 
 static void syncMaterializeMappingsToBufferMembers(mlir::ModuleOp module, subop::StateMembersAttr targetMembers,
-                                                   const llvm::DenseSet<void*>& closure);
+                                                   const llvm::DenseSet<void*>& closure,
+                                                   const llvm::DenseMap<const void*, uint64_t>* columnHashes);
 
 static void applyBufferLayoutToSsaClosure(mlir::ModuleOp module, llvm::ArrayRef<mlir::Value> canonicalBuffers,
-                                          subop::StateMembersAttr targetMembers, const ModuleReuseInfo& reuse) {
+                                          subop::StateMembersAttr targetMembers, const ModuleReuseInfo& reuse,
+                                          const llvm::DenseMap<const void*, uint64_t>* columnHashes = nullptr) {
    JoinBufferHivSsaClosure joinClosure = computeJoinBufferHivSsaClosure(canonicalBuffers, reuse);
    llvm::DenseSet<void*>& closure = joinClosure.opaque;
    expandClosureThroughExecutionStepPorts(module, closure);
@@ -1826,16 +1874,16 @@ static void applyBufferLayoutToSsaClosure(mlir::ModuleOp module, llvm::ArrayRef<
       if (!opaqueClosureContains(closure, chiv.getSource())) return;
       syncCreateHashIndexedViewFromBuffer(chiv);
    });
-   syncMaterializeMappingsToBufferMembers(module, targetMembers, closure);
+   syncMaterializeMappingsToBufferMembers(module, targetMembers, closure, columnHashes);
    synchronizeExecutionStepPortTypes(module, &closure);
 }
 
-/// After buffer layout is applied, canonicalize \c materialize member slots to \p targetMembers (by name / semantic key).
+/// After buffer layout is applied, canonicalize \c materialize member slots to \p targetMembers (by name / payload hash).
 static void syncMaterializeMappingsToBufferMembers(mlir::ModuleOp module, subop::StateMembersAttr targetMembers,
-                                                   const llvm::DenseSet<void*>& closure) {
+                                                   const llvm::DenseSet<void*>& closure,
+                                                   const llvm::DenseMap<const void*, uint64_t>* columnHashes) {
    auto* ctx = module.getContext();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    llvm::StringMap<subop::Member> validByName;
    for (subop::Member m : targetMembers.getMembers()) validByName[mm.getName(m)] = m;
 
@@ -1844,12 +1892,15 @@ static void syncMaterializeMappingsToBufferMembers(mlir::ModuleOp module, subop:
       subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(mat.getState().getType());
       if (!bufTy || bufTy.getMembers() != targetMembers) return;
 
-      llvm::StringMap<subop::Member> bySemanticKey;
-      for (auto& pr : mat.getMapping().getMapping()) {
-         auto itName = validByName.find(mm.getName(pr.first));
-         if (itName == validByName.end()) continue;
-         auto [scope, leaf] = cm.getName(&pr.second.getColumn());
-         bySemanticKey[columnSemanticKey(scope, leaf)] = itName->second;
+      llvm::DenseMap<uint64_t, subop::Member> byPayloadHash;
+      if (columnHashes) {
+         for (auto& pr : mat.getMapping().getMapping()) {
+            auto itName = validByName.find(mm.getName(pr.first));
+            if (itName == validByName.end()) continue;
+            auto itHash = columnHashes->find(&pr.second.getColumn());
+            if (itHash == columnHashes->end()) continue;
+            byPayloadHash[itHash->second] = itName->second;
+         }
       }
 
       llvm::SmallVector<subop::RefMappingPairT> pairs;
@@ -1864,10 +1915,12 @@ static void syncMaterializeMappingsToBufferMembers(mlir::ModuleOp module, subop:
                if (auto it = validByName.find(predName); it != validByName.end()) canon = it->second;
             }
          }
-         if (!canon) {
-            auto [scope, leaf] = cm.getName(&pr.second.getColumn());
-            if (auto it = bySemanticKey.find(columnSemanticKey(scope, leaf)); it != bySemanticKey.end())
-               canon = it->second;
+         if (!canon && columnHashes) {
+            auto itHash = columnHashes->find(&pr.second.getColumn());
+            if (itHash != columnHashes->end()) {
+               if (auto it = byPayloadHash.find(itHash->second); it != byPayloadHash.end())
+                  canon = it->second;
+            }
          }
          if (!canon) continue;
          pairs.push_back({canon, pr.second});
@@ -2219,10 +2272,10 @@ static void syncMapInputColsFromGather(subop::GatherOp gather, tuples::ColumnMan
          tuples::ColumnRefAttr replacement;
          if (auto it = outRefByKey.find(columnSemanticKey(scope, leaf)); it != outRefByKey.end()) {
             replacement = it->second;
-         } else if (auto it = outRefByNormLeaf.find(leaf); it != outRefByNormLeaf.end()) {
-            replacement = it->second;
-         } else if (!isPayloadMemberSlotName(leaf)) {
+         } else if (isPayloadMemberSlotName(leaf) || scope.starts_with("lookup_u_")) {
             if (auto it = outRefByNormLeaf.find(normalizeColumnIdentifier(leaf)); it != outRefByNormLeaf.end()) {
+               replacement = it->second;
+            } else if (auto it = outRefByNormLeaf.find(leaf); it != outRefByNormLeaf.end()) {
                replacement = it->second;
             }
          }
@@ -2386,7 +2439,8 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
                                          const JoinBufferUnionPlan& plan,
                                          const ModuleReuseInfo& reuseSynthetic,
                                          llvm::ArrayRef<std::pair<mlir::ModuleOp, mlir::Value>> peerHivs,
-                                         llvm::ArrayRef<const ModuleReuseInfo*> peerReuses) {
+                                         llvm::ArrayRef<const ModuleReuseInfo*> peerReuses,
+                                         const llvm::DenseMap<const void*, uint64_t>& columnHashes) {
    assert(peerHivs.size() == peerReuses.size() && "join superset: peer HIVs and reuse metadata must align");
    mlir::Block& body = buildStep.getSubOps().front();
    auto* ctx = synthetic.getContext();
@@ -2471,16 +2525,15 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    subop::MaterializeOp matOp = findJoinBufferMaterializeInStep(buildStep);
    assert(matOp && "join superset: buffer build step must materialize into join buffer");
 
-   auto collectMaterializedPayloadKeys = [&]() {
-      std::unordered_set<std::string> keys;
+   auto collectMaterializedPayloadHashes = [&]() {
+      llvm::DenseSet<uint64_t> keys;
       for (auto& [member, colRef] : matOp.getMapping().getMapping()) {
          if (member == plan.linkMember || member == plan.hashMember) continue;
-         auto [scope, leaf] = cm.getName(&colRef.getColumn());
-         keys.insert(columnSemanticKey(scope, leaf));
+         keys.insert(payloadColumnIdentityHash(colRef, columnHashes));
       }
       return keys;
    };
-   std::unordered_set<std::string> materializedKeys = collectMaterializedPayloadKeys();
+   llvm::DenseSet<uint64_t> materializedHashes = collectMaterializedPayloadHashes();
 
    subop::MapOp hashMapOp = findJoinHashMapBeforeMaterialize(body, matOp);
    assert(hashMapOp);
@@ -2493,11 +2546,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    };
 
    auto isPayloadMaterialized = [&](const PayloadColumnSpec& spec) {
-      if (materializedKeys.contains(spec.semanticKey)) return true;
-      llvm::StringRef wantLeaf = normalizeColumnIdentifier(spec.leaf);
-      for (const std::string& k : materializedKeys) {
-         if (normalizeColumnIdentifier(semanticKeyLeaf(k)) == wantLeaf) return true;
-      }
+      if (materializedHashes.contains(spec.semanticHash)) return true;
       return false;
    };
 
@@ -2530,7 +2579,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
          gb.create<subop::GatherOp>(mlir::UnknownLoc::get(ctx), gatherTy, mapStream, gatherRef, mapping);
       matOp->setOperand(0, newGather.getRes());
       appendMaterializeMapping(bufMem, colDef);
-      materializedKeys.insert(spec.semanticKey);
+      materializedHashes.insert(spec.semanticHash);
       return true;
    };
 
@@ -2631,11 +2680,13 @@ static void applyUnionPlanToSyntheticHiv(mlir::ModuleOp synthetic, mlir::Value s
    SyntheticJoinBuildSite site = findSyntheticJoinBuildSite(synthetic, syntheticHiv, reuseSynthetic);
    assert(site.materialize && "join superset: synthetic build step must materialize into merged join buffer");
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
-   assignPayloadMembersForPlan(mm, cm, site.materialize, plan);
+   llvm::DenseMap<const void*, uint64_t> syntheticColumnHashes =
+      collectStateConstructionColumnHashes(synthetic, syntheticHiv);
+   assignPayloadMembersForPlan(mm, cm, site.materialize, plan, syntheticColumnHashes);
    auto targetMembers = bufferMembersForPlan(ctx, plan);
    llvm::SmallVector<mlir::Value, 4> roots = {site.mergedBuffer};
 
-   applyBufferLayoutToSsaClosure(synthetic, roots, targetMembers, reuseSynthetic);
+   applyBufferLayoutToSsaClosure(synthetic, roots, targetMembers, reuseSynthetic, &syntheticColumnHashes);
 
    if (site.buildStep) {
       llvm::SmallVector<std::pair<mlir::ModuleOp, mlir::Value>, 8> peerHivs = {
@@ -2645,10 +2696,11 @@ static void applyUnionPlanToSyntheticHiv(mlir::ModuleOp synthetic, mlir::Value s
       llvm::SmallVector<const ModuleReuseInfo*, 8> peerReuses = {&reuseB, &reuseA};
       peerHivs.append(extraPeerHivs.begin(), extraPeerHivs.end());
       peerReuses.append(extraPeerReuses.begin(), extraPeerReuses.end());
-      patchBufferBuildStepForUnion(synthetic, site.buildStep, plan, reuseSynthetic, peerHivs, peerReuses);
+      patchBufferBuildStepForUnion(synthetic, site.buildStep, plan, reuseSynthetic, peerHivs, peerReuses,
+                                   syntheticColumnHashes);
    }
 
-   applyBufferLayoutToSsaClosure(synthetic, roots, targetMembers, reuseSynthetic);
+   applyBufferLayoutToSsaClosure(synthetic, roots, targetMembers, reuseSynthetic, &syntheticColumnHashes);
    finalizeSyntheticJoinProducerClosure(synthetic, roots, plan, reuseSynthetic);
 }
 
@@ -3047,10 +3099,26 @@ static subop::PreAggrHtType aggregateHtTypeFromState(mlir::Value state) {
 
 struct AggregatePayloadMemberInfo {
    std::string semanticKey;
+   uint64_t semanticHash = 0;
    subop::Member member;
    mlir::Type type;
    tuples::ColumnRefAttr sourceColumn;
 };
+
+static uint64_t aggregatePayloadHashForInfo(llvm::StringRef semanticKey,
+                                            tuples::ColumnRefAttr sourceColumn,
+                                            mlir::Type payloadType,
+                                            const llvm::DenseMap<const void*, uint64_t>& columnHashes) {
+   if (semanticKey == "count:*") return payloadSyntheticColumnHash("aggregate", "count", payloadType);
+   if (semanticKey == "identity") return payloadSyntheticColumnHash("aggregate", "identity", payloadType);
+
+   llvm::StringRef kind = "payload";
+   if (semanticKey.consume_front("sum:")) kind = "sum";
+   assert(sourceColumn && "aggregate payload must have a source column identity hash");
+   uint64_t h = hashPayloadString("aggregate_payload");
+   h = combinePayloadHash(h, hashPayloadString(kind));
+   return combinePayloadHash(h, payloadColumnIdentityHash(sourceColumn, columnHashes));
+}
 
 static tuples::ColumnRefAttr resolveAggregatePayloadSourceColumn(subop::ReduceOp reduceOp, unsigned payloadIdx) {
    mlir::Block& block = reduceOp.getRegion().front();
@@ -3078,6 +3146,8 @@ collectAggregatePayloadMembers(mlir::ModuleOp module, mlir::Value aggregateState
    auto* ctx = module.getContext();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   llvm::DenseMap<const void*, uint64_t> columnHashes =
+      collectStateConstructionColumnHashes(module, aggregateState);
    subop::PreAggrHtType ht = aggregateHtTypeFromState(aggregateState);
    assert(ht && "aggregate payload collection requires optimistic_ht-like state");
    subop::PreAggrHtFragmentType fragTy = fragmentTypeForAggregateHt(ht);
@@ -3099,7 +3169,9 @@ collectAggregatePayloadMembers(mlir::ModuleOp module, mlir::Value aggregateState
 
    llvm::DenseMap<subop::Member, AggregatePayloadMemberInfo> byMember;
    auto recordMember = [&](subop::Member member, std::string semanticKey, tuples::ColumnRefAttr sourceColumn) {
-      AggregatePayloadMemberInfo info{std::move(semanticKey), member, mm.getType(member), sourceColumn};
+      mlir::Type memberTy = mm.getType(member);
+      uint64_t semanticHash = aggregatePayloadHashForInfo(semanticKey, sourceColumn, memberTy, columnHashes);
+      AggregatePayloadMemberInfo info{std::move(semanticKey), semanticHash, member, memberTy, sourceColumn};
       auto it = byMember.find(member);
       if (it == byMember.end() || (it->second.semanticKey == "identity" && info.semanticKey != "identity")) {
          byMember[member] = std::move(info);
@@ -3122,7 +3194,9 @@ collectAggregatePayloadMembers(mlir::ModuleOp module, mlir::Value aggregateState
       if (it != byMember.end()) {
          out.push_back(std::move(it->second));
       } else {
-         out.push_back({"identity", member, mm.getType(member), {}});
+         mlir::Type memberTy = mm.getType(member);
+         out.push_back({"identity", aggregatePayloadHashForInfo("identity", {}, memberTy, columnHashes),
+                        member, memberTy, {}});
       }
    }
    return out;
@@ -3136,9 +3210,7 @@ static CachedAggregateLayout buildAggregateUnionLayout(mlir::Value producerState
 
    llvm::SmallVector<AggregatePayloadMemberInfo, 16> producer = collectAggregatePayloadMembers(producerModule, producerState);
    llvm::SmallVector<AggregatePayloadMemberInfo, 16> peer = collectAggregatePayloadMembers(peerModule, peerState);
-   llvm::StringSet<> producerKeys;
    for (const auto& p : producer) {
-      producerKeys.insert(p.semanticKey);
       layout.payloadSemanticKeys.push_back(p.semanticKey);
       layout.payloadMembers.push_back(p.member);
       layout.payloadColumnTypes.push_back(p.type);
@@ -3634,10 +3706,10 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
 
    llvm::SmallVector<AggregatePayloadMemberInfo, 16> producerInfos =
       collectAggregatePayloadMembers(synthetic, syntheticHtState);
-   llvm::StringMap<AggregatePayloadMemberInfo> producerBySemantic;
+   llvm::DenseMap<uint64_t, AggregatePayloadMemberInfo> producerByHash;
    unsigned nextSlot = 0;
    for (const auto& p : producerInfos) {
-      producerBySemantic[p.semanticKey] = p;
+      producerByHash[p.semanticHash] = p;
       if (auto slot = parseAggregateValueSlot(mm.getName(p.member))) nextSlot = std::max(nextSlot, *slot + 1);
    }
 
@@ -3650,16 +3722,9 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
       collectAggregatePayloadMembers(query1, peerHtState);
    subop::MapOp producerMap = findProducerAggregateMap(buildStep);
    llvm::SmallVector<std::pair<unsigned, mlir::Type>, 4> insertedPayloads;
-   llvm::StringMap<unsigned> currentIndexBySemantic;
-   auto rebuildIndex = [&]() {
-      currentIndexBySemantic.clear();
-      for (unsigned i = 0; i < layout.payloadSemanticKeys.size(); ++i)
-         currentIndexBySemantic.try_emplace(layout.payloadSemanticKeys[i], i);
-   };
-   rebuildIndex();
    for (unsigned peerIdx = 0; peerIdx < peerInfos.size(); ++peerIdx) {
       const auto& p = peerInfos[peerIdx];
-      if (producerBySemantic.contains(p.semanticKey)) continue;
+      if (producerByHash.contains(p.semanticHash)) continue;
       if (p.semanticKey == "count:*") continue;
       tuples::ColumnRefAttr source = cloneColumnRefToContext(p.sourceColumn, ctx);
       auto sourceProducerMap = findMapProducingColumn(buildStep, source, cm);
@@ -3682,7 +3747,6 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
       layout.payloadSemanticKeys.insert(layout.payloadSemanticKeys.begin() + insertIdx, p.semanticKey);
       layout.payloadMembers.insert(layout.payloadMembers.begin() + insertIdx, member);
       layout.payloadColumnTypes.insert(layout.payloadColumnTypes.begin() + insertIdx, slotTy);
-      rebuildIndex();
       insertAggregateLookupInitial(lookup, insertIdx, slotTy);
       insertAggregateReduceUpdate(reduce, insertIdx, source, member, slotTy);
       insertAggregateReduceCombine(reduce, insertIdx, slotTy);
@@ -5049,9 +5113,11 @@ static void ensureReuseFilterPredColumn(JoinBufferUnionPlan& plan, unsigned quer
    predSpec.leaf = llvm::Twine(queryIndex).str();
    predSpec.colType = mlir::IntegerType::get(ctx, 1);
    predSpec.semanticKey = semKey;
+   predSpec.semanticHash = payloadSyntheticColumnHash(predSpec.scope, predSpec.leaf, predSpec.colType);
    plan.payloadColumns.push_back(std::move(predSpec));
    llvm::sort(plan.payloadColumns, [](const PayloadColumnSpec& a, const PayloadColumnSpec& b) {
       if (a.isJoinKey != b.isJoinKey) return a.isJoinKey > b.isJoinKey;
+      if (a.semanticHash != b.semanticHash) return a.semanticHash < b.semanticHash;
       return a.semanticKey < b.semanticKey;
    });
    plan.payloadMemberTypes.clear();

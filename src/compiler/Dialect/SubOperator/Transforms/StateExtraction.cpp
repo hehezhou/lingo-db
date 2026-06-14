@@ -1426,6 +1426,7 @@ struct StepDagHasher {
    llvm::DenseMap<const lingodb::compiler::dialect::tuples::Column*, uint64_t> columnHashByColumn;
    llvm::DenseMap<const lingodb::compiler::dialect::tuples::Column*, mlir::Value> refStateByColumn;
    llvm::DenseMap<mlir::Value, uint64_t> regionValueHashByValue;
+   llvm::DenseMap<const void*, uint64_t>* outColumnHashByColumn = nullptr;
    using SelectedColumnSet = llvm::SmallSet<uint64_t, 8>;
 
    bool isWithinStep(mlir::Operation* op) {
@@ -1656,6 +1657,7 @@ struct StepDagHasher {
 
    void defineColumn(lingodb::compiler::dialect::tuples::ColumnDefAttr def, uint64_t h) {
       columnHashByColumn[&def.getColumn()] = h;
+      if (outColumnHashByColumn) (*outColumnHashByColumn)[&def.getColumn()] = h;
    }
 
    void defineRefColumn(lingodb::compiler::dialect::tuples::ColumnDefAttr def, uint64_t h, mlir::Value state) {
@@ -4000,6 +4002,67 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
 
 ModuleReuseInfo collectModuleReuseInfo(mlir::ModuleOp moduleOp) {
    return analyzeModuleForMatchAndReuse(moduleOp).reuse;
+}
+
+llvm::DenseMap<const void*, uint64_t> collectStateConstructionColumnHashes(mlir::ModuleOp moduleOp,
+                                                                           mlir::Value state) {
+   llvm::DenseMap<const void*, uint64_t> out;
+   if (!state) return out;
+
+   auto* dialect = moduleOp.getContext()->getLoadedDialect<subop::SubOperatorDialect>();
+   assert(dialect && "subop dialect must be loaded to fingerprint members");
+   subop::MemberManager& memberManager = dialect->getMemberManager();
+   auto* tupDialect =
+      moduleOp.getContext()->getLoadedDialect<lingodb::compiler::dialect::tuples::TupleStreamDialect>();
+   assert(tupDialect && "tuples dialect must be loaded");
+
+   ModuleMatchAndReuseAnalysis module = analyzeModuleForMatchAndReuse(moduleOp);
+   StateDependencyGraph depGraph = buildStateDependencyGraphFromStepRw(module.rwByStep);
+   llvm::DenseMap<mlir::Value, std::string> tableDescrByTableState = buildTableDescrByTableState(moduleOp);
+   StateHashEnv stateHashEnv = buildStateHashEnv(module, depGraph, tableDescrByTableState);
+
+   mlir::Value stateCanon = canonicalizeStateValueDeep(state);
+   auto constructionStepIndices = getConstructionStepIndicesForState(
+      stateCanon, module.createdAtByState, module.writesByState, module.mergedFromShadowState);
+   if (constructionStepIndices.empty()) return out;
+
+   const bool isHiv = mlir::isa<subop::HashIndexedViewType>(stateCanon.getType());
+   std::optional<JoinHivMatchDetails> joinHivDetails;
+   if (isHiv) {
+      joinHivDetails.emplace(computeJoinHivMatchDetails(
+         stateCanon, mlir::cast<subop::HashIndexedViewType>(stateCanon.getType()), memberManager,
+         tupDialect->getColumnManager(), module.reuse.writerStepsByState, constructionStepIndices,
+         module.stepByIndex));
+   }
+
+   llvm::DenseSet<mlir::Value> targetConstructionStates;
+   targetConstructionStates.insert(stateCanon);
+   forEachShadowChainPredecessorValue(stateCanon, module.mergedFromShadowState, [&](mlir::Value shadow) {
+      targetConstructionStates.insert(canonicalizeStateValueDeep(shadow));
+   });
+
+   for (int si : constructionStepIndices) {
+      auto itS = module.stepByIndex.find(si);
+      assert(itS != module.stepByIndex.end());
+      StepDagHasher hasher;
+      hasher.step = itS->second;
+      hasher.targetState = stateCanon;
+      hasher.targetStateType = stateCanon.getType();
+      hasher.tableDescrByTableState = &tableDescrByTableState;
+      hasher.memberManager = &memberManager;
+      hasher.columnManager = &tupDialect->getColumnManager();
+      hasher.externalDatasourceByTableState = &module.reuse.externalDatasourceByTableState;
+      hasher.stateHashEnv = &stateHashEnv;
+      hasher.targetConstructionStates = &targetConstructionStates;
+      hasher.outColumnHashByColumn = &out;
+      if (joinHivDetails) {
+         hasher.joinIndexMemberNamesSanitized = &joinHivDetails->indexMemberNamesSanitized;
+         hasher.joinKeyColumnAttrHashes = &joinHivDetails->joinKeyColumnAttrHashes;
+         hasher.joinKeyColumnIdentifiersSanitized = &joinHivDetails->joinKeyColumnIdentifiersSanitized;
+      }
+      (void)hasher.hashStepReturnGraph();
+   }
+   return out;
 }
 
 llvm::SmallVector<CrossQueryStateMatchGroup, 64>

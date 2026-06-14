@@ -2332,33 +2332,6 @@ static std::optional<size_t> getMixedHashIndexedViewFilterPredIndex(mlir::Type t
    return std::nullopt;
 }
 
-static unsigned getMixedHashIndexedViewFilterPredIndex(subop::MixedHashIndexedViewType mixed) {
-   auto packPredMask = [](unsigned predOrdinal, unsigned predSlotCount) {
-      return (predSlotCount << 16) | predOrdinal;
-   };
-   llvm::StringRef predMemberName = mixed.getFilterPredMemberName().getValue();
-   auto parsePredSlot = [](llvm::StringRef name) -> std::optional<unsigned> {
-      if (!name.consume_front("filter_pred$")) return std::nullopt;
-      unsigned slot = 0;
-      if (name.getAsInteger(10, slot)) return std::nullopt;
-      return slot;
-   };
-   auto& memberManager = mixed.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   llvm::SmallVector<std::pair<unsigned, subop::Member>, 4> predMembers;
-   for (subop::Member member : mixed.getValueMembers().getMembers()) {
-      if (auto slot = parsePredSlot(memberManager.getName(member))) predMembers.push_back({*slot, member});
-   }
-   llvm::sort(predMembers, [](const auto& a, const auto& b) { return a.first < b.first; });
-   assert(predMembers.size() <= 8 &&
-          "mixed HIV runtime wrapper currently accepts up to 8 physical predicate bloom selectors");
-   for (unsigned i = 0; i < predMembers.size(); ++i) {
-      if (memberManager.getName(predMembers[i].second) == predMemberName)
-         return packPredMask(i, predMembers.size());
-   }
-   assert(false && "mixed HIV predicate member must exist in value members");
-   return 0;
-}
-
 static size_t alignTo(size_t offset, size_t alignment) {
    return ((offset + alignment - 1) / alignment) * alignment;
 }
@@ -2754,7 +2727,7 @@ class LookupHashIndexedViewLowering : public SubOpTupleStreamConsumerConversionP
       Value ptr = rewriter.create<util::LoadOp>(loc, rewriter.getPtrType(), ht, buckedPos);
       //optimization
       auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(lookupOp.getState().getType());
-      Value refValid = mixed ? rewriter.create<util::PtrHashTagMatchesMasked>(loc, rewriter.getI1Type(), ptr, hash, getMixedHashIndexedViewFilterPredIndex(mixed)).getResult()
+      Value refValid = mixed ? rewriter.create<util::IsRefValidOp>(loc, rewriter.getI1Type(), ptr).getResult()
                              : rewriter.create<util::PtrTagMatches>(loc, rewriter.getI1Type(), ptr, hash).getResult();
       mlir::Value lookupPred = rewriter.create<arith::ConstantIntOp>(loc, 1, 1);
       if (mlir::isa<subop::MixedHashIndexedViewType>(lookupOp.getState().getType()) && lookupArgs.size() > 1) {
