@@ -3047,6 +3047,61 @@ static std::optional<unsigned> findAggregateInputArgIndex(mlir::Value root, mlir
    return findAggregateInputArgIndex(root, block, numCols, seen);
 }
 
+enum class AggregatePayloadKind { Identity, Count, Sum, Min, Max, Payload };
+
+static AggregatePayloadKind aggregatePayloadKindForSemantic(llvm::StringRef semanticKey) {
+   if (semanticKey == "identity") return AggregatePayloadKind::Identity;
+   if (semanticKey == "count:*") return AggregatePayloadKind::Count;
+   if (semanticKey.starts_with("sum:")) return AggregatePayloadKind::Sum;
+   if (semanticKey.starts_with("min:")) return AggregatePayloadKind::Min;
+   if (semanticKey.starts_with("max:")) return AggregatePayloadKind::Max;
+   return AggregatePayloadKind::Payload;
+}
+
+static std::optional<AggregatePayloadKind>
+classifyMinMaxAggregateSelect(mlir::Value returned, mlir::Value current, mlir::Value input) {
+   auto select = mlir::dyn_cast_or_null<mlir::arith::SelectOp>(returned.getDefiningOp());
+   if (!select) return std::nullopt;
+   auto cmp = mlir::dyn_cast_or_null<db::CmpOp>(
+      stripCastLikeForAggregateSemantic(select.getCondition()).getDefiningOp());
+   if (!cmp) return std::nullopt;
+
+   mlir::Value trueValue = stripCastLikeForAggregateSemantic(select.getTrueValue());
+   mlir::Value falseValue = stripCastLikeForAggregateSemantic(select.getFalseValue());
+   mlir::Value lhs = stripCastLikeForAggregateSemantic(cmp.getLeft());
+   mlir::Value rhs = stripCastLikeForAggregateSemantic(cmp.getRight());
+   bool trueIsInput = trueValue == input;
+   bool falseIsCurrent = falseValue == current;
+   bool trueIsCurrent = trueValue == current;
+   bool falseIsInput = falseValue == input;
+   if (!((trueIsInput && falseIsCurrent) || (trueIsCurrent && falseIsInput))) return std::nullopt;
+
+   enum class CmpShape { CurrentLessInput, CurrentGreaterInput, InputLessCurrent, InputGreaterCurrent };
+   std::optional<CmpShape> shape;
+   using P = db::DBCmpPredicate;
+   if (lhs == current && rhs == input) {
+      if (cmp.getPredicate() == P::lt || cmp.getPredicate() == P::lte) shape = CmpShape::CurrentLessInput;
+      if (cmp.getPredicate() == P::gt || cmp.getPredicate() == P::gte) shape = CmpShape::CurrentGreaterInput;
+   } else if (lhs == input && rhs == current) {
+      if (cmp.getPredicate() == P::lt || cmp.getPredicate() == P::lte) shape = CmpShape::InputLessCurrent;
+      if (cmp.getPredicate() == P::gt || cmp.getPredicate() == P::gte) shape = CmpShape::InputGreaterCurrent;
+   }
+   if (!shape) return std::nullopt;
+
+   if (trueIsInput) {
+      if (*shape == CmpShape::CurrentGreaterInput || *shape == CmpShape::InputLessCurrent)
+         return AggregatePayloadKind::Min;
+      if (*shape == CmpShape::CurrentLessInput || *shape == CmpShape::InputGreaterCurrent)
+         return AggregatePayloadKind::Max;
+   } else {
+      if (*shape == CmpShape::CurrentLessInput || *shape == CmpShape::InputGreaterCurrent)
+         return AggregatePayloadKind::Min;
+      if (*shape == CmpShape::CurrentGreaterInput || *shape == CmpShape::InputLessCurrent)
+         return AggregatePayloadKind::Max;
+   }
+   return std::nullopt;
+}
+
 static std::string aggregatePayloadSemanticKeyForReturn(subop::ReduceOp reduce, unsigned memberIdx,
                                                         tuples::ColumnManager& cm) {
    assert(!reduce.getRegion().empty() && "aggregate reduce must have update region");
@@ -3080,7 +3135,14 @@ static std::string aggregatePayloadSemanticKeyForReturn(subop::ReduceOp reduce, 
    }
    if (auto inputIdx = findAggregateInputArgIndex(returned, block, numCols)) {
       auto col = mlir::cast<tuples::ColumnRefAttr>(reduce.getColumns()[*inputIdx]);
-      if (aggregateExprContainsValue(returned, current)) return "sum:" + aggregateColumnSemanticKey(col, cm);
+      mlir::Value input = block.getArgument(*inputIdx);
+      if (aggregateExprContainsValue(returned, current)) {
+         if (auto kind = classifyMinMaxAggregateSelect(returned, current, input)) {
+            if (*kind == AggregatePayloadKind::Min) return "min:" + aggregateColumnSemanticKey(col, cm);
+            if (*kind == AggregatePayloadKind::Max) return "max:" + aggregateColumnSemanticKey(col, cm);
+         }
+         abortAggregateUnionUnsupported("unsupported aggregate payload update expression using current value");
+      }
       return aggregateColumnSemanticKey(col, cm);
    }
    llvm_unreachable("aggregate union: unsupported reduce payload update expression");
@@ -3123,6 +3185,8 @@ static uint64_t aggregatePayloadHashForInfo(llvm::StringRef semanticKey,
 
    llvm::StringRef kind = "payload";
    if (semanticKey.consume_front("sum:")) kind = "sum";
+   else if (semanticKey.consume_front("min:")) kind = "min";
+   else if (semanticKey.consume_front("max:")) kind = "max";
    assert(sourceColumn && "aggregate payload must have a source column identity hash");
    uint64_t h = hashPayloadString("aggregate_payload");
    h = combinePayloadHash(h, hashPayloadString(kind));
@@ -3665,6 +3729,62 @@ static mlir::Value createOneForType(mlir::OpBuilder& b, mlir::Location loc, mlir
    return b.create<db::ConstantOp>(loc, ty, b.getI64IntegerAttr(1));
 }
 
+static mlir::Value createInitialForAggregatePayload(mlir::OpBuilder& b, mlir::Location loc,
+                                                    mlir::Type ty, AggregatePayloadKind kind) {
+   if (kind == AggregatePayloadKind::Min) {
+      auto intTy = mlir::dyn_cast<mlir::IntegerType>(ty);
+      if (!intTy) abortAggregateUnionUnsupported("min aggregate payload initial value requires integer type");
+      return b.create<db::ConstantOp>(loc, ty,
+                                      b.getIntegerAttr(ty, llvm::APInt::getSignedMaxValue(intTy.getWidth())));
+   }
+   return createZeroForType(b, loc, ty);
+}
+
+static mlir::Value createAggregatePayloadUpdate(mlir::OpBuilder& b, mlir::Location loc,
+                                                AggregatePayloadKind kind, mlir::Value current,
+                                                mlir::Value input, mlir::Type ty) {
+   switch (kind) {
+      case AggregatePayloadKind::Count:
+         return b.create<db::AddOp>(loc, current, createOneForType(b, loc, ty));
+      case AggregatePayloadKind::Sum:
+      case AggregatePayloadKind::Payload:
+         return b.create<db::AddOp>(loc, current, input);
+      case AggregatePayloadKind::Min: {
+         mlir::Value useInput = b.create<db::CmpOp>(loc, db::DBCmpPredicate::gt, current, input);
+         return b.create<mlir::arith::SelectOp>(loc, useInput, input, current);
+      }
+      case AggregatePayloadKind::Max: {
+         mlir::Value useInput = b.create<db::CmpOp>(loc, db::DBCmpPredicate::lt, current, input);
+         return b.create<mlir::arith::SelectOp>(loc, useInput, input, current);
+      }
+      case AggregatePayloadKind::Identity:
+         abortAggregateUnionUnsupported("cannot insert identity aggregate payload update");
+   }
+   llvm_unreachable("unknown aggregate payload kind");
+}
+
+static mlir::Value createAggregatePayloadCombine(mlir::OpBuilder& b, mlir::Location loc,
+                                                 AggregatePayloadKind kind, mlir::Value left,
+                                                 mlir::Value right) {
+   switch (kind) {
+      case AggregatePayloadKind::Count:
+      case AggregatePayloadKind::Sum:
+      case AggregatePayloadKind::Payload:
+         return b.create<db::AddOp>(loc, left, right);
+      case AggregatePayloadKind::Min: {
+         mlir::Value keepLeft = b.create<db::CmpOp>(loc, db::DBCmpPredicate::lt, left, right);
+         return b.create<mlir::arith::SelectOp>(loc, keepLeft, left, right);
+      }
+      case AggregatePayloadKind::Max: {
+         mlir::Value keepRight = b.create<db::CmpOp>(loc, db::DBCmpPredicate::lt, left, right);
+         return b.create<mlir::arith::SelectOp>(loc, keepRight, right, left);
+      }
+      case AggregatePayloadKind::Identity:
+         abortAggregateUnionUnsupported("cannot insert identity aggregate payload combine");
+   }
+   llvm_unreachable("unknown aggregate payload kind");
+}
+
 static void insertReturnOperand(tuples::ReturnOp ret, unsigned idx, mlir::Value v) {
    mlir::OpBuilder b(ret);
    llvm::SmallVector<mlir::Value> operands(ret->getOperands().begin(), ret->getOperands().end());
@@ -3674,15 +3794,17 @@ static void insertReturnOperand(tuples::ReturnOp ret, unsigned idx, mlir::Value 
    (void)newRet;
 }
 
-static void insertAggregateLookupInitial(subop::LookupOrInsertOp lookup, unsigned idx, mlir::Type ty) {
+static void insertAggregateLookupInitial(subop::LookupOrInsertOp lookup, unsigned idx,
+                                         mlir::Type ty, AggregatePayloadKind kind) {
    mlir::Block& block = lookup.getInitFn().front();
    auto ret = mlir::cast<tuples::ReturnOp>(block.getTerminator());
    mlir::OpBuilder b(ret);
-   insertReturnOperand(ret, idx, createZeroForType(b, lookup.getLoc(), ty));
+   insertReturnOperand(ret, idx, createInitialForAggregatePayload(b, lookup.getLoc(), ty, kind));
 }
 
 static void insertAggregateReduceUpdate(subop::ReduceOp reduce, unsigned idx, tuples::ColumnRefAttr sourceCol,
-                                        subop::Member member, mlir::Type ty) {
+                                        subop::Member member, mlir::Type ty,
+                                        AggregatePayloadKind kind) {
    auto* ctx = reduce.getContext();
    llvm::SmallVector<mlir::Attribute> cols(reduce.getColumns().begin(), reduce.getColumns().end());
    llvm::SmallVector<mlir::Attribute> members(reduce.getMembers().begin(), reduce.getMembers().end());
@@ -3698,31 +3820,29 @@ static void insertAggregateReduceUpdate(subop::ReduceOp reduce, unsigned idx, tu
    mlir::BlockArgument current = block.insertArgument(oldNumCols + 1 + idx, ty, loc);
    auto ret = mlir::cast<tuples::ReturnOp>(block.getTerminator());
    mlir::OpBuilder b(ret);
-   mlir::Value updated;
-   if (columnSemanticKey(sourceCol, ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager()) == "count:*") {
-      updated = b.create<db::AddOp>(loc, current, createOneForType(b, loc, ty));
-   } else {
-      updated = b.create<db::AddOp>(loc, current, input);
-   }
+   mlir::Value updated = createAggregatePayloadUpdate(b, loc, kind, current, input, ty);
    insertReturnOperand(ret, idx, updated);
 }
 
-static void insertPairwiseAddRegionResult(mlir::Region& region, unsigned idx, mlir::Type ty, mlir::Location loc) {
+static void insertPairwiseAggregateRegionResult(mlir::Region& region, unsigned idx, mlir::Type ty,
+                                                mlir::Location loc, AggregatePayloadKind kind) {
    mlir::Block& block = region.front();
    auto ret = mlir::cast<tuples::ReturnOp>(block.getTerminator());
    unsigned oldNumValues = ret.getNumOperands();
    mlir::BlockArgument left = block.insertArgument(idx, ty, loc);
    mlir::BlockArgument right = block.insertArgument(oldNumValues + 1 + idx, ty, loc);
    mlir::OpBuilder b(ret);
-   insertReturnOperand(ret, idx, b.create<db::AddOp>(loc, left, right));
+   insertReturnOperand(ret, idx, createAggregatePayloadCombine(b, loc, kind, left, right));
 }
 
-static void insertAggregateReduceCombine(subop::ReduceOp reduce, unsigned idx, mlir::Type ty) {
-   insertPairwiseAddRegionResult(reduce.getCombine(), idx, ty, reduce.getLoc());
+static void insertAggregateReduceCombine(subop::ReduceOp reduce, unsigned idx,
+                                         mlir::Type ty, AggregatePayloadKind kind) {
+   insertPairwiseAggregateRegionResult(reduce.getCombine(), idx, ty, reduce.getLoc(), kind);
 }
 
-static void insertAggregateMergeCombine(subop::MergeOp merge, unsigned idx, mlir::Type ty) {
-   insertPairwiseAddRegionResult(merge.getCombineFn(), idx, ty, merge.getLoc());
+static void insertAggregateMergeCombine(subop::MergeOp merge, unsigned idx,
+                                        mlir::Type ty, AggregatePayloadKind kind) {
+   insertPairwiseAggregateRegionResult(merge.getCombineFn(), idx, ty, merge.getLoc(), kind);
 }
 
 static void appendAggregateMergeEqKey(subop::MergeOp merge, unsigned oldKeyCount, mlir::Type keyTy) {
@@ -3890,7 +4010,12 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
    for (subop::Member m : newMembers) newTypes.push_back(mm.getType(m));
 
    subop::MapOp producerMap = findProducerAggregateMap(buildStep);
-   llvm::SmallVector<std::pair<unsigned, mlir::Type>, 4> insertedPayloads;
+   struct InsertedAggregatePayload {
+      unsigned idx;
+      mlir::Type type;
+      AggregatePayloadKind kind;
+   };
+   llvm::SmallVector<InsertedAggregatePayload, 4> insertedPayloads;
    for (const AggregatePeerRewriteInput& peer : peers) {
       llvm::SmallVector<AggregatePayloadMemberInfo, 16> peerInfos =
          collectAggregatePayloadMembers(peer.module, peer.state, peer.buildStep);
@@ -3913,6 +4038,7 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
                                                    reuseSynthetic, peer.reuse, synthetic);
          }
          mlir::Type slotTy = cloneTypeToContext(p.type, ctx);
+         AggregatePayloadKind kind = aggregatePayloadKindForSemantic(p.semanticKey);
          subop::Member member = allocUnusedAggregateValueSlot(mm, slotTy, nextSlot);
          unsigned insertIdx = layout.payloadSemanticKeys.size();
          newMembers.insert(newMembers.begin() + insertIdx, member);
@@ -3920,10 +4046,10 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
          layout.payloadSemanticKeys.insert(layout.payloadSemanticKeys.begin() + insertIdx, p.semanticKey);
          layout.payloadMembers.insert(layout.payloadMembers.begin() + insertIdx, member);
          layout.payloadColumnTypes.insert(layout.payloadColumnTypes.begin() + insertIdx, slotTy);
-         insertAggregateLookupInitial(lookup, insertIdx, slotTy);
-         insertAggregateReduceUpdate(reduce, insertIdx, source, member, slotTy);
-         insertAggregateReduceCombine(reduce, insertIdx, slotTy);
-         insertedPayloads.push_back({insertIdx, slotTy});
+         insertAggregateLookupInitial(lookup, insertIdx, slotTy, kind);
+         insertAggregateReduceUpdate(reduce, insertIdx, source, member, slotTy, kind);
+         insertAggregateReduceCombine(reduce, insertIdx, slotTy, kind);
+         insertedPayloads.push_back({insertIdx, slotTy, kind});
          producerByHash[p.semanticHash] =
             AggregatePayloadMemberInfo{p.semanticKey, p.semanticHash, member, slotTy, p.sourceColumn};
          producerSemanticTypeKeys.insert(p.semanticKey + "\x1f" + mlirTypeToString(p.type));
@@ -3940,7 +4066,8 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
    if (layout.mixedByQueryId) {
       appendAggregateMergeEqKey(merge, oldHt.getKeyMembers().getMembers().size(), mm.getType(layout.queryIdMember));
    }
-   for (auto [idx, ty] : insertedPayloads) insertAggregateMergeCombine(merge, idx, ty);
+   for (auto payload : insertedPayloads)
+      insertAggregateMergeCombine(merge, payload.idx, payload.type, payload.kind);
 
    llvm::DenseSet<void*> closure;
    auto seedValue = [&](mlir::Value v) {

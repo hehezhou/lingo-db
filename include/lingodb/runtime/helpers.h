@@ -16,6 +16,8 @@
 namespace lingodb::runtime {
 alignas(4096) extern uint16_t bloomMasks[2048];
 extern bool useFilterPredBloomAdaptation;
+static constexpr uint64_t filterPredBloomLocalityBloomBits = 4;
+static constexpr uint64_t filterPredBloomLocalityInteractionBits = 2;
 static constexpr uint16_t hashTagMask = 0x3fff;
 static inline uint64_t floorPowerOfTwo(uint64_t v) {
    if (v == 0) return 0;

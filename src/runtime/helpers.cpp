@@ -1,6 +1,8 @@
 #include "lingodb/runtime/helpers.h"
 
+#include <algorithm>
 #include <cstdlib>
+#include <cstdint>
 
 static bool initUseFilterPredBloomAdaptation() {
    const char* v = std::getenv("LINGODB_DISABLE_FILTER_PRED_BLOOM_ADAPTATION");
@@ -9,6 +11,39 @@ static bool initUseFilterPredBloomAdaptation() {
 }
 
 bool lingodb::runtime::useFilterPredBloomAdaptation = initUseFilterPredBloomAdaptation();
+
+static uint32_t nextBloomRng(uint32_t& state) {
+   state ^= state << 13;
+   state ^= state >> 17;
+   state ^= state << 5;
+   return state;
+}
+
+static unsigned popcount16(uint16_t v) {
+   unsigned count = 0;
+   while (v) {
+      v &= static_cast<uint16_t>(v - 1);
+      ++count;
+   }
+   return count;
+}
+
+static uint16_t selectRandomBit(uint16_t candidates, uint32_t& rng) {
+   unsigned count = popcount16(candidates);
+   if (!count) std::abort();
+   unsigned target = nextBloomRng(rng) % count;
+   for (unsigned bit = 0; bit < 16; ++bit) {
+      uint16_t mask = static_cast<uint16_t>(uint16_t{1} << bit);
+      if (!(candidates & mask)) continue;
+      if (target-- == 0) return mask;
+   }
+   std::abort();
+}
+
+static bool useLocalityBloomMasks() {
+   const char* v = std::getenv("LINGODB_FILTER_PRED_BLOOM_LOCALITY");
+   return v && v[0] != '\0';
+}
 
 alignas(4096) uint16_t lingodb::runtime::bloomMasks[2048] = {
    // The 1820 distinct bit-patterns
@@ -30,3 +65,32 @@ alignas(4096) uint16_t lingodb::runtime::bloomMasks[2048] = {
    // 228 repeated bit-patterns, randomly sampled from above
    75, 83, 90, 99, 116, 135, 139, 172, 284, 298, 464, 547, 556, 564, 582, 594, 657, 658, 705, 771, 780, 928, 960, 1045, 1098, 1158, 1176, 1185, 1186, 1283, 1346, 1424, 1576, 2059, 2067, 2083, 2085, 2089, 2115, 2181, 2186, 2188, 2194, 2310, 2369, 2372, 2632, 3105, 3106, 3152, 3392, 3840, 4121, 4138, 4140, 4152, 4208, 4234, 4241, 4362, 4364, 4418, 4488, 4613, 4617, 4674, 4744, 4752, 4992, 5123, 5126, 5132, 5138, 5140, 5256, 6210, 6276, 7176, 8214, 8218, 8233, 8248, 8329, 8337, 8340, 8344, 8360, 8386, 8392, 8416, 8457, 8472, 8488, 8592, 9352, 9476, 9600, 9736, 9744, 9792, 10336, 10376, 10500, 10512, 10754, 11266, 12291, 12300, 12306, 12308, 12322, 12324, 12420, 12432, 12560, 13314, 13316, 13440, 13824, 16397, 16453, 16529, 16580, 16688, 16906, 16929, 16962, 16968,
    17040, 17160, 17411, 17414, 17428, 17448, 17473, 17480, 17504, 17538, 17544, 17665, 17680, 17928, 17984, 18512, 18696, 18945, 19008, 19464, 19488, 20497, 20500, 20513, 20546, 20548, 20612, 20624, 22530, 24593, 24612, 24644, 24706, 25089, 25092, 25096, 25104, 32779, 32789, 32794, 32824, 32850, 32905, 32914, 32929, 32962, 32976, 33060, 33410, 33424, 33664, 33825, 33921, 33922, 33936, 34052, 34080, 34308, 34822, 34828, 34856, 34881, 34884, 34945, 36096, 36884, 36898, 36932, 37056, 37184, 37377, 38016, 38914, 38928, 41120, 41152, 41600, 42240, 43520, 45312, 49155, 49157, 49169, 49172, 49186, 49296, 49410, 49536, 50178, 50184, 50192, 52224, 53280, 54272, 55296, 57352, 57360, 57600, 57856, 59392};
+
+static bool initBloomMaskLookupTable() {
+   if (!useLocalityBloomMasks()) return true;
+
+   constexpr uint64_t bloomBits = lingodb::runtime::filterPredBloomLocalityBloomBits;
+   constexpr uint64_t interactionBits = lingodb::runtime::filterPredBloomLocalityInteractionBits;
+   static_assert(bloomBits > 0 && bloomBits <= 16);
+   static_assert(interactionBits <= bloomBits);
+
+   uint32_t rng = 0x9e3779b9u;
+   uint16_t previous = 0;
+   for (uint64_t i = 0; i < 2048; ++i) {
+      uint16_t mask = 0;
+      uint64_t inherited = i == 0 ? 0 : std::min<uint64_t>(interactionBits, popcount16(previous));
+      for (uint64_t j = 0; j < inherited; ++j) {
+         uint16_t bit = selectRandomBit(static_cast<uint16_t>(previous & ~mask), rng);
+         mask = static_cast<uint16_t>(mask | bit);
+      }
+      while (popcount16(mask) < bloomBits) {
+         uint16_t bit = selectRandomBit(static_cast<uint16_t>(~mask), rng);
+         mask = static_cast<uint16_t>(mask | bit);
+      }
+      lingodb::runtime::bloomMasks[i] = mask;
+      previous = mask;
+   }
+   return true;
+}
+
+static bool bloomMaskLookupTableInitialized = initBloomMaskLookupTable();
