@@ -84,6 +84,24 @@ mlir::Value materializeRuntimeFiltersAsSubopFilter(
    const llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
    llvm::ArrayRef<runtime::FilterDescription> filters);
 
+/// Build a boolean predicate column after \c scanOp from runtime simple filters. The scan table ref is widened
+/// for filter columns, needed columns are gathered immediately after the scan, and downstream users can be
+/// rewired to consume the predicate stream.
+std::pair<mlir::Value, tuples::ColumnRefAttr> materializeRuntimeFiltersAsPredicateColumnAfterScanRefs(
+   subop::ScanRefsOp scanOp, llvm::ArrayRef<runtime::FilterDescription> filters,
+   llvm::StringRef predLeafName, bool rewireDownstreamUses);
+
+struct RuntimeFilterIdClause {
+   unsigned id = 0;
+   llvm::SmallVector<runtime::FilterDescription, 8> filters;
+};
+
+/// Build an i64 id column after \c scanOp. Each clause is evaluated as an AND of runtime simple filters;
+/// because callers use this for disjoint clauses, the first matching id is the row source id.
+std::pair<mlir::Value, tuples::ColumnRefAttr> materializeRuntimeFilterClausesAsIdColumnAfterScanRefs(
+   subop::ScanRefsOp scanOp, llvm::ArrayRef<RuntimeFilterIdClause> clauses,
+   unsigned fallbackId, llvm::StringRef idLeafName, bool rewireDownstreamUses);
+
 /// Decode external-table filters for each cache target (including paired `thread_local` writers).
 llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>>
 decodeFiltersByCacheTargets(llvm::ArrayRef<CacheTarget> targets, const ModuleReuseInfo& reuse);

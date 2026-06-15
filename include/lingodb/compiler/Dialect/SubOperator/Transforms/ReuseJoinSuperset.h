@@ -38,6 +38,8 @@ using CachedJoinBufferLayoutsByKey = llvm::DenseMap<uint64_t, CachedJoinBufferLa
 
 struct CachedAggregateLayout {
    subop::PreAggrHtType producerHt;
+   bool mixedByQueryId = false;
+   subop::Member queryIdMember;
    llvm::SmallVector<std::string> payloadSemanticKeys;
    llvm::SmallVector<subop::Member> payloadMembers;
    llvm::SmallVector<mlir::Type> payloadColumnTypes;
@@ -45,6 +47,8 @@ struct CachedAggregateLayout {
    llvm::SmallVector<subop::Member> query0Members;
    llvm::SmallVector<std::string> query1SemanticKeys;
    llvm::SmallVector<subop::Member> query1Members;
+   llvm::DenseMap<unsigned, llvm::SmallVector<std::string, 8>> querySemanticKeysById;
+   llvm::DenseMap<unsigned, llvm::SmallVector<subop::Member, 8>> queryMembersById;
 };
 
 using CachedAggregateLayoutsByKey = llvm::DenseMap<uint64_t, CachedAggregateLayout>;
@@ -103,6 +107,12 @@ void extendSyntheticAggregateHashTablesToPayloadUnion(mlir::ModuleOp synthetic, 
                                                       llvm::ArrayRef<CacheTarget> targetsInSynthetic,
                                                       const mlir::IRMapping& donorToSynthetic,
                                                       CachedAggregateLayoutsByKey* outLayouts = nullptr);
+
+void extendSyntheticAggregateHashTablesToPayloadUnionForGroups(
+   mlir::ModuleOp synthetic, llvm::ArrayRef<mlir::ModuleOp> queries,
+   llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
+   llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+   CachedAggregateLayoutsByKey* outLayouts = nullptr);
 
 /// Align a consumer to the union column layout: HIV payload order matches the cached producer, but existing
 /// columns keep the consumer's \c member$N names and types; union-only columns are inserted (not type-replaced).

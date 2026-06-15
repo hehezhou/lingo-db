@@ -1623,6 +1623,122 @@ static void rewireStreamUsesAfterAnchorInBlock(mlir::Value anchorStream, mlir::V
    });
 }
 
+std::pair<mlir::Value, tuples::ColumnRefAttr> materializeRuntimeFiltersAsPredicateColumnAfterScanRefs(
+   subop::ScanRefsOp scanOp, llvm::ArrayRef<runtime::FilterDescription> filters,
+   llvm::StringRef predLeafName, bool rewireDownstreamUses) {
+   assert(scanOp && "predicate column insertion requires scan_refs");
+   llvm::SmallVector<runtime::FilterDescription, 8> restricted =
+      restrictFiltersToTableScanInExecutionStep(scanOp->getParentOfType<ExecutionStepOp>(), filters);
+   filters = restricted;
+   assert(!filters.empty() && "predicate column insertion requires at least one runtime filter");
+
+   extendTableScanRefTypesForFilters(scanOp, filters);
+
+   llvm::SmallVector<mlir::Operation*> excludeOps;
+   excludeOps.push_back(scanOp.getOperation());
+   mlir::Value predStream;
+   tuples::ColumnDefAttr predDef;
+   bool needsColumnGather =
+      llvm::any_of(filters, [](const runtime::FilterDescription& f) { return f.op != runtime::FilterOp::NOTNULL; });
+   if (!needsColumnGather) {
+      mlir::OpBuilder b(scanOp);
+      b.setInsertionPointAfter(scanOp);
+      std::tie(predStream, predDef) =
+         materializeConstantTruePredColumnOnStream(b, scanOp.getLoc(), scanOp.getRes(), predLeafName);
+   } else {
+      subop::GatherOp filterGather = insertFilterColumnGatherRightAfterScan(scanOp, filters);
+      assert(filterGather && "predicate column insertion requires gathered filter columns");
+      excludeOps.push_back(filterGather.getOperation());
+      auto colByName = buildFilterColByNameFromGather(filterGather);
+      mlir::OpBuilder b(filterGather);
+      b.setInsertionPointAfter(filterGather);
+      std::tie(predStream, predDef) =
+         materializeRuntimeFiltersAsPredicateColumn(b, filterGather.getLoc(), filterGather.getRes(),
+                                                    colByName, filters, predLeafName);
+   }
+   if (mlir::Operation* predMap = predStream.getDefiningOp()) excludeOps.push_back(predMap);
+   if (rewireDownstreamUses) rewireStreamUsesAfterAnchorInBlock(scanOp.getRes(), predStream, scanOp, excludeOps);
+
+   auto& cm = scanOp.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   return {predStream, cm.createRef(&predDef.getColumn())};
+}
+
+std::pair<mlir::Value, tuples::ColumnRefAttr> materializeRuntimeFilterClausesAsIdColumnAfterScanRefs(
+   subop::ScanRefsOp scanOp, llvm::ArrayRef<RuntimeFilterIdClause> clauses,
+   unsigned fallbackId, llvm::StringRef idLeafName, bool rewireDownstreamUses) {
+   assert(scanOp && "id column insertion requires scan_refs");
+   assert(!clauses.empty() && "id column insertion requires at least one clause");
+
+   llvm::SmallVector<RuntimeFilterIdClause, 8> restrictedClauses;
+   llvm::SmallVector<runtime::FilterDescription, 32> allFilters;
+   for (const RuntimeFilterIdClause& clause : clauses) {
+      RuntimeFilterIdClause restricted;
+      restricted.id = clause.id;
+      restricted.filters = restrictFiltersToTableScanInExecutionStep(
+         scanOp->getParentOfType<ExecutionStepOp>(), clause.filters);
+      assert(!restricted.filters.empty() && "mixed aggregate id clause must have simple table filters");
+      allFilters.append(restricted.filters.begin(), restricted.filters.end());
+      restrictedClauses.push_back(std::move(restricted));
+   }
+   extendTableScanRefTypesForFilters(scanOp, allFilters);
+
+   llvm::SmallVector<mlir::Operation*> excludeOps;
+   excludeOps.push_back(scanOp.getOperation());
+   mlir::Value stream = scanOp.getRes();
+   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr> colByName;
+   bool needsColumnGather =
+      llvm::any_of(allFilters, [](const runtime::FilterDescription& f) { return f.op != runtime::FilterOp::NOTNULL; });
+   if (needsColumnGather) {
+      subop::GatherOp gather = insertFilterColumnGatherRightAfterScan(scanOp, allFilters);
+      assert(gather && "id column insertion requires gathered filter columns");
+      excludeOps.push_back(gather.getOperation());
+      colByName = buildFilterColByNameFromGather(gather);
+      stream = gather.getRes();
+   }
+
+   auto* ctx = scanOp.getContext();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   tuples::ColumnDefAttr idDef = cm.createDef(cm.getUniqueScope("agg_reuse_query_id"), idLeafName);
+   idDef.getColumn().type = mlir::IntegerType::get(ctx, 64);
+   tuples::ColumnRefAttr idRef = cm.createRef(&idDef.getColumn());
+
+   mlir::OpBuilder b(scanOp);
+   mlir::Operation* anchor = stream.getDefiningOp();
+   assert(anchor && "id column stream must be op-defined");
+   b.setInsertionPointAfter(anchor);
+   subop::MapCreationHelper helper(ctx);
+   mlir::Location loc = scanOp.getLoc();
+   helper.buildBlock(b, [&](mlir::OpBuilder& rb) {
+      mlir::Type idTy = idDef.getColumn().type;
+      mlir::Value id =
+         rb.create<lingodb::compiler::dialect::db::ConstantOp>(loc, idTy, rb.getI64IntegerAttr(fallbackId));
+      for (auto it = restrictedClauses.rbegin(); it != restrictedClauses.rend(); ++it) {
+         mlir::Value pred;
+         for (const runtime::FilterDescription& f : it->filters) {
+            if (f.op == runtime::FilterOp::NOTNULL) continue;
+            auto colIt = colByName.find(f.columnName);
+            assert(colIt != colByName.end() && "id column insertion missing filter column");
+            mlir::Value one = emitRuntimeFilterPredicateValue(rb, loc, helper, colIt->second, f);
+            pred = pred ? rb.create<lingodb::compiler::dialect::db::AndOp>(loc, mlir::ValueRange{pred, one}) : one;
+         }
+         if (!pred) pred = rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+         pred = deriveDbPredicateTruthValue(rb, loc, pred);
+         mlir::Value clauseId =
+            rb.create<lingodb::compiler::dialect::db::ConstantOp>(loc, idTy, rb.getI64IntegerAttr(it->id));
+         id = rb.create<mlir::arith::SelectOp>(loc, pred, clauseId, id);
+      }
+      rb.create<tuples::ReturnOp>(loc, mlir::ValueRange{id});
+   });
+   auto idMap = b.create<subop::MapOp>(loc, tuples::TupleStreamType::get(ctx), stream,
+                                       b.getArrayAttr({idDef}), helper.getColRefs());
+   idMap.getFn().push_back(helper.getMapBlock());
+   excludeOps.push_back(idMap.getOperation());
+
+   if (rewireDownstreamUses)
+      rewireStreamUsesAfterAnchorInBlock(scanOp.getRes(), idMap.getResult(), scanOp, excludeOps);
+   return {idMap.getResult(), idRef};
+}
+
 static void appendPredMemberToBufferMaterialize(subop::MaterializeOp matOp, subop::Member predMember,
                                                 tuples::ColumnDefAttr predDef) {
    auto* ctx = matOp.getContext();

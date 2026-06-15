@@ -2555,6 +2555,25 @@ static std::string aggregateDependencyFingerprint(llvm::ArrayRef<std::string> de
    return joinSortedStrings(deps);
 }
 
+static std::string stripExternalFiltersFromDependencyToken(llvm::StringRef dep) {
+   std::string s = dep.str();
+   size_t filtersStart = s.find(";filters=[");
+   if (filtersStart == std::string::npos) return s;
+   size_t filtersEnd = s.find("];or_filters=[", filtersStart);
+   assert(filtersEnd != std::string::npos && "table dependency token must contain or_filters after filters");
+   size_t orFiltersEnd = s.find(']', filtersEnd + llvm::StringRef("];or_filters=[").size());
+   assert(orFiltersEnd != std::string::npos && "table dependency token must close or_filters");
+   s.erase(filtersStart, orFiltersEnd + 1 - filtersStart);
+   return s;
+}
+
+static std::string aggregateDependencyNoFilterFingerprint(llvm::ArrayRef<std::string> depTokensSorted) {
+   llvm::SmallVector<std::string, 4> deps;
+   for (llvm::StringRef d : depTokensSorted) deps.push_back(stripExternalFiltersFromDependencyToken(d));
+   llvm::sort(deps);
+   return joinSortedStrings(deps);
+}
+
 // Fingerprint SubOp "state-like" types in a way that is stable across separate compilations of the same SQL.
 // (MemberManager assigns unique `$<id>` suffixes that differ per MLIRContext/module.)
 std::string normalizedSubopStateTypeFingerprint(subop::MemberManager& mm, mlir::Type t) {
@@ -3291,6 +3310,14 @@ struct MatchNumericFilterRange {
    std::optional<double> eq;
 };
 
+struct MatchStringFilterRange {
+   std::optional<std::string> lower;
+   bool lowerInclusive = true;
+   std::optional<std::string> upper;
+   bool upperInclusive = true;
+   std::optional<std::string> eq;
+};
+
 static std::optional<double> getMatchNumericFilterValue(const lingodb::runtime::FilterDescription& f) {
    if (const auto* v = std::get_if<int64_t>(&f.value)) return static_cast<double>(*v);
    if (const auto* v = std::get_if<double>(&f.value)) return *v;
@@ -3373,6 +3400,68 @@ static bool matchRangesAreDisjoint(const MatchNumericFilterRange& a, const Match
    return false;
 }
 
+static void addMatchStringRangeConstraint(MatchStringFilterRange& range, lingodb::runtime::FilterOp op,
+                                          llvm::StringRef value) {
+   switch (op) {
+      case lingodb::runtime::FilterOp::EQ:
+         range.eq = value.str();
+         break;
+      case lingodb::runtime::FilterOp::GT:
+      case lingodb::runtime::FilterOp::GTE: {
+         bool inclusive = op == lingodb::runtime::FilterOp::GTE;
+         if (!range.lower || value > *range.lower) {
+            range.lower = value.str();
+            range.lowerInclusive = inclusive;
+         } else if (value == *range.lower) {
+            range.lowerInclusive = range.lowerInclusive && inclusive;
+         }
+         break;
+      }
+      case lingodb::runtime::FilterOp::LT:
+      case lingodb::runtime::FilterOp::LTE: {
+         bool inclusive = op == lingodb::runtime::FilterOp::LTE;
+         if (!range.upper || value < *range.upper) {
+            range.upper = value.str();
+            range.upperInclusive = inclusive;
+         } else if (value == *range.upper) {
+            range.upperInclusive = range.upperInclusive && inclusive;
+         }
+         break;
+      }
+      default:
+         break;
+   }
+}
+
+static bool matchStringRangeAllowsValue(const MatchStringFilterRange& range, llvm::StringRef value) {
+   if (range.lower && (value < *range.lower || (value == *range.lower && !range.lowerInclusive))) return false;
+   if (range.upper && (value > *range.upper || (value == *range.upper && !range.upperInclusive))) return false;
+   return true;
+}
+
+static bool matchStringRangeIsEmpty(const MatchStringFilterRange& range) {
+   if (range.eq && !matchStringRangeAllowsValue(range, *range.eq)) return true;
+   if (!range.lower || !range.upper) return false;
+   if (*range.lower > *range.upper) return true;
+   return *range.lower == *range.upper && !(range.lowerInclusive && range.upperInclusive);
+}
+
+static bool matchStringRangesAreDisjoint(const MatchStringFilterRange& a, const MatchStringFilterRange& b) {
+   if (matchStringRangeIsEmpty(a) || matchStringRangeIsEmpty(b)) return true;
+   if (a.eq && b.eq) return *a.eq != *b.eq;
+   if (a.eq) return !matchStringRangeAllowsValue(b, *a.eq);
+   if (b.eq) return !matchStringRangeAllowsValue(a, *b.eq);
+   if (a.upper && b.lower) {
+      if (*a.upper < *b.lower) return true;
+      if (*a.upper == *b.lower && !(a.upperInclusive && b.lowerInclusive)) return true;
+   }
+   if (b.upper && a.lower) {
+      if (*b.upper < *a.lower) return true;
+      if (*b.upper == *a.lower && !(b.upperInclusive && a.lowerInclusive)) return true;
+   }
+   return false;
+}
+
 static bool matchFiltersDefinitelyDisjoint(
    llvm::ArrayRef<lingodb::runtime::FilterDescription> filtersA,
    llvm::ArrayRef<lingodb::runtime::FilterDescription> filtersB) {
@@ -3406,6 +3495,24 @@ static bool matchFiltersDefinitelyDisjoint(
       auto b = rangesB.find(a.getKey());
       if (b == rangesB.end()) continue;
       if (matchRangesAreDisjoint(a.getValue(), b->getValue())) return true;
+   }
+   llvm::StringMap<MatchStringFilterRange> stringRangesA;
+   llvm::StringMap<MatchStringFilterRange> stringRangesB;
+   auto addAllStrings = [](llvm::StringMap<MatchStringFilterRange>& ranges,
+                           llvm::ArrayRef<lingodb::runtime::FilterDescription> filters) {
+      for (const auto& f : filters) {
+         if (!isMatchRangeFilterOp(f.op)) continue;
+         const auto* value = std::get_if<std::string>(&f.value);
+         if (!value) continue;
+         addMatchStringRangeConstraint(ranges[f.columnName], f.op, *value);
+      }
+   };
+   addAllStrings(stringRangesA, filtersA);
+   addAllStrings(stringRangesB, filtersB);
+   for (auto& a : stringRangesA) {
+      auto b = stringRangesB.find(a.getKey());
+      if (b == stringRangesB.end()) continue;
+      if (matchStringRangesAreDisjoint(a.getValue(), b->getValue())) return true;
    }
    return false;
 }
@@ -4172,7 +4279,14 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
             auto* b = bucket[j];
             if (matchedStates.contains(b->value)) continue;
             if (seenQueries.contains(b->queryId)) continue;
-            if (!peerOk(*a, *b)) continue;
+            bool okWithGroup = true;
+            for (const StateMatchProfile* existing : members) {
+               if (!peerOk(*existing, *b)) {
+                  okWithGroup = false;
+                  break;
+               }
+            }
+            if (!okWithGroup) continue;
             members.push_back(b);
             seenQueries.insert(b->queryId);
          }
@@ -4314,6 +4428,41 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
             return a.aggregateGroupKeyFingerprint == b.aggregateGroupKeyFingerprint;
          },
          aggregateMatchKeyStr, /*enableFilterPredReuse=*/false);
+   }
+
+   auto aggregateNoFilterMatchKeyStr = [](const StateMatchProfile& p) -> std::string {
+      return aggregateDependencyNoFilterFingerprint(p.depTokensSorted) + "@@agg=" + p.aggregateGroupKeyFingerprint +
+             "@@disjoint_filters";
+   };
+   ProfileBucketMap aggregateProfilesByNoFilterHash;
+   llvm::SmallVector<uint64_t, 32> aggregateNoFilterHashOrder;
+   for (auto* p : all) {
+      if (!mlir::isa<subop::PreAggrHtType>(p->value.getType())) continue;
+      std::string k = aggregateNoFilterMatchKeyStr(*p);
+      uint64_t hash = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
+      appendToBucket(aggregateProfilesByNoFilterHash, aggregateNoFilterHashOrder, hash, p);
+   }
+   for (uint64_t hash : aggregateNoFilterHashOrder) {
+      auto bucketIt = aggregateProfilesByNoFilterHash.find(hash);
+      assert(bucketIt != aggregateProfilesByNoFilterHash.end());
+      auto& bucket = bucketIt->second;
+      appendGroupFromBucket(
+         bucket,
+         [](const StateMatchProfile& p) {
+            return mlir::isa<subop::PreAggrHtType>(p.value.getType());
+         },
+         [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+            if (!mlir::isa<subop::PreAggrHtType>(b.value.getType())) return false;
+            if (aggregateDependencyNoFilterFingerprint(a.depTokensSorted) !=
+                aggregateDependencyNoFilterFingerprint(b.depTokensSorted))
+               return false;
+            if (a.aggregateGroupKeyFingerprint != b.aggregateGroupKeyFingerprint) return false;
+            const QueryModel* modelA = modelByQueryId.lookup(a.queryId);
+            const QueryModel* modelB = modelByQueryId.lookup(b.queryId);
+            assert(modelA && modelB && "missing query model for aggregate disjoint profile");
+            return profilesDefinitelyDisjointByFilters(a, modelA->reuse, b, modelB->reuse);
+         },
+         aggregateNoFilterMatchKeyStr, /*enableFilterPredReuse=*/true);
    }
    return out;
 }
