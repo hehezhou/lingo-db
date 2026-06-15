@@ -40,10 +40,19 @@ def run_cmd(argv: List[str], env: Dict[str, str], timeout_s: int) -> CmdResult:
 
 
 _RE_RUNSQL_ROW = re.compile(r"^\s*(\d+\.sql)\s+.*\s(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s*$")
-_RE_SUBOP_REUSE = re.compile(r"^//\s+reuse_targets:\s+query\[0\]=(\d+)\s+query\[1\]=(\d+)\s*$", re.M)
-_RE_SUBOP_REUSE_NO_TABLE = re.compile(r"^//\s+reuse_targets_no_table:\s+query\[0\]=(\d+)\s+query\[1\]=(\d+)\s*$", re.M)
-_RE_SUBOP_REUSE_MAPPED = re.compile(r"^//\s+reuse_targets_q0_mapped:\s+(\d+)\s*$", re.M)
-_RE_SUBOP_REUSE_MAPPED_NO_TABLE = re.compile(r"^//\s+reuse_targets_q0_mapped_no_table:\s+(\d+)\s*$", re.M)
+_RE_SUBOP_REUSE = re.compile(
+    r"^//\s+reuse_targets:\s+(?:query\[0\]=(\d+)\s+query\[1\]=(\d+)|per_query=\[(\d+),(\d+)\])\s*$",
+    re.M,
+)
+_RE_SUBOP_REUSE_NO_TABLE = re.compile(
+    r"^//\s+reuse_targets_no_table:\s+(?:query\[0\]=(\d+)\s+query\[1\]=(\d+)|per_query=\[(\d+),(\d+)\])\s*$",
+    re.M,
+)
+_RE_SUBOP_REUSE_MAPPED = re.compile(r"^//\s+reuse_targets_(?:q0|synthetic)_mapped:\s+(\d+)\s*$", re.M)
+_RE_SUBOP_REUSE_MAPPED_NO_TABLE = re.compile(
+    r"^//\s+reuse_targets_(?:q0|synthetic)_mapped_no_table:\s+(\d+)\s*$",
+    re.M,
+)
 _RE_SUBOP_TIMING_TOTAL = re.compile(r"^//\s+timing:\s+optimization_ms=.*\s+execution_time_ms=([0-9.eE+\-]+)\s*$", re.M)
 _RE_SUBOP_TIMING_PER_RUN = re.compile(r"^//\s+timing_execution_time_ms:\s+per_run=\[([^\]]*)\]\s+total=([0-9.eE+\-]+)\s*$", re.M)
 _RE_SUBOP_RESULT_BLOCK = re.compile(
@@ -118,15 +127,21 @@ def parse_subop_result_blocks(stdout: str) -> Dict[int, str]:
     return out
 
 
+def parse_reuse_count_pair(match: re.Match[str]) -> Dict[str, int]:
+    q0 = match.group(1) or match.group(3)
+    q1 = match.group(2) or match.group(4)
+    return {"q0": int(q0), "q1": int(q1)}
+
+
 def parse_subop_metrics(stdout: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
 
     m = _RE_SUBOP_REUSE.search(stdout)
     if m:
-        out["reuse_targets"] = {"q0": int(m.group(1)), "q1": int(m.group(2))}
+        out["reuse_targets"] = parse_reuse_count_pair(m)
     m = _RE_SUBOP_REUSE_NO_TABLE.search(stdout)
     if m:
-        out["reuse_targets_no_table"] = {"q0": int(m.group(1)), "q1": int(m.group(2))}
+        out["reuse_targets_no_table"] = parse_reuse_count_pair(m)
     m = _RE_SUBOP_REUSE_MAPPED.search(stdout)
     if m:
         out["reuse_targets_q0_mapped"] = int(m.group(1))
@@ -209,6 +224,25 @@ def build_subop_result_payload(
     return payload
 
 
+def summarize_reuse_counts(subop_payload: Dict[str, Any]) -> Dict[str, Any]:
+    reuse = subop_payload.get("reuse_targets")
+    reuse_no_table = subop_payload.get("reuse_targets_no_table")
+    summary: Dict[str, Any] = {}
+    if reuse:
+        total = int(reuse.get("q0", 0)) + int(reuse.get("q1", 0))
+        summary["reuse_targets_total"] = total
+        summary["has_reuse"] = total > 0
+    if reuse_no_table:
+        total_no_table = int(reuse_no_table.get("q0", 0)) + int(reuse_no_table.get("q1", 0))
+        summary["reuse_targets_no_table_total"] = total_no_table
+        summary["has_reuse_no_table"] = total_no_table > 0
+    if "reuse_targets_q0_mapped" in subop_payload:
+        summary["reuse_targets_q0_mapped"] = subop_payload["reuse_targets_q0_mapped"]
+    if "reuse_targets_q0_mapped_no_table" in subop_payload:
+        summary["reuse_targets_q0_mapped_no_table"] = subop_payload["reuse_targets_q0_mapped_no_table"]
+    return summary
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--build-dir", default="build/lingodb-release", help="e.g. build/lingodb-release")
@@ -259,6 +293,10 @@ def main() -> None:
     pairs = list(itertools.combinations(range(1, 23), 2))
     total = len(pairs)
     done = 0
+    reuse_pair_count = sum(1 for row in results if row.get("reuse_summary", {}).get("has_reuse"))
+    reuse_no_table_pair_count = sum(
+        1 for row in results if row.get("reuse_summary", {}).get("has_reuse_no_table")
+    )
     t_all = time.time()
 
     for a, b in pairs:
@@ -286,6 +324,11 @@ def main() -> None:
                 "q1_execution_time_ms": singles[b]["execution_time_ms"],
             },
         }
+        row["reuse_summary"] = summarize_reuse_counts(row["subop"])
+        if row["reuse_summary"].get("has_reuse"):
+            reuse_pair_count += 1
+        if row["reuse_summary"].get("has_reuse_no_table"):
+            reuse_no_table_pair_count += 1
         q0 = singles[a]["execution_time_ms"]
         q1 = singles[b]["execution_time_ms"]
         if q0 is not None and q1 is not None:
@@ -333,7 +376,10 @@ def main() -> None:
         done += 1
         if done % 10 == 0 or done == total:
             elapsed = time.time() - t_all
-            print(f"[{done}/{total}] last={pair_id} elapsed_s={elapsed:.1f}")
+            print(
+                f"[{done}/{total}] last={pair_id} reuse_pairs={reuse_pair_count} "
+                f"reuse_no_table_pairs={reuse_no_table_pair_count} elapsed_s={elapsed:.1f}"
+            )
 
             out_obj = {
                 "meta": {
@@ -341,6 +387,8 @@ def main() -> None:
                     "db": args.db,
                     "sql_dir": args.sql_dir,
                     "generated_at_unix": time.time(),
+                    "reuse_pair_count": reuse_pair_count,
+                    "reuse_no_table_pair_count": reuse_no_table_pair_count,
                 },
                 "singles_run_sql": singles,
                 "pairs": results,

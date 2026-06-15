@@ -1732,6 +1732,11 @@ static subop::HashIndexedViewType asHashIndexedViewLayoutType(mlir::Type type) {
    return nullptr;
 }
 
+static bool lookupEntryRefStateHasLayout(mlir::Type type, subop::HashIndexedViewType layoutHiv) {
+   auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(type);
+   return ler && asHashIndexedViewLayoutType(ler.getState()) == layoutHiv;
+}
+
 static bool sameMemberTypeSequence(subop::MemberManager& mmA, subop::StateMembersAttr a,
                                    subop::MemberManager& mmB, subop::StateMembersAttr b) {
    auto as = a.getMembers();
@@ -2248,7 +2253,8 @@ static void collectMapOpsOnStreamChain(mlir::Value stream, llvm::SmallVector<sub
    }
 }
 
-static void syncMapInputColsFromGather(subop::GatherOp gather, tuples::ColumnManager& cm) {
+static void syncMapInputColsFromGather(subop::GatherOp gather, tuples::ColumnManager& cm,
+                                       const llvm::StringMap<tuples::ColumnRefAttr>* extraRefsByKey = nullptr) {
    auto* ctx = gather.getContext();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    llvm::StringMap<tuples::ColumnRefAttr> outRefByKey;
@@ -2259,6 +2265,11 @@ static void syncMapInputColsFromGather(subop::GatherOp gather, tuples::ColumnMan
       outRefByKey[columnSemanticKey(scope, leaf)] = outRef;
       outRefByNormLeaf[leaf] = outRef;
       outRefByNormLeaf[mm.getName(pr.first)] = outRef;
+   }
+   if (extraRefsByKey) {
+      for (const auto& entry : *extraRefsByKey) {
+         outRefByKey[entry.getKey()] = entry.getValue();
+      }
    }
    if (outRefByKey.empty()) return;
    llvm::SmallVector<subop::MapOp, 8> mapOps;
@@ -2304,15 +2315,14 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
    };
    auto syncLookupEntryRefToHiv = [&](tuples::ColumnRefAttr& cref) -> bool {
       bool changed = false;
-      if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(cref.getColumn().type)) {
-         if (ler.getState() != producerHiv) return false;
+      if (mlir::isa<subop::LookupEntryRefType>(cref.getColumn().type)) {
+         if (!lookupEntryRefStateHasLayout(cref.getColumn().type, producerHiv)) return false;
          if (cref.getColumn().type != expectedLer) {
             cref.getColumn().type = expectedLer;
             changed = true;
          }
       } else if (auto list = mlir::dyn_cast<subop::ListType>(cref.getColumn().type)) {
-         auto elemLer = mlir::dyn_cast<subop::LookupEntryRefType>(list.getT());
-         if (!elemLer || elemLer.getState() != producerHiv) return false;
+         if (!lookupEntryRefStateHasLayout(list.getT(), producerHiv)) return false;
          if (cref.getColumn().type != expectedListTy) {
             cref.getColumn().type = expectedListTy;
             changed = true;
@@ -2321,8 +2331,7 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
       return changed;
    };
    auto syncLookupEntryDefToHiv = [&](tuples::ColumnDefAttr& def) -> bool {
-      auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(def.getColumn().type);
-      if (!ler || ler.getState() != producerHiv) return false;
+      if (!lookupEntryRefStateHasLayout(def.getColumn().type, producerHiv)) return false;
       if (def.getColumn().type == expectedLer) return false;
       def.getColumn().type = expectedLer;
       return true;
@@ -2361,7 +2370,7 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
    module.walk([&](subop::LookupOp op) {
       if (!shouldUpdateOp(op.getOperation())) return;
       if (closureFilter && !opaqueClosureContains(*closureFilter, op.getState())) return;
-      auto hivTy = mlir::dyn_cast<subop::HashIndexedViewType>(op.getState().getType());
+      auto hivTy = asHashIndexedViewLayoutType(op.getState().getType());
       if (!hivTy || hivTy != producerHiv) return;
       auto r = op.getRef();
       if (r.getColumn().type != expectedListTy) {
@@ -2425,7 +2434,7 @@ static void propagateJoinSupersetColumnAttrsForClosure(mlir::ModuleOp module,
    auto& cm = module.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    module.walk([&](subop::LookupOp op) {
       if (!opOperandsOrNestedBlockArgsTouchClosure(op.getOperation(), closureFilter)) return;
-      auto hivTy = mlir::dyn_cast<subop::HashIndexedViewType>(op.getState().getType());
+      auto hivTy = asHashIndexedViewLayoutType(op.getState().getType());
       if (!hivTy) return;
       if (!seenHiv.insert(hivTy.getAsOpaquePointer()).second) return;
       auto listRef = op.getRef();
@@ -4426,6 +4435,7 @@ static void remapClosureGathersToAlignedConsumerHiv(mlir::ModuleOp consumer,
       auto st = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState());
       if (!st || !sameHashIndexedViewLayout(st, alignedHiv)) return;
       llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> out;
+      llvm::StringMap<tuples::ColumnRefAttr> oldDefRefsToNewDefs;
       bool changed = false;
       for (auto& pr : gather.getMapping().getMapping()) {
          subop::Member nm = resolveGatherMember(pr.first, pr.second);
@@ -4434,13 +4444,18 @@ static void remapClosureGathersToAlignedConsumerHiv(mlir::ModuleOp consumer,
          if (nm != pr.first) changed = true;
          tuples::ColumnDefAttr def = pr.second;
          auto [defScope, defLeaf] = cm.getName(&def.getColumn());
-         if (isJoinProbeCompilerScope(defScope) && !lookupProbeRefScopesMatch(refScope, defScope)) {
+         bool probePayloadLeafNeedsRename = isJoinProbeCompilerScope(defScope) &&
+            isPayloadMemberSlotName(defLeaf) && defLeaf != mm.getName(nm);
+         if (isJoinProbeCompilerScope(defScope) &&
+             (!lookupProbeRefScopesMatch(refScope, defScope) || probePayloadLeafNeedsRename)) {
+            std::string oldDefKey = columnSemanticKey(defScope, defLeaf);
             debugProbeAlign(dbg, [&](llvm::raw_ostream& os) {
                os << "  remapClosure mapping @" << defScope << "::" << defLeaf << " -> @" << refScope
                   << "::" << mm.getName(nm);
             });
             def = cm.createDef(refScope, mm.getName(nm));
             def.getColumn().type = mm.getType(nm);
+            oldDefRefsToNewDefs[oldDefKey] = cm.createRef(&def.getColumn());
             changed = true;
          } else if (auto lerDef = mlir::dyn_cast<subop::LookupEntryRefType>(def.getColumn().type)) {
             if (sameHashIndexedViewLayout(mlir::cast<subop::HashIndexedViewType>(lerDef.getState()), alignedHiv) &&
@@ -4452,7 +4467,7 @@ static void remapClosureGathersToAlignedConsumerHiv(mlir::ModuleOp consumer,
          out.push_back({nm, def});
       }
       if (changed) gather.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, out));
-      syncMapInputColsFromGather(gather, cm);
+      syncMapInputColsFromGather(gather, cm, &oldDefRefsToNewDefs);
    });
 }
 
@@ -4475,8 +4490,23 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
 
    llvm::DenseMap<subop::Member, subop::Member> producerPayloadToConsumer;
    llvm::StringMap<subop::Member> assignedBySemantic;
+   llvm::DenseSet<subop::Member> assignedMembers;
    llvm::DenseMap<subop::Member, subop::Member> probeGatherMemberRemap;
    assert(layout.payloadSemanticKeys.size() == layout.payloadMembers.size());
+
+   llvm::SmallVector<subop::Member, 8> oldNonPredValueMembers;
+   if (consumerHivBeforeAlign) {
+      for (subop::Member m : consumerHivBeforeAlign.getValueMembers().getMembers()) {
+         if (parseFilterPredMemberSlot(mm.getName(m))) continue;
+         oldNonPredValueMembers.push_back(m);
+      }
+   }
+   unsigned unionNonPredValueMembers = 0;
+   for (llvm::StringRef semKey : layout.payloadSemanticKeys) {
+      unsigned predIdx = 0;
+      if (!parseFilterPredLayoutSemanticKey(semKey, predIdx)) ++unionNonPredValueMembers;
+   }
+   unsigned nonPredPayloadIndex = 0;
 
    auto ensureConsumerMember = [&](std::optional<subop::Member> reused, mlir::Type producerSlotTy) -> subop::Member {
       if (reused) {
@@ -4503,9 +4533,11 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
       if (parseFilterPredLayoutSemanticKey(semKey, predIdx)) {
          subop::Member consumerMem = makeOrGetPredMemberForSlot(ctx, predIdx);
          assignedBySemantic[semKey] = consumerMem;
+         assignedMembers.insert(consumerMem);
          producerPayloadToConsumer[producerMem] = consumerMem;
          continue;
       }
+      unsigned curNonPredPayloadIndex = nonPredPayloadIndex++;
 
       std::optional<subop::Member> reused;
       if (auto it = semanticToConsumer.find(semKey); it != semanticToConsumer.end()) {
@@ -4517,8 +4549,11 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
       // when this query already had the column (assignPayloadMembersForPlan keeps member$N / flag$N).
       if (!reused && consumerHivBeforeAlign) {
          auto& producerMm = producerHiv.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-         if (consumerReuseQueryIndex && consumerQueryHadPayloadColumn(layout, semKey, *consumerReuseQueryIndex)) {
-            reused = findConsumerMemberByName(producerMm.getName(producerMem), consumerHivBeforeAlign);
+         reused = findConsumerMemberByName(producerMm.getName(producerMem), consumerHivBeforeAlign);
+         if (!reused && oldNonPredValueMembers.size() == unionNonPredValueMembers &&
+             curNonPredPayloadIndex < oldNonPredValueMembers.size()) {
+            subop::Member oldMember = oldNonPredValueMembers[curNonPredPayloadIndex];
+            if (!assignedMembers.contains(oldMember)) reused = oldMember;
          }
          if (!reused) {
             llvm::ArrayRef<subop::Member> oldVals = consumerHivBeforeAlign.getValueMembers().getMembers();
@@ -4528,19 +4563,24 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
                   qIdx == 0 ? layout.query0SemanticKeys : layout.query1SemanticKeys;
                if (qKeys.size() == 1 && qKeys[0] == semKey && oldVals.size() == 1) {
                   probeGatherRemapFrom = oldVals[0];
-                  reused = std::nullopt;
+                  if (!assignedMembers.contains(oldVals[0])) reused = oldVals[0];
                   break;
                }
             }
          }
       }
+      if (reused && assignedMembers.contains(*reused)) reused = std::nullopt;
       subop::Member consumerMem = ensureConsumerMember(reused, producerSlotTy);
       if (probeGatherRemapFrom) {
          probeGatherMemberRemap[*probeGatherRemapFrom] = consumerMem;
       } else if (reused && consumerHivBeforeAlign && *reused != consumerMem) {
          probeGatherMemberRemap[*reused] = consumerMem;
       }
+      if (producerMem != consumerMem) {
+         probeGatherMemberRemap[producerMem] = consumerMem;
+      }
       assignedBySemantic[semKey] = consumerMem;
+      assignedMembers.insert(consumerMem);
       producerPayloadToConsumer[layout.payloadMembers[i]] = consumerMem;
    }
 
@@ -4986,7 +5026,7 @@ void syncProbeGatherMappingsInModule(mlir::ModuleOp module) {
    auto& cm = module.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    llvm::DenseSet<const void*> seenHiv;
    module.walk([&](subop::LookupOp op) {
-      auto hivTy = mlir::dyn_cast<subop::HashIndexedViewType>(op.getState().getType());
+      auto hivTy = asHashIndexedViewLayoutType(op.getState().getType());
       if (!hivTy) return;
       if (!seenHiv.insert(hivTy.getAsOpaquePointer()).second) return;
       auto listRef = op.getRef();
@@ -5009,7 +5049,7 @@ void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const Cache
    consumer.walk([&](subop::CacheGetOp get) {
       if (cacheKey && static_cast<uint64_t>(get.getKey()) != *cacheKey) return;
 
-      auto consumerHivBeforeAlign = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
+      auto consumerHivBeforeAlign = asHashIndexedViewLayoutType(get.getResult().getType());
       CachedJoinBufferLayout consumerLayout;
       subop::HashIndexedViewType alignedHiv = buildConsumerAlignedHivType(
          consumer, producerHiv, layout, consumerHivBeforeAlign, consumerReuseQueryIndex, consumerLayout);
@@ -5443,7 +5483,7 @@ void resyncConsumerCachedHivCarrierTypesFromCacheGet(mlir::ModuleOp consumer,
    auto& mm = consumer.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    consumer.walk([&](subop::CacheGetOp get) {
       if (cacheKey && static_cast<uint64_t>(get.getKey()) != *cacheKey) return;
-      auto canonicalHiv = mlir::dyn_cast<subop::HashIndexedViewType>(get.getResult().getType());
+      auto canonicalHiv = asHashIndexedViewLayoutType(get.getResult().getType());
       if (!canonicalHiv) return;
 
       CachedJoinBufferLayout consumerLayout;

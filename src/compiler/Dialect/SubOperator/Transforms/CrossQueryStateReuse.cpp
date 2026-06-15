@@ -419,9 +419,9 @@ decodeFiltersForPotentialReuseState(mlir::Value state, const ModuleReuseInfo& re
    return filters;
 }
 
-static bool reuseMatchFiltersDefinitelyDisjoint(mlir::Value stateA, mlir::Value stateB,
-                                                const ModuleReuseInfo& reuseA,
-                                                const ModuleReuseInfo& reuseB) {
+[[maybe_unused]] static bool reuseMatchFiltersDefinitelyDisjoint(mlir::Value stateA, mlir::Value stateB,
+                                                                 const ModuleReuseInfo& reuseA,
+                                                                 const ModuleReuseInfo& reuseB) {
    llvm::SmallVector<runtime::FilterDescription, 8> filtersA =
       decodeFiltersForPotentialReuseState(stateA, reuseA);
    llvm::SmallVector<runtime::FilterDescription, 8> filtersB =
@@ -768,6 +768,7 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    mlir::ModuleOp query1,
    llvm::ArrayRef<CrossQueryStateMatchPair> matches,
    lingodb::catalog::Catalog* catalog) {
+   (void)catalog;
    ReusePlanRewriteResult res;
 
    llvm::SmallVector<CrossQueryStateMatchPair, 64> matchesLocal(matches.begin(), matches.end());
@@ -797,17 +798,11 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
       if (m.stateA && m.stateB) {
          ta = resolveCacheTargetStateForReuse(m.stateA, reuse0Early);
          tb = resolveCacheTargetStateForReuse(m.stateB, reuse1Early);
+         // Cardinality/disjoint pruning is intentionally disabled for now. The old pairwise
+         // rewrite path must match the batch path; pruning should come back through the shared
+         // match-group cost model instead of filtering pairs here.
          bool bothHiv = mlir::isa<subop::HashIndexedViewType>(ta.getType()) &&
             mlir::isa<subop::HashIndexedViewType>(tb.getType());
-         if (reuseMatchFiltersDefinitelyDisjoint(m.stateA, m.stateB, reuse0Early, reuse1Early)) {
-            continue;
-         }
-         if (bothHiv) {
-            assert(catalog && "join superset CE threshold requires a catalog");
-            double mergedRows = estimateMergedHivExternalFilterRows(query0, query1, m.stateA, m.stateB,
-                                                                    reuse0Early, reuse1Early, *catalog);
-            if (mergedRows < 100.0) continue;
-         }
          if (bothHiv &&
              joinMatchPeerExternalFiltersIdentical(query0, query1, m.stateA, m.stateB, reuse0Early, reuse1Early)) {
             enableFilterPredReuse = false;
