@@ -14,10 +14,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
+#include <map>
 #include <unordered_set>
 #include <sstream>
 #include <llvm/ADT/SmallSet.h>
@@ -3318,6 +3320,17 @@ struct MatchStringFilterRange {
    std::optional<std::string> eq;
 };
 
+struct MatchNormalizedColumnFilter {
+   MatchNumericFilterRange numericRange;
+   MatchStringFilterRange stringRange;
+   llvm::SmallVector<double, 8> numericIn;
+   llvm::SmallVector<std::string, 8> stringIn;
+   bool hasNumericRange = false;
+   bool hasStringRange = false;
+   bool hasNumericIn = false;
+   bool hasStringIn = false;
+};
+
 static std::optional<double> getMatchNumericFilterValue(const lingodb::runtime::FilterDescription& f) {
    if (const auto* v = std::get_if<int64_t>(&f.value)) return static_cast<double>(*v);
    if (const auto* v = std::get_if<double>(&f.value)) return *v;
@@ -3372,6 +3385,7 @@ static void addMatchRangeConstraint(MatchNumericFilterRange& range, lingodb::run
 }
 
 static bool matchRangeAllowsValue(const MatchNumericFilterRange& range, double value) {
+   if (range.eq && value != *range.eq) return false;
    if (range.hasLower && (value < range.lower || (value == range.lower && !range.lowerInclusive))) return false;
    if (range.hasUpper && (value > range.upper || (value == range.upper && !range.upperInclusive))) return false;
    return true;
@@ -3434,6 +3448,7 @@ static void addMatchStringRangeConstraint(MatchStringFilterRange& range, lingodb
 }
 
 static bool matchStringRangeAllowsValue(const MatchStringFilterRange& range, llvm::StringRef value) {
+   if (range.eq && value != *range.eq) return false;
    if (range.lower && (value < *range.lower || (value == *range.lower && !range.lowerInclusive))) return false;
    if (range.upper && (value > *range.upper || (value == *range.upper && !range.upperInclusive))) return false;
    return true;
@@ -3462,57 +3477,207 @@ static bool matchStringRangesAreDisjoint(const MatchStringFilterRange& a, const 
    return false;
 }
 
-static bool matchFiltersDefinitelyDisjoint(
-   llvm::ArrayRef<lingodb::runtime::FilterDescription> filtersA,
-   llvm::ArrayRef<lingodb::runtime::FilterDescription> filtersB) {
-   for (const auto& a : filtersA) {
-      if (a.op != lingodb::runtime::FilterOp::EQ) continue;
-      const auto* strA = std::get_if<std::string>(&a.value);
-      if (!strA) continue;
-      for (const auto& b : filtersB) {
-         if (b.op != lingodb::runtime::FilterOp::EQ) continue;
-         if (a.columnName != b.columnName) continue;
-         const auto* strB = std::get_if<std::string>(&b.value);
-         if (!strB) continue;
-         if (*strA != *strB) return true;
+static void intersectNumericIn(llvm::SmallVectorImpl<double>& current, llvm::ArrayRef<double> next) {
+   llvm::SmallVector<double, 8> intersection;
+   for (double v : current) {
+      if (llvm::is_contained(next, v) && !llvm::is_contained(intersection, v)) intersection.push_back(v);
+   }
+   current.assign(intersection.begin(), intersection.end());
+}
+
+static void intersectStringIn(llvm::SmallVectorImpl<std::string>& current, llvm::ArrayRef<std::string> next) {
+   llvm::SmallVector<std::string, 8> intersection;
+   for (const std::string& v : current) {
+      if (llvm::is_contained(next, v) && !llvm::is_contained(intersection, v)) intersection.push_back(v);
+   }
+   current.assign(intersection.begin(), intersection.end());
+}
+
+static void addMatchInConstraint(MatchNormalizedColumnFilter& normalized,
+                                 const lingodb::runtime::FilterDescription& f) {
+   std::visit([&](const auto& values) {
+      using Vec = std::decay_t<decltype(values)>;
+      if constexpr (std::is_same_v<Vec, std::vector<std::string>>) {
+         llvm::SmallVector<std::string, 8> next;
+         for (const std::string& v : values)
+            if (!llvm::is_contained(next, v)) next.push_back(v);
+         if (normalized.hasStringIn) {
+            intersectStringIn(normalized.stringIn, next);
+         } else {
+            normalized.hasStringIn = true;
+            normalized.stringIn.assign(next.begin(), next.end());
+         }
+      } else {
+         llvm::SmallVector<double, 8> next;
+         for (auto v : values) {
+            double d = static_cast<double>(v);
+            if (!llvm::is_contained(next, d)) next.push_back(d);
+         }
+         if (normalized.hasNumericIn) {
+            intersectNumericIn(normalized.numericIn, next);
+         } else {
+            normalized.hasNumericIn = true;
+            normalized.numericIn.assign(next.begin(), next.end());
+         }
+      }
+   },
+              f.values);
+}
+
+static llvm::StringMap<MatchNormalizedColumnFilter>
+preprocessSimpleMatchFilters(llvm::ArrayRef<lingodb::runtime::FilterDescription> filters) {
+   llvm::StringMap<MatchNormalizedColumnFilter> out;
+   for (const auto& f : filters) {
+      if (f.op == lingodb::runtime::FilterOp::NEQ || f.op == lingodb::runtime::FilterOp::NOTNULL) continue;
+      MatchNormalizedColumnFilter& normalized = out[f.columnName];
+      if (f.op == lingodb::runtime::FilterOp::IN) {
+         addMatchInConstraint(normalized, f);
+         continue;
+      }
+      if (!isMatchRangeFilterOp(f.op)) continue;
+      if (auto numericValue = getMatchNumericFilterValue(f)) {
+         normalized.hasNumericRange = true;
+         addMatchRangeConstraint(normalized.numericRange, f.op, *numericValue);
+         continue;
+      }
+      if (const auto* stringValue = std::get_if<std::string>(&f.value)) {
+         normalized.hasStringRange = true;
+         addMatchStringRangeConstraint(normalized.stringRange, f.op, *stringValue);
       }
    }
 
-   llvm::StringMap<MatchNumericFilterRange> rangesA;
-   llvm::StringMap<MatchNumericFilterRange> rangesB;
-   auto addAll = [](llvm::StringMap<MatchNumericFilterRange>& ranges,
-                    llvm::ArrayRef<lingodb::runtime::FilterDescription> filters) {
-      for (const auto& f : filters) {
-         if (!isMatchRangeFilterOp(f.op)) continue;
-         std::optional<double> value = getMatchNumericFilterValue(f);
-         if (!value) continue;
-         addMatchRangeConstraint(ranges[f.columnName], f.op, *value);
+   for (auto& entry : out) {
+      MatchNormalizedColumnFilter& normalized = entry.getValue();
+      if (normalized.hasNumericIn) {
+         llvm::SmallVector<double, 8> narrowed;
+         for (double v : normalized.numericIn) {
+            if (matchRangeAllowsValue(normalized.numericRange, v) && !llvm::is_contained(narrowed, v))
+               narrowed.push_back(v);
+         }
+         normalized.numericIn.assign(narrowed.begin(), narrowed.end());
+         normalized.hasNumericRange = false;
       }
-   };
-   addAll(rangesA, filtersA);
-   addAll(rangesB, filtersB);
-   for (auto& a : rangesA) {
-      auto b = rangesB.find(a.getKey());
-      if (b == rangesB.end()) continue;
-      if (matchRangesAreDisjoint(a.getValue(), b->getValue())) return true;
+      if (normalized.hasStringIn) {
+         llvm::SmallVector<std::string, 8> narrowed;
+         for (const std::string& v : normalized.stringIn) {
+            if (matchStringRangeAllowsValue(normalized.stringRange, v) && !llvm::is_contained(narrowed, v))
+               narrowed.push_back(v);
+         }
+         normalized.stringIn.assign(narrowed.begin(), narrowed.end());
+         normalized.hasStringRange = false;
+      }
    }
-   llvm::StringMap<MatchStringFilterRange> stringRangesA;
-   llvm::StringMap<MatchStringFilterRange> stringRangesB;
-   auto addAllStrings = [](llvm::StringMap<MatchStringFilterRange>& ranges,
-                           llvm::ArrayRef<lingodb::runtime::FilterDescription> filters) {
-      for (const auto& f : filters) {
-         if (!isMatchRangeFilterOp(f.op)) continue;
-         const auto* value = std::get_if<std::string>(&f.value);
-         if (!value) continue;
-         addMatchStringRangeConstraint(ranges[f.columnName], f.op, *value);
-      }
-   };
-   addAllStrings(stringRangesA, filtersA);
-   addAllStrings(stringRangesB, filtersB);
-   for (auto& a : stringRangesA) {
-      auto b = stringRangesB.find(a.getKey());
-      if (b == stringRangesB.end()) continue;
-      if (matchStringRangesAreDisjoint(a.getValue(), b->getValue())) return true;
+   return out;
+}
+
+static bool numericInDisjointFromRange(llvm::ArrayRef<double> values, const MatchNumericFilterRange& range) {
+   if (values.empty() || matchRangeIsEmpty(range)) return true;
+   return llvm::none_of(values, [&](double v) { return matchRangeAllowsValue(range, v); });
+}
+
+static bool stringInDisjointFromRange(llvm::ArrayRef<std::string> values, const MatchStringFilterRange& range) {
+   if (values.empty() || matchStringRangeIsEmpty(range)) return true;
+   return llvm::none_of(values, [&](const std::string& v) { return matchStringRangeAllowsValue(range, v); });
+}
+
+static bool numericInSetsDisjoint(llvm::ArrayRef<double> a, llvm::ArrayRef<double> b) {
+   if (a.empty() || b.empty()) return true;
+   return llvm::none_of(a, [&](double v) { return llvm::is_contained(b, v); });
+}
+
+static bool stringInSetsDisjoint(llvm::ArrayRef<std::string> a, llvm::ArrayRef<std::string> b) {
+   if (a.empty() || b.empty()) return true;
+   return llvm::none_of(a, [&](const std::string& v) { return llvm::is_contained(b, v); });
+}
+
+static bool normalizedColumnFiltersDisjoint(const MatchNormalizedColumnFilter& a,
+                                            const MatchNormalizedColumnFilter& b) {
+   if (a.hasNumericIn && b.hasNumericIn && numericInSetsDisjoint(a.numericIn, b.numericIn)) return true;
+   if (a.hasNumericIn && b.hasNumericRange && numericInDisjointFromRange(a.numericIn, b.numericRange)) return true;
+   if (b.hasNumericIn && a.hasNumericRange && numericInDisjointFromRange(b.numericIn, a.numericRange)) return true;
+   if (a.hasNumericRange && b.hasNumericRange && matchRangesAreDisjoint(a.numericRange, b.numericRange)) return true;
+
+   if (a.hasStringIn && b.hasStringIn && stringInSetsDisjoint(a.stringIn, b.stringIn)) return true;
+   if (a.hasStringIn && b.hasStringRange && stringInDisjointFromRange(a.stringIn, b.stringRange)) return true;
+   if (b.hasStringIn && a.hasStringRange && stringInDisjointFromRange(b.stringIn, a.stringRange)) return true;
+   if (a.hasStringRange && b.hasStringRange && matchStringRangesAreDisjoint(a.stringRange, b.stringRange)) return true;
+
+   return false;
+}
+
+static MatchNumericFilterRange canonicalizeNumericRangeForClustering(MatchNumericFilterRange range) {
+   if (range.eq) {
+      range.hasLower = true;
+      range.lower = *range.eq;
+      range.lowerInclusive = true;
+      range.hasUpper = true;
+      range.upper = *range.eq;
+      range.upperInclusive = true;
+      range.eq.reset();
+   }
+   return range;
+}
+
+static MatchStringFilterRange canonicalizeStringRangeForClustering(MatchStringFilterRange range) {
+   if (range.eq) {
+      range.lower = *range.eq;
+      range.lowerInclusive = true;
+      range.upper = *range.eq;
+      range.upperInclusive = true;
+      range.eq.reset();
+   }
+   return range;
+}
+
+static void unionNumericRangeInto(MatchNumericFilterRange& current, const MatchNumericFilterRange& next) {
+   if (!current.hasLower || !next.hasLower) {
+      current.hasLower = false;
+   } else if (next.lower < current.lower) {
+      current.lower = next.lower;
+      current.lowerInclusive = next.lowerInclusive;
+   } else if (next.lower == current.lower) {
+      current.lowerInclusive = current.lowerInclusive || next.lowerInclusive;
+   }
+
+   if (!current.hasUpper || !next.hasUpper) {
+      current.hasUpper = false;
+   } else if (next.upper > current.upper) {
+      current.upper = next.upper;
+      current.upperInclusive = next.upperInclusive;
+   } else if (next.upper == current.upper) {
+      current.upperInclusive = current.upperInclusive || next.upperInclusive;
+   }
+}
+
+static void unionStringRangeInto(MatchStringFilterRange& current, const MatchStringFilterRange& next) {
+   if (!current.lower || !next.lower) {
+      current.lower.reset();
+   } else if (*next.lower < *current.lower) {
+      current.lower = next.lower;
+      current.lowerInclusive = next.lowerInclusive;
+   } else if (*next.lower == *current.lower) {
+      current.lowerInclusive = current.lowerInclusive || next.lowerInclusive;
+   }
+
+   if (!current.upper || !next.upper) {
+      current.upper.reset();
+   } else if (*next.upper > *current.upper) {
+      current.upper = next.upper;
+      current.upperInclusive = next.upperInclusive;
+   } else if (*next.upper == *current.upper) {
+      current.upperInclusive = current.upperInclusive || next.upperInclusive;
+   }
+}
+
+static bool matchFiltersDefinitelyDisjoint(
+   llvm::ArrayRef<lingodb::runtime::FilterDescription> filtersA,
+   llvm::ArrayRef<lingodb::runtime::FilterDescription> filtersB) {
+   llvm::StringMap<MatchNormalizedColumnFilter> normalizedA = preprocessSimpleMatchFilters(filtersA);
+   llvm::StringMap<MatchNormalizedColumnFilter> normalizedB = preprocessSimpleMatchFilters(filtersB);
+   for (auto& a : normalizedA) {
+      auto b = normalizedB.find(a.getKey());
+      if (b == normalizedB.end()) continue;
+      if (normalizedColumnFiltersDisjoint(a.getValue(), b->getValue())) return true;
    }
    return false;
 }
@@ -4261,6 +4426,313 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
    llvm::SmallVector<CrossQueryStateMatchGroup, 64> out;
    llvm::DenseSet<mlir::Value> matchedStates;
 
+   auto buildNormalizedFiltersForMembers = [&](llvm::ArrayRef<const StateMatchProfile*> members)
+      -> std::optional<llvm::SmallVector<llvm::StringMap<MatchNormalizedColumnFilter>, 8>> {
+      llvm::SmallVector<llvm::StringMap<MatchNormalizedColumnFilter>, 8> normalizedByMember;
+      normalizedByMember.reserve(members.size());
+      for (const StateMatchProfile* p : members) {
+         const QueryModel* model = modelByQueryId.lookup(p->queryId);
+         assert(model && "missing query model for profile");
+         llvm::SmallVector<lingodb::runtime::FilterDescription, 8> filters =
+            decodeSimpleMatchFiltersAlongShadowChain(p->value, model->reuse);
+         if (filters.empty()) return std::nullopt;
+         normalizedByMember.push_back(preprocessSimpleMatchFilters(filters));
+      }
+      return normalizedByMember;
+   };
+
+   auto emitMatchGroup = [&](llvm::ArrayRef<const StateMatchProfile*> members,
+                             const StateMatchProfile& keySeed,
+                             llvm::StringRef keySuffix,
+                             llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
+                             bool enableFilterPredReuse) {
+      assert(members.size() >= 2 && "singleton clusters must not be materialized as reuse groups");
+      std::string k = keyForSeed(keySeed);
+      k.append(keySuffix.data(), keySuffix.size());
+      uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
+
+      CrossQueryStateMatchGroup g;
+      g.cacheKey = cacheKey;
+      bool allHiv = true;
+      bool sameStoredHivLayout = true;
+      std::optional<std::string> firstStoredHivLayout;
+      for (const StateMatchProfile* p : members) {
+         if (!mlir::isa<subop::HashIndexedViewType>(p->value.getType())) {
+            allHiv = false;
+            break;
+         }
+         if (!firstStoredHivLayout) {
+            firstStoredHivLayout = p->storedValueMembersFingerprint;
+         } else if (*firstStoredHivLayout != p->storedValueMembersFingerprint) {
+            sameStoredHivLayout = false;
+         }
+      }
+      if (allHiv && !sameStoredHivLayout) g.requiresJoinLayoutUnion = true;
+      bool needsFilterPredReuse = enableFilterPredReuse;
+      if (needsFilterPredReuse && allHiv) {
+         needsFilterPredReuse = false;
+         for (const StateMatchProfile* p : members) {
+            if (p->hasResidualTableFilter || p->hasComplexResidualTableFilter) {
+               needsFilterPredReuse = true;
+               break;
+            }
+            const QueryModel* model = modelByQueryId.lookup(p->queryId);
+            assert(model && "missing query model for profile");
+            if (!decodeSimpleMatchFiltersAlongShadowChain(p->value, model->reuse).empty()) {
+               needsFilterPredReuse = true;
+               break;
+            }
+            if (llvm::any_of(p->depTokensSorted, [](llvm::StringRef dep) {
+                   return dep.starts_with("cache:");
+                })) {
+               needsFilterPredReuse = true;
+               break;
+            }
+         }
+      }
+      g.enableFilterPredReuse = needsFilterPredReuse;
+      if (allHiv && needsFilterPredReuse) g.requiresJoinLayoutUnion = true;
+      for (const StateMatchProfile* p : members) {
+         g.entries.push_back(CrossQueryStateMatchEntry{p->queryId, p->value});
+         matchedStates.insert(p->value);
+      }
+      out.push_back(std::move(g));
+   };
+
+   auto tryEmitSimpleFilterUnionFindClusteredGroups = [&](llvm::ArrayRef<const StateMatchProfile*> members,
+                                                          llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
+                                                          bool enableFilterPredReuse) -> bool {
+      if (members.size() < 2) return false;
+
+      struct SimpleFilterCluster {
+         unsigned root = 0;
+         llvm::SmallVector<const StateMatchProfile*, 8> members;
+      };
+
+      auto clusterByColumn = [&](llvm::ArrayRef<const StateMatchProfile*> currentMembers,
+                                 llvm::ArrayRef<llvm::StringMap<MatchNormalizedColumnFilter>> normalizedByMember,
+                                 llvm::StringRef clusterColumn,
+                                 llvm::SmallVectorImpl<SimpleFilterCluster>& clusters) -> bool {
+         bool useNumeric = true;
+         bool useString = true;
+         for (auto& normalized : normalizedByMember) {
+            auto it = normalized.find(clusterColumn);
+            if (it == normalized.end()) return false;
+            const MatchNormalizedColumnFilter& filter = it->getValue();
+            assert(!((filter.hasNumericRange || filter.hasStringRange) && (filter.hasNumericIn || filter.hasStringIn)) &&
+                   "simple filter preprocessing must collapse same-column range+IN into IN");
+            useNumeric = useNumeric && (filter.hasNumericIn || filter.hasNumericRange);
+            useString = useString && (filter.hasStringIn || filter.hasStringRange);
+         }
+         if (useNumeric == useString) return false;
+
+         llvm::SmallVector<unsigned, 8> parent;
+         parent.reserve(currentMembers.size());
+         for (unsigned i = 0; i < currentMembers.size(); ++i) parent.push_back(i);
+         std::function<unsigned(unsigned)> findRoot = [&](unsigned idx) -> unsigned {
+            if (parent[idx] == idx) return idx;
+            parent[idx] = findRoot(parent[idx]);
+            return parent[idx];
+         };
+         auto unite = [&](unsigned a, unsigned b) {
+            unsigned ra = findRoot(a);
+            unsigned rb = findRoot(b);
+            if (ra != rb) parent[rb] = ra;
+         };
+
+         if (useNumeric) {
+            std::map<double, unsigned> ownerByElement;
+            for (unsigned i = 0; i < currentMembers.size(); ++i) {
+               auto it = normalizedByMember[i].find(clusterColumn);
+               assert(it != normalizedByMember[i].end());
+               for (double v : it->getValue().numericIn) {
+                  auto owner = ownerByElement.find(v);
+                  if (owner == ownerByElement.end()) {
+                     ownerByElement[v] = i;
+                  } else {
+                     unite(i, owner->second);
+                  }
+               }
+            }
+
+            struct NumericRangeItem {
+               unsigned memberIdx;
+               MatchNumericFilterRange range;
+            };
+            llvm::SmallVector<NumericRangeItem, 8> ranges;
+            for (unsigned i = 0; i < currentMembers.size(); ++i) {
+               auto it = normalizedByMember[i].find(clusterColumn);
+               assert(it != normalizedByMember[i].end());
+               const MatchNormalizedColumnFilter& filter = it->getValue();
+               if (!filter.hasNumericRange) continue;
+               ranges.push_back({i, canonicalizeNumericRangeForClustering(filter.numericRange)});
+            }
+
+            auto firstElementInRange = [&](const MatchNumericFilterRange& range) {
+               if (!range.hasLower) return ownerByElement.begin();
+               return range.lowerInclusive ? ownerByElement.lower_bound(range.lower)
+                                           : ownerByElement.upper_bound(range.lower);
+            };
+            auto endElementInRange = [&](const MatchNumericFilterRange& range) {
+               if (!range.hasUpper) return ownerByElement.end();
+               return range.upperInclusive ? ownerByElement.upper_bound(range.upper)
+                                           : ownerByElement.lower_bound(range.upper);
+            };
+            for (const NumericRangeItem& item : ranges) {
+               for (auto owner = firstElementInRange(item.range), end = endElementInRange(item.range);
+                    owner != end; ++owner) {
+                  unite(item.memberIdx, owner->second);
+               }
+            }
+
+            llvm::sort(ranges, [](const NumericRangeItem& a, const NumericRangeItem& b) {
+               if (a.range.hasLower != b.range.hasLower) return !a.range.hasLower;
+               if (!a.range.hasLower) return false;
+               if (a.range.lower != b.range.lower) return a.range.lower < b.range.lower;
+               return a.range.lowerInclusive && !b.range.lowerInclusive;
+            });
+            bool hasCurrent = false;
+            unsigned currentOwner = 0;
+            MatchNumericFilterRange currentRange;
+            for (const NumericRangeItem& item : ranges) {
+               if (!hasCurrent) {
+                  currentOwner = item.memberIdx;
+                  currentRange = item.range;
+                  hasCurrent = true;
+                  continue;
+               }
+               if (matchRangesAreDisjoint(currentRange, item.range)) {
+                  currentOwner = item.memberIdx;
+                  currentRange = item.range;
+               } else {
+                  unite(currentOwner, item.memberIdx);
+                  unionNumericRangeInto(currentRange, item.range);
+               }
+            }
+         } else {
+            std::map<std::string, unsigned> ownerByElement;
+            for (unsigned i = 0; i < currentMembers.size(); ++i) {
+               auto it = normalizedByMember[i].find(clusterColumn);
+               assert(it != normalizedByMember[i].end());
+               for (const std::string& v : it->getValue().stringIn) {
+                  auto owner = ownerByElement.find(v);
+                  if (owner == ownerByElement.end()) {
+                     ownerByElement[v] = i;
+                  } else {
+                     unite(i, owner->second);
+                  }
+               }
+            }
+
+            struct StringRangeItem {
+               unsigned memberIdx;
+               MatchStringFilterRange range;
+            };
+            llvm::SmallVector<StringRangeItem, 8> ranges;
+            for (unsigned i = 0; i < currentMembers.size(); ++i) {
+               auto it = normalizedByMember[i].find(clusterColumn);
+               assert(it != normalizedByMember[i].end());
+               const MatchNormalizedColumnFilter& filter = it->getValue();
+               if (!filter.hasStringRange) continue;
+               ranges.push_back({i, canonicalizeStringRangeForClustering(filter.stringRange)});
+            }
+
+            auto firstElementInRange = [&](const MatchStringFilterRange& range) {
+               if (!range.lower) return ownerByElement.begin();
+               return range.lowerInclusive ? ownerByElement.lower_bound(*range.lower)
+                                           : ownerByElement.upper_bound(*range.lower);
+            };
+            auto endElementInRange = [&](const MatchStringFilterRange& range) {
+               if (!range.upper) return ownerByElement.end();
+               return range.upperInclusive ? ownerByElement.upper_bound(*range.upper)
+                                           : ownerByElement.lower_bound(*range.upper);
+            };
+            for (const StringRangeItem& item : ranges) {
+               for (auto owner = firstElementInRange(item.range), end = endElementInRange(item.range);
+                    owner != end; ++owner) {
+                  unite(item.memberIdx, owner->second);
+               }
+            }
+
+            llvm::sort(ranges, [](const StringRangeItem& a, const StringRangeItem& b) {
+               if (a.range.lower.has_value() != b.range.lower.has_value()) return !a.range.lower.has_value();
+               if (!a.range.lower) return false;
+               if (*a.range.lower != *b.range.lower) return *a.range.lower < *b.range.lower;
+               return a.range.lowerInclusive && !b.range.lowerInclusive;
+            });
+            bool hasCurrent = false;
+            unsigned currentOwner = 0;
+            MatchStringFilterRange currentRange;
+            for (const StringRangeItem& item : ranges) {
+               if (!hasCurrent) {
+                  currentOwner = item.memberIdx;
+                  currentRange = item.range;
+                  hasCurrent = true;
+                  continue;
+               }
+               if (matchStringRangesAreDisjoint(currentRange, item.range)) {
+                  currentOwner = item.memberIdx;
+                  currentRange = item.range;
+               } else {
+                  unite(currentOwner, item.memberIdx);
+                  unionStringRangeInto(currentRange, item.range);
+               }
+            }
+         }
+
+         llvm::DenseMap<unsigned, unsigned> clusterByRoot;
+         for (unsigned i = 0; i < currentMembers.size(); ++i) {
+            unsigned root = findRoot(i);
+            auto it = clusterByRoot.find(root);
+            if (it == clusterByRoot.end()) {
+               unsigned pos = clusters.size();
+               clusters.push_back(SimpleFilterCluster{root, {}});
+               it = clusterByRoot.try_emplace(root, pos).first;
+            }
+            clusters[it->second].members.push_back(currentMembers[i]);
+         }
+         return true;
+      };
+
+      bool emittedAny = false;
+      std::function<void(llvm::ArrayRef<const StateMatchProfile*>, std::optional<std::string>, std::string)>
+         decomposeAndEmit = [&](llvm::ArrayRef<const StateMatchProfile*> currentMembers,
+                                std::optional<std::string> skipColumn,
+                                std::string keySuffix) {
+            if (currentMembers.size() == 1) {
+               matchedStates.insert(currentMembers.front()->value);
+               emittedAny = true;
+               return;
+            }
+
+            auto normalizedStorage = buildNormalizedFiltersForMembers(currentMembers);
+            if (normalizedStorage) {
+               auto& normalizedByMember = *normalizedStorage;
+               for (auto& firstEntry : normalizedByMember.front()) {
+                  llvm::StringRef col = firstEntry.getKey();
+                  if (skipColumn && col == *skipColumn) continue;
+                  llvm::SmallVector<SimpleFilterCluster, 8> clusters;
+                  if (!clusterByColumn(currentMembers, normalizedByMember, col, clusters)) continue;
+                  if (clusters.size() < 2) continue;
+
+                  for (const SimpleFilterCluster& cluster : clusters) {
+                     std::string childSuffix = keySuffix + "@@simple_filter_cluster=" + col.str() + "#" +
+                                               std::to_string(cluster.root);
+                     decomposeAndEmit(cluster.members, col.str(), std::move(childSuffix));
+                  }
+                  emittedAny = true;
+                  return;
+               }
+            }
+
+            emitMatchGroup(currentMembers, *currentMembers.front(), keySuffix, keyForSeed, enableFilterPredReuse);
+            emittedAny = true;
+         };
+
+      decomposeAndEmit(members, std::nullopt, "");
+      return emittedAny;
+   };
+
    auto appendGroupFromBucket = [&](llvm::ArrayRef<const StateMatchProfile*> bucket,
                                     llvm::function_ref<bool(const StateMatchProfile&)> seedOk,
                                     llvm::function_ref<bool(const StateMatchProfile&, const StateMatchProfile&)> peerOk,
@@ -4291,56 +4763,8 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
             seenQueries.insert(b->queryId);
          }
          if (members.size() < 2) continue;
-
-         std::string k = keyForSeed(*a);
-         uint64_t cacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
-
-         CrossQueryStateMatchGroup g;
-         g.cacheKey = cacheKey;
-         bool allHiv = true;
-         bool sameStoredHivLayout = true;
-         std::optional<std::string> firstStoredHivLayout;
-         for (const StateMatchProfile* p : members) {
-            if (!mlir::isa<subop::HashIndexedViewType>(p->value.getType())) {
-               allHiv = false;
-               break;
-            }
-            if (!firstStoredHivLayout) {
-               firstStoredHivLayout = p->storedValueMembersFingerprint;
-            } else if (*firstStoredHivLayout != p->storedValueMembersFingerprint) {
-               sameStoredHivLayout = false;
-            }
-         }
-         if (allHiv && !sameStoredHivLayout) g.requiresJoinLayoutUnion = true;
-         bool needsFilterPredReuse = enableFilterPredReuse;
-         if (needsFilterPredReuse && allHiv) {
-            needsFilterPredReuse = false;
-            for (const StateMatchProfile* p : members) {
-               if (p->hasResidualTableFilter || p->hasComplexResidualTableFilter) {
-                  needsFilterPredReuse = true;
-                  break;
-               }
-               const QueryModel* model = modelByQueryId.lookup(p->queryId);
-               assert(model && "missing query model for profile");
-               if (!decodeSimpleMatchFiltersAlongShadowChain(p->value, model->reuse).empty()) {
-                  needsFilterPredReuse = true;
-                  break;
-               }
-               if (llvm::any_of(p->depTokensSorted, [](llvm::StringRef dep) {
-                      return dep.starts_with("cache:");
-                   })) {
-                  needsFilterPredReuse = true;
-                  break;
-               }
-            }
-         }
-         g.enableFilterPredReuse = needsFilterPredReuse;
-         if (allHiv && needsFilterPredReuse) g.requiresJoinLayoutUnion = true;
-         for (const StateMatchProfile* p : members) {
-            g.entries.push_back(CrossQueryStateMatchEntry{p->queryId, p->value});
-            matchedStates.insert(p->value);
-         }
-         out.push_back(std::move(g));
+         if (tryEmitSimpleFilterUnionFindClusteredGroups(members, keyForSeed, enableFilterPredReuse)) continue;
+         emitMatchGroup(members, *a, "", keyForSeed, enableFilterPredReuse);
       }
    };
 

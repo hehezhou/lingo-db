@@ -358,7 +358,9 @@ double estimateExternalDatasourceOrRowsFromSample(
    auto batch = sample.getSampleData();
    assert(batch && batch->num_rows() > 0 && "sample CE: sample must be non-empty");
 
-   std::vector<std::unique_ptr<eval::expr>> disjuncts;
+   eval::SelectionMask unionMask;
+   unionMask.numRows = static_cast<size_t>(batch->num_rows());
+   unionMask.words.assign((unionMask.numRows + 63) / 64, 0);
    for (size_t i = 0; i < filterSources.size(); ++i) {
       std::vector<std::unique_ptr<eval::expr>> conjuncts;
       auto sourceExpr = buildExternalDatasourcePredicate(filterSources[i], batch->schema());
@@ -370,14 +372,12 @@ double estimateExternalDatasourceOrRowsFromSample(
       if (conjuncts.empty()) {
          return static_cast<double>(tableEntry.value()->getNumRows());
       }
-      disjuncts.push_back(eval::createAnd(conjuncts));
+      auto sourceMask = lingodb::compiler::support::eval::selectRows(batch, eval::createAnd(conjuncts));
+      assert(sourceMask.has_value() && "sample CE: sample predicate must be evaluable");
+      unionMask.orWith(sourceMask.value());
    }
 
-   assert(!disjuncts.empty() && "sample CE: filtered datasource must have clauses");
-   auto optionalCount = lingodb::compiler::support::eval::countResults(
-      batch, lingodb::compiler::support::eval::createOr(disjuncts));
-   assert(optionalCount.has_value() && "sample CE: sample predicate must be evaluable");
-   size_t count = optionalCount.value();
+   size_t count = unionMask.count();
    if (count == 0) count = 1;
    return static_cast<double>(tableEntry.value()->getNumRows()) *
       static_cast<double>(count) / static_cast<double>(batch->num_rows());

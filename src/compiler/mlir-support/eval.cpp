@@ -21,13 +21,45 @@ std::unique_ptr<support::eval::expr> pack(arrow::compute::Expression expr) {
 } // end anonymous namespace
 namespace lingodb::compiler::support::eval {
 
+SelectionMask SelectionMask::all(size_t numRows) {
+   SelectionMask mask;
+   mask.numRows = numRows;
+   mask.words.assign((numRows + 63) / 64, ~uint64_t{0});
+   if (numRows % 64) {
+      mask.words.back() &= (uint64_t{1} << (numRows % 64)) - 1;
+   }
+   return mask;
+}
+
+void SelectionMask::set(size_t row) {
+   assert(row < numRows);
+   words[row / 64] |= uint64_t{1} << (row % 64);
+}
+
+void SelectionMask::orWith(const SelectionMask& other) {
+   assert(numRows == other.numRows);
+   assert(words.size() == other.words.size());
+   for (size_t i = 0; i < words.size(); ++i) words[i] |= other.words[i];
+}
+
+size_t SelectionMask::count() const {
+   size_t res = 0;
+   for (uint64_t word : words) {
+      while (word) {
+         word &= word - 1;
+         ++res;
+      }
+   }
+   return res;
+}
+
 void init() {
    auto status = arrow::compute::Initialize();
    if (!status.ok()) {
       throw std::runtime_error("Failed to initialize Arrow compute: " + status.ToString());
    }
 }
-std::optional<size_t> countResults(std::shared_ptr<arrow::RecordBatch> batch, std::unique_ptr<expr> filter) {
+std::optional<SelectionMask> selectRows(std::shared_ptr<arrow::RecordBatch> batch, std::unique_ptr<expr> filter) {
    if (!filter) return {};
    auto filterExpression = unpack(filter);
    auto boundCond = filterExpression.Bind(*batch->schema()).ValueOrDie();
@@ -40,10 +72,27 @@ std::optional<size_t> countResults(std::shared_ptr<arrow::RecordBatch> batch, st
       throw std::runtime_error("Apache Arrow:" + execBatch->ToString());
    }
    if (mask->is_scalar()) {
-      return mask->scalar_as<arrow::BooleanScalar>().is_valid ? batch->num_rows() : 0;
+      auto scalar = mask->scalar_as<arrow::BooleanScalar>();
+      if (scalar.is_valid && scalar.value) return SelectionMask::all(batch->num_rows());
+      SelectionMask empty;
+      empty.numRows = batch->num_rows();
+      empty.words.assign((empty.numRows + 63) / 64, 0);
+      return empty;
    }
-   size_t res = arrow::compute::internal::GetFilterOutputSize(*mask.ValueUnsafe().array(), arrow::compute::FilterOptions::NullSelectionBehavior::DROP);
-   return res;
+   auto array = std::static_pointer_cast<arrow::BooleanArray>(mask.ValueUnsafe().make_array());
+   SelectionMask selected;
+   selected.numRows = batch->num_rows();
+   selected.words.assign((selected.numRows + 63) / 64, 0);
+   assert(array->length() == static_cast<int64_t>(batch->num_rows()));
+   for (int64_t i = 0; i < array->length(); ++i) {
+      if (array->IsValid(i) && array->Value(i)) selected.set(static_cast<size_t>(i));
+   }
+   return selected;
+}
+std::optional<size_t> countResults(std::shared_ptr<arrow::RecordBatch> batch, std::unique_ptr<expr> filter) {
+   auto selected = selectRows(batch, std::move(filter));
+   if (!selected) return {};
+   return selected->count();
 }
 std::unique_ptr<expr> createAnd(const std::vector<std::unique_ptr<expr>>& expressions) {
    std::vector<arrow::compute::Expression> pureExpressions;

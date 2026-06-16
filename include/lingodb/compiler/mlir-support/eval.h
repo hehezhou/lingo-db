@@ -2,8 +2,10 @@
 #define LINGODB_COMPILER_MLIR_SUPPORT_EVAL_H
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <variant>
 #include <vector>
 
@@ -14,6 +16,15 @@ struct Expr {
    virtual ~Expr() = default;
 };
 using expr = Expr;
+struct SelectionMask {
+   size_t numRows = 0;
+   std::vector<uint64_t> words;
+
+   static SelectionMask all(size_t numRows);
+   void set(size_t row);
+   void orWith(const SelectionMask& other);
+   size_t count() const;
+};
 void init();
 std::unique_ptr<expr> createInvalid();
 std::unique_ptr<expr> createAttrRef(const std::string& str);
@@ -29,6 +40,7 @@ std::unique_ptr<expr> createGt(std::unique_ptr<expr> a, std::unique_ptr<expr> b)
 std::unique_ptr<expr> createLike(std::unique_ptr<expr> a, std::string pattern);
 std::unique_ptr<expr> createIsNull(std::unique_ptr<expr> val);
 
+std::optional<SelectionMask> selectRows(std::shared_ptr<arrow::RecordBatch> batch, std::unique_ptr<expr> filter);
 std::optional<size_t> countResults(std::shared_ptr<arrow::RecordBatch> batch, std::unique_ptr<expr> filter);
 } // end namespace lingodb::compiler::support::eval
 
