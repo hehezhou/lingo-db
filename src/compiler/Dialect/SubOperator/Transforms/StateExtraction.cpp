@@ -1238,7 +1238,7 @@ static JoinHivMatchDetails computeJoinHivMatchDetails(
 
    JoinHivMatchDetails details;
    details.storedValueMembersFingerprint =
-      fingerprintSortedMemberPairs(mm, hivTy.getValueMembers().getMembers());
+      fingerprintMemberTypesSequence(mm, hivTy.getValueMembers().getMembers());
 
    details.indexMemberNamesSanitized.insert(sanitizeMemberSlotName(mm.getName(chiv.getHashMember().getMember())));
    details.indexMemberNamesSanitized.insert(sanitizeMemberSlotName(mm.getName(chiv.getLinkMember().getMember())));
@@ -1421,6 +1421,135 @@ static bool residualPredicateMapComplexForRelaxedHiv(subop::MapOp map,
       }
    }
    return false;
+}
+
+static bool streamValueHasOnlyUseByInStep(mlir::Value v, mlir::Operation* expectedUser,
+                                          subop::ExecutionStepOp step) {
+   mlir::Operation* onlyUser = nullptr;
+   auto isWithinStep = [&](mlir::Operation* op) {
+      for (mlir::Operation* cur = op; cur; cur = cur->getParentOp())
+         if (cur == step.getOperation()) return true;
+      return false;
+   };
+   for (mlir::OpOperand& use : v.getUses()) {
+      mlir::Operation* user = use.getOwner();
+      if (!isWithinStep(user)) continue;
+      if (onlyUser && onlyUser != user) return false;
+      onlyUser = user;
+   }
+   return onlyUser == expectedUser;
+}
+
+static bool filterConditionsComeFromMap(subop::FilterOp filter, subop::MapOp map) {
+   llvm::DenseSet<const void*> computedCols;
+   for (auto attr : map.getComputedCols()) {
+      auto def = mlir::cast<tuples::ColumnDefAttr>(attr);
+      computedCols.insert(&def.getColumn());
+   }
+   for (auto attr : filter.getConditions()) {
+      auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
+      if (!computedCols.contains(&ref.getColumn())) return false;
+   }
+   return true;
+}
+
+static mlir::Value scanLikeSourceState(mlir::Operation* op) {
+   if (auto scanRefs = mlir::dyn_cast<subop::ScanRefsOp>(op))
+      return canonicalizeStateValueDeep(scanRefs.getState());
+   if (auto scan = mlir::dyn_cast<subop::ScanOp>(op))
+      return canonicalizeStateValueDeep(scan.getState());
+   if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(op))
+      return canonicalizeStateValueDeep(findUpstreamLookupHashIndexedView(scanList.getList()));
+   return {};
+}
+
+struct ResidualMaterializeStreamTrace {
+   mlir::Value sourceState;
+   subop::MapOp predMap;
+   subop::FilterOp filter;
+   bool split = false;
+   bool unsupported = false;
+   bool complex = false;
+};
+
+static ResidualMaterializeStreamTrace traceResidualFilterOnMaterializeStream(
+   subop::ExecutionStepOp step, subop::MaterializeOp mat) {
+   ResidualMaterializeStreamTrace trace;
+   mlir::Operation* user = mat.getOperation();
+   mlir::Value stream = mat.getStream();
+   for (;;) {
+      mlir::Operation* def = stream.getDefiningOp();
+      if (!def) return trace;
+      bool inStep = false;
+      for (mlir::Operation* cur = def; cur; cur = cur->getParentOp()) {
+         if (cur == step.getOperation()) {
+            inStep = true;
+            break;
+         }
+      }
+      if (!inStep) return trace;
+      if (!streamValueHasOnlyUseByInStep(stream, user, step)) {
+         trace.split = true;
+         return trace;
+      }
+      if (mlir::isa<subop::UnionOp>(def)) {
+         trace.split = true;
+         return trace;
+      }
+      if (mlir::Value source = scanLikeSourceState(def)) {
+         trace.sourceState = source;
+         return trace;
+      }
+      if (auto filter = mlir::dyn_cast<subop::FilterOp>(def)) {
+         auto map = mlir::dyn_cast_or_null<subop::MapOp>(filter.getStream().getDefiningOp());
+         if (map && streamValueHasOnlyUseByInStep(map.getResult(), filter.getOperation(), step) &&
+             filterConditionsComeFromMap(filter, map)) {
+            trace.predMap = map;
+            trace.filter = filter;
+            trace.unsupported = !residualPredicateMapSupportedForRelaxedHiv(map, filter);
+            if (!trace.unsupported) trace.complex = residualPredicateMapComplexForRelaxedHiv(map, filter);
+            user = map.getOperation();
+            stream = map.getStream();
+            continue;
+         }
+         user = def;
+         stream = filter.getStream();
+         continue;
+      }
+      if (auto gather = mlir::dyn_cast<subop::GatherOp>(def)) {
+         user = def;
+         stream = gather.getStream();
+         continue;
+      }
+      if (auto map = mlir::dyn_cast<subop::MapOp>(def)) {
+         user = def;
+         stream = map.getStream();
+         continue;
+      }
+      if (auto rename = mlir::dyn_cast<subop::RenamingOp>(def)) {
+         user = def;
+         stream = rename.getStream();
+         continue;
+      }
+      return trace;
+   }
+}
+
+static subop::MaterializeOp findUniqueMaterializeForStatesInStep(
+   subop::ExecutionStepOp step, const llvm::DenseSet<mlir::Value>& states, bool& multiple) {
+   subop::MaterializeOp found;
+   multiple = false;
+   step.walk([&](subop::MaterializeOp mat) {
+      mlir::Value st = canonicalizeStateValueDeep(mat.getState());
+      if (!states.contains(st)) return;
+      if (found && found != mat) {
+         multiple = true;
+         return;
+      }
+      found = mat;
+   });
+   if (multiple) return {};
+   return found;
 }
 
 std::string normalizedSubopStateTypeFingerprint(subop::MemberManager& mm, mlir::Type t);
@@ -1828,74 +1957,21 @@ struct StepDagHasher {
       return s;
    }
 
-   bool valueHasOnlyUseBy(mlir::Value v, mlir::Operation* expectedUser) {
-      mlir::Operation* onlyUser = nullptr;
-      for (mlir::OpOperand& use : v.getUses()) {
-         mlir::Operation* user = use.getOwner();
-         if (!isWithinStep(user)) continue;
-         if (onlyUser && onlyUser != user) return false;
-         onlyUser = user;
-      }
-      return onlyUser == expectedUser;
+   subop::MaterializeOp findUniqueTargetMaterialize() {
+      if (!targetConstructionStates) return {};
+      bool multiple = false;
+      return findUniqueMaterializeForStatesInStep(step, *targetConstructionStates, multiple);
    }
 
-   subop::ScanRefsOp traceSingleUseStreamToTableScan(mlir::Operation* user, mlir::Value stream) {
-      for (;;) {
-         mlir::Operation* def = stream.getDefiningOp();
-         if (!def || !isWithinStep(def)) return {};
-         if (!valueHasOnlyUseBy(stream, user)) return {};
-         if (auto scan = mlir::dyn_cast<subop::ScanRefsOp>(def)) {
-            if (mlir::isa<subop::TableType>(scan.getState().getType())) return scan;
-            return {};
-         }
-         if (auto gather = mlir::dyn_cast<subop::GatherOp>(def)) {
-            user = def;
-            stream = gather.getStream();
-            continue;
-         }
-         if (auto map = mlir::dyn_cast<subop::MapOp>(def)) {
-            user = def;
-            stream = map.getStream();
-            continue;
-         }
-         if (auto filter = mlir::dyn_cast<subop::FilterOp>(def)) {
-            user = def;
-            stream = filter.getStream();
-            continue;
-         }
-         if (auto rename = mlir::dyn_cast<subop::RenamingOp>(def)) {
-            user = def;
-            stream = rename.getStream();
-            continue;
-         }
-         return {};
-      }
-   }
-
-   subop::MapOp predicateMapForRelaxedTableFilter(subop::FilterOp filter) {
-      auto map = mlir::dyn_cast_or_null<subop::MapOp>(filter.getStream().getDefiningOp());
-      if (!map) return {};
-      if (!valueHasOnlyUseBy(map.getResult(), filter.getOperation())) return {};
-
-      llvm::DenseSet<const void*> computedCols;
-      for (auto attr : map.getComputedCols()) {
-         auto colDef = mlir::cast<lingodb::compiler::dialect::tuples::ColumnDefAttr>(attr);
-         computedCols.insert(&colDef.getColumn());
-      }
-      for (auto attr : filter.getConditions()) {
-         auto cond = mlir::cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(attr);
-         if (!computedCols.contains(&cond.getColumn())) return {};
-      }
-      if (!residualPredicateMapSupportedForRelaxedHiv(map, filter)) return {};
-      if (!traceSingleUseStreamToTableScan(map.getOperation(), map.getStream())) return {};
-      return map;
-   }
-
-   bool isRelaxedTableFilter(subop::FilterOp filter, subop::MapOp& predMap, subop::ScanRefsOp& scan) {
-      predMap = predicateMapForRelaxedTableFilter(filter);
-      if (!predMap) return false;
-      scan = traceSingleUseStreamToTableScan(predMap.getOperation(), predMap.getStream());
-      return static_cast<bool>(scan);
+   bool isRelaxedResidualFilterOnTargetMaterializeChain(subop::FilterOp filter, subop::MapOp& predMap) {
+      if (!targetAllowsResidualTableFilterSkip()) return false;
+      subop::MaterializeOp mat = findUniqueTargetMaterialize();
+      if (!mat) return false;
+      ResidualMaterializeStreamTrace trace = traceResidualFilterOnMaterializeStream(step, mat);
+      if (trace.split || trace.unsupported || !trace.filter) return false;
+      if (trace.filter != filter) return false;
+      predMap = trace.predMap;
+      return static_cast<bool>(predMap);
    }
 
    void bindRegionArgs(mlir::Region& r, llvm::ArrayRef<uint64_t> argHashes) {
@@ -2052,13 +2128,8 @@ struct StepDagHasher {
 
       if (auto filter = mlir::dyn_cast<subop::FilterOp>(def)) {
          subop::MapOp predMap;
-         subop::ScanRefsOp scan;
-         if (isRelaxedTableFilter(filter, predMap, scan)) {
+         if (isRelaxedResidualFilterOnTargetMaterializeChain(filter, predMap)) {
             return hashSelectedStreamProducer(predMap.getStream(), selected);
-         }
-         if (targetAllowsResidualTableFilterSkip() &&
-             traceSingleUseStreamToTableScan(filter.getOperation(), filter.getStream())) {
-            return hashSelectedStreamProducer(filter.getStream(), selected);
          }
          SelectedColumnSet nextSelected(selected.begin(), selected.end());
          uint64_t local = hashOpName(*def);
@@ -2692,9 +2763,12 @@ struct StateMatchProfile {
    std::string typeFingerprintStr;
    /// Full HIV/buffer stored-value column layout (excluded from `constructionHash` / match type key).
    std::string storedValueMembersFingerprint;
+   /// Predicate member names used when this state's construction scans an upstream MixedHIV.
+   /// Different slots mean the candidate observes different logical row subsets; keep them apart.
+   std::string mixedHivLookupPredFingerprint;
    /// Aggregate hash-table group-key identity. Payloads are intentionally excluded from aggregate matching.
    std::string aggregateGroupKeyFingerprint;
-   /// A scan_refs(table) -> ... -> map(predicate) -> filter residual table filter was observed
+   /// A scan-like source -> ... -> map(predicate) -> filter residual stream filter was observed
    /// in the HIV construction closure. Used to keep relaxed HIV fallback matching filter-specific.
    bool hasResidualTableFilter = false;
    bool hasComplexResidualTableFilter = false;
@@ -2713,118 +2787,33 @@ struct StateConstructionMatchHashes {
    uint64_t constructionHash = 0;
    std::string typeFingerprintStr;
    std::string storedValueMembersFingerprint;
+   std::string mixedHivLookupPredFingerprint;
 };
 
-static bool streamValueHasOnlyUseByInStep(mlir::Value v, mlir::Operation* expectedUser,
-                                          subop::ExecutionStepOp step) {
-   mlir::Operation* onlyUser = nullptr;
-   auto isWithinStep = [&](mlir::Operation* op) {
-      for (mlir::Operation* cur = op; cur; cur = cur->getParentOp())
-         if (cur == step.getOperation()) return true;
-      return false;
-   };
-   for (mlir::OpOperand& use : v.getUses()) {
-      mlir::Operation* user = use.getOwner();
-      if (!isWithinStep(user)) continue;
-      if (onlyUser && onlyUser != user) return false;
-      onlyUser = user;
-   }
-   return onlyUser == expectedUser;
-}
-
-static subop::ScanRefsOp traceSingleUseStreamToTableScanForProfile(subop::ExecutionStepOp step,
-                                                                   mlir::Operation* user,
-                                                                   mlir::Value stream) {
-   for (;;) {
-      mlir::Operation* def = stream.getDefiningOp();
-      if (!def) return {};
-      if (!streamValueHasOnlyUseByInStep(stream, user, step)) return {};
-      if (auto scan = mlir::dyn_cast<subop::ScanRefsOp>(def)) {
-         if (mlir::isa<subop::TableType>(scan.getState().getType())) return scan;
-         return {};
-      }
-      if (auto gather = mlir::dyn_cast<subop::GatherOp>(def)) {
-         user = def;
-         stream = gather.getStream();
-         continue;
-      }
-      if (auto map = mlir::dyn_cast<subop::MapOp>(def)) {
-         user = def;
-         stream = map.getStream();
-         continue;
-      }
-      if (auto rename = mlir::dyn_cast<subop::RenamingOp>(def)) {
-         user = def;
-         stream = rename.getStream();
-         continue;
-      }
-      return {};
-   }
-}
-
-static bool stepHasResidualTableFilterForProfile(subop::ExecutionStepOp step, bool requireSupported) {
-   bool found = false;
-   step.walk([&](subop::FilterOp filter) {
-      if (found) return;
-      auto map = mlir::dyn_cast_or_null<subop::MapOp>(filter.getStream().getDefiningOp());
-      if (!map) return;
-      if (!streamValueHasOnlyUseByInStep(map.getResult(), filter.getOperation(), step)) return;
-      llvm::DenseSet<const void*> computedCols;
-      for (auto attr : map.getComputedCols()) {
-         auto def = mlir::cast<tuples::ColumnDefAttr>(attr);
-         computedCols.insert(&def.getColumn());
-      }
-      for (auto attr : filter.getConditions()) {
-         auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
-         if (!computedCols.contains(&ref.getColumn())) return;
-      }
-      if (requireSupported && !residualPredicateMapSupportedForRelaxedHiv(map, filter)) return;
-      found = static_cast<bool>(traceSingleUseStreamToTableScanForProfile(step, map.getOperation(), map.getStream()));
-   });
-   return found;
-}
-
-static bool constructionHasResidualTableFilter(llvm::ArrayRef<int> constructionStepIndices,
-                                               const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex,
-                                               bool requireSupported) {
-   for (int si : constructionStepIndices) {
-      auto itS = stepByIndex.find(si);
-      assert(itS != stepByIndex.end());
-      if (stepHasResidualTableFilterForProfile(itS->second, requireSupported)) return true;
-   }
-   return false;
-}
-
-static bool constructionHasComplexResidualTableFilter(
+static std::string mixedHivLookupPredFingerprint(
    llvm::ArrayRef<int> constructionStepIndices,
    const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex) {
+   llvm::SmallVector<std::string, 4> predMembers;
    for (int si : constructionStepIndices) {
-      auto itS = stepByIndex.find(si);
-      assert(itS != stepByIndex.end());
-      subop::ExecutionStepOp step = itS->second;
-      bool found = false;
-      step.walk([&](subop::FilterOp filter) {
-         if (found) return;
-         auto map = mlir::dyn_cast_or_null<subop::MapOp>(filter.getStream().getDefiningOp());
-         if (!map) return;
-         if (!streamValueHasOnlyUseByInStep(map.getResult(), filter.getOperation(), step)) return;
-         llvm::DenseSet<const void*> computedCols;
-         for (auto attr : map.getComputedCols()) {
-            auto def = mlir::cast<tuples::ColumnDefAttr>(attr);
-            computedCols.insert(&def.getColumn());
-         }
-         for (auto attr : filter.getConditions()) {
-            auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
-            if (!computedCols.contains(&ref.getColumn())) return;
-         }
-         if (!residualPredicateMapSupportedForRelaxedHiv(map, filter)) return;
-         if (!residualPredicateMapComplexForRelaxedHiv(map, filter)) return;
-         found = static_cast<bool>(
-            traceSingleUseStreamToTableScanForProfile(step, map.getOperation(), map.getStream()));
+      auto it = stepByIndex.find(si);
+      assert(it != stepByIndex.end());
+      subop::ExecutionStepOp step = it->second;
+      step.walk([&](subop::ScanListOp scanList) {
+         auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(scanList.getElem().getColumn().type);
+         if (!ler) return;
+         auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(ler.getState());
+         if (!mixed) return;
+         predMembers.push_back(mixed.getFilterPredMemberName().getValue().str());
       });
-      if (found) return true;
    }
-   return false;
+   llvm::sort(predMembers);
+   predMembers.erase(std::unique(predMembers.begin(), predMembers.end()), predMembers.end());
+   std::string out;
+   for (llvm::StringRef pred : predMembers) {
+      if (!out.empty()) out.push_back('|');
+      out += pred;
+   }
+   return out;
 }
 
 struct ModuleMatchAndReuseAnalysis {
@@ -2844,6 +2833,80 @@ struct ModuleMatchAndReuseAnalysis {
    llvm::SmallVector<mlir::Value, 64> statesSorted;
    ModuleReuseInfo reuse;
 };
+
+static void collectStateAndShadowConstructionStates(
+   mlir::Value state, const ModuleMatchAndReuseAnalysis& module,
+   llvm::DenseSet<mlir::Value>& out) {
+   out.insert(canonicalizeStateValueDeep(state));
+   forEachShadowChainPredecessorValue(canonicalizeStateValueDeep(state), module.mergedFromShadowState,
+                                      [&](mlir::Value shadow) {
+                                         out.insert(canonicalizeStateValueDeep(shadow));
+                                      });
+}
+
+static bool stepHasResidualFilterForProfile(subop::ExecutionStepOp step,
+                                            const llvm::DenseSet<mlir::Value>& constructionStates,
+                                            bool requireSupported) {
+   bool multiple = false;
+   subop::MaterializeOp mat = findUniqueMaterializeForStatesInStep(step, constructionStates, multiple);
+   if (!mat || multiple) return false;
+   ResidualMaterializeStreamTrace trace = traceResidualFilterOnMaterializeStream(step, mat);
+   if (!trace.filter || !trace.sourceState || trace.split) return false;
+   if (requireSupported && trace.unsupported) return false;
+   return true;
+}
+
+static bool constructionHasResidualFilter(
+   mlir::Value state, const ModuleMatchAndReuseAnalysis& module,
+   llvm::ArrayRef<int> constructionStepIndices,
+   const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex,
+   bool requireSupported) {
+   llvm::DenseSet<mlir::Value> constructionStates;
+   collectStateAndShadowConstructionStates(state, module, constructionStates);
+   for (int si : constructionStepIndices) {
+      auto itS = stepByIndex.find(si);
+      assert(itS != stepByIndex.end());
+      if (stepHasResidualFilterForProfile(itS->second, constructionStates, requireSupported)) return true;
+   }
+   return false;
+}
+
+static bool constructionHasComplexResidualTableFilter(
+   mlir::Value state, const ModuleMatchAndReuseAnalysis& module,
+   llvm::ArrayRef<int> constructionStepIndices,
+   const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex) {
+   llvm::DenseSet<mlir::Value> constructionStates;
+   collectStateAndShadowConstructionStates(state, module, constructionStates);
+   for (int si : constructionStepIndices) {
+      auto itS = stepByIndex.find(si);
+      assert(itS != stepByIndex.end());
+      bool multiple = false;
+      subop::MaterializeOp mat = findUniqueMaterializeForStatesInStep(itS->second, constructionStates, multiple);
+      if (!mat || multiple) continue;
+      ResidualMaterializeStreamTrace trace = traceResidualFilterOnMaterializeStream(itS->second, mat);
+      if (trace.filter && trace.sourceState && !trace.split && !trace.unsupported && trace.complex) return true;
+   }
+   return false;
+}
+
+static bool constructionHasTupleStreamSplitOnTargetMaterialize(
+   mlir::Value state, const ModuleMatchAndReuseAnalysis& module,
+   llvm::ArrayRef<int> constructionStepIndices,
+   const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex) {
+   llvm::DenseSet<mlir::Value> constructionStates;
+   collectStateAndShadowConstructionStates(state, module, constructionStates);
+   for (int si : constructionStepIndices) {
+      auto itS = stepByIndex.find(si);
+      assert(itS != stepByIndex.end());
+      bool multiple = false;
+      subop::MaterializeOp mat = findUniqueMaterializeForStatesInStep(itS->second, constructionStates, multiple);
+      if (multiple) return true;
+      if (!mat) continue;
+      ResidualMaterializeStreamTrace trace = traceResidualFilterOnMaterializeStream(itS->second, mat);
+      if (trace.split) return true;
+   }
+   return false;
+}
 
 /// Register execution steps and state metadata (creation site, merge shadow, create-only) before RW analysis.
 static void registerModuleExecutionSteps(mlir::ModuleOp moduleOp, ModuleMatchAndReuseAnalysis& a) {
@@ -3116,6 +3179,9 @@ static bool determineStateReuseEligibility(
    for (int si : constructionStepIndices) {
       if (constructionStepHasMultipleWrites(si, stepRw)) return false;
    }
+   if (constructionHasTupleStreamSplitOnTargetMaterialize(stateCanon, module, constructionStepIndices,
+                                                          module.stepByIndex))
+      return false;
    return true;
 }
 
@@ -3173,6 +3239,8 @@ static StateConstructionMatchHashes computeEligibleStateMatchHashes(
       hashes.typeFingerprintStr = normalizedHashIndexedViewTypeFingerprintForJoinMatch(
          memberManager, mlir::cast<subop::HashIndexedViewType>(state.getType()), *joinHivDetails);
       hashes.storedValueMembersFingerprint = joinHivDetails->storedValueMembersFingerprint;
+      hashes.mixedHivLookupPredFingerprint =
+         mixedHivLookupPredFingerprint(constructionStepIndices, module.stepByIndex);
    } else {
       assert(!isHiv);
       hashes.typeFingerprintStr = normalizedSubopStateTypeFingerprint(memberManager, state.getType());
@@ -3229,13 +3297,14 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
             relaxJoinHivDepTokensInProfile(prof.depTokensSorted, joinHivDetails,
                                            module.reuse.externalDatasourceByTableState, tableDescrByTableState);
             bool hasAnyResidualFilter =
-               constructionHasResidualTableFilter(constructionStepIndices, module.stepByIndex,
-                                                  /*requireSupported*/ false);
+               constructionHasResidualFilter(state, module, constructionStepIndices, module.stepByIndex,
+                                             /*requireSupported*/ false);
             prof.hasResidualTableFilter =
-               constructionHasResidualTableFilter(constructionStepIndices, module.stepByIndex,
-                                                  /*requireSupported*/ true);
+               constructionHasResidualFilter(state, module, constructionStepIndices, module.stepByIndex,
+                                             /*requireSupported*/ true);
             prof.hasComplexResidualTableFilter =
-               constructionHasComplexResidualTableFilter(constructionStepIndices, module.stepByIndex);
+               constructionHasComplexResidualTableFilter(state, module, constructionStepIndices,
+                                                         module.stepByIndex);
             prof.hasUnsupportedResidualTableFilter = hasAnyResidualFilter && !prof.hasResidualTableFilter;
          }
          StateConstructionMatchHashes hashes = computeEligibleStateMatchHashes(
@@ -3247,6 +3316,7 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
          prof.constructionHash = hashes.constructionHash;
          prof.typeFingerprintStr = std::move(hashes.typeFingerprintStr);
          prof.storedValueMembersFingerprint = std::move(hashes.storedValueMembersFingerprint);
+         prof.mixedHivLookupPredFingerprint = std::move(hashes.mixedHivLookupPredFingerprint);
          if (mlir::isa<subop::HashIndexedViewType>(state.getType())) {
             assert(!prof.storedValueMembersFingerprint.empty());
             module.reuse.joinBuildStoredValueMembersByState[state] = prof.storedValueMembersFingerprint;
@@ -4474,6 +4544,13 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
       return !decodeSimpleMatchFiltersAlongShadowChain(a.value, modelA->reuse).empty() ||
              !decodeSimpleMatchFiltersAlongShadowChain(b.value, modelB->reuse).empty();
    };
+   auto hasCacheDependency = [](const StateMatchProfile& p) {
+      return llvm::any_of(p.depTokensSorted, [](llvm::StringRef dep) { return dep.starts_with("cache:"); });
+   };
+   auto relaxedHivPayloadUnionAllowed = [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+      if (!hasCacheDependency(a) && !hasCacheDependency(b)) return true;
+      return a.mixedHivLookupPredFingerprint == b.mixedHivLookupPredFingerprint;
+   };
    using ProfileBucketMap = llvm::DenseMap<uint64_t, llvm::SmallVector<const StateMatchProfile*, 8>>;
    auto appendToBucket = [](ProfileBucketMap& buckets,
                             llvm::SmallVectorImpl<uint64_t>& bucketOrder,
@@ -4983,8 +5060,8 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
             members.push_back(b);
             seenQueries.insert(b->queryId);
          }
-         if (members.size() < 2) continue;
-         if (tryEmitIdenticalFilterSubgroupDisjointGroups(members, keyForSeed, enableFilterPredReuse)) continue;
+      if (members.size() < 2) continue;
+      if (tryEmitIdenticalFilterSubgroupDisjointGroups(members, keyForSeed, enableFilterPredReuse)) continue;
          if (tryEmitSimpleFilterUnionFindClusteredGroups(members, keyForSeed, enableFilterPredReuse)) continue;
          emitMatchGroupCapped(members, *a, "", keyForSeed, enableFilterPredReuse);
       }
@@ -5036,6 +5113,7 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
             const QueryModel* modelA = modelByQueryId.lookup(a.queryId);
             const QueryModel* modelB = modelByQueryId.lookup(b.queryId);
             assert(modelA && modelB && "missing query model for HIV relaxed profile");
+            if (!relaxedHivPayloadUnionAllowed(a, b)) return false;
             if (!complexResidualMatchAllowed(a, modelA, b, modelB)) return false;
             // TODO(batch-reuse): Restore filter-disjoint pruning as part of clustering / reuse cost modeling.
             return true;

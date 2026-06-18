@@ -150,6 +150,7 @@ struct PayloadColumnSpec {
    bool inQuery0 = false;
    bool inQuery1 = false;
    bool fromExternalTable = false;
+   unsigned stableOrder = 0;
 };
 
 struct JoinBufferUnionPlan {
@@ -160,6 +161,24 @@ struct JoinBufferUnionPlan {
    /// Buffer/HIV payload members aligned with \p payloadColumns (semantic union, not slot `member$N`).
    llvm::SmallVector<subop::Member, 8> payloadMembers;
 };
+
+static void refreshPayloadMemberTypes(JoinBufferUnionPlan& plan) {
+   plan.payloadMemberTypes.clear();
+   plan.payloadMemberTypes.reserve(plan.payloadColumns.size());
+   for (const PayloadColumnSpec& spec : plan.payloadColumns) plan.payloadMemberTypes.push_back(spec.colType);
+}
+
+static unsigned nextPayloadStableOrder(llvm::ArrayRef<PayloadColumnSpec> specs) {
+   unsigned next = 0;
+   for (const PayloadColumnSpec& spec : specs) next = std::max(next, spec.stableOrder + 1);
+   return next;
+}
+
+static unsigned nextPayloadStableOrder(const llvm::DenseMap<uint64_t, PayloadColumnSpec>& specs) {
+   unsigned next = 0;
+   for (const auto& it : specs) next = std::max(next, it.second.stableOrder + 1);
+   return next;
+}
 
 static unsigned filterPredUnionSlotForQueryIndices(llvm::ArrayRef<unsigned> queryIndices) {
    unsigned maxIdx = 0;
@@ -179,15 +198,9 @@ static void ensureFilterPredUnionColumn(JoinBufferUnionPlan& plan, unsigned unio
    predSpec.colType = mlir::IntegerType::get(ctx, 1);
    predSpec.semanticKey = semKey;
    predSpec.semanticHash = payloadSyntheticColumnHash(predSpec.scope, predSpec.leaf, predSpec.colType);
+   predSpec.stableOrder = nextPayloadStableOrder(plan.payloadColumns);
    plan.payloadColumns.push_back(std::move(predSpec));
-   llvm::sort(plan.payloadColumns, [](const PayloadColumnSpec& a, const PayloadColumnSpec& b) {
-      if (a.isJoinKey != b.isJoinKey) return a.isJoinKey > b.isJoinKey;
-      if (a.semanticHash != b.semanticHash) return a.semanticHash < b.semanticHash;
-      return a.semanticKey < b.semanticKey;
-   });
-   plan.payloadMemberTypes.clear();
-   plan.payloadMemberTypes.reserve(plan.payloadColumns.size());
-   for (const PayloadColumnSpec& spec : plan.payloadColumns) plan.payloadMemberTypes.push_back(spec.colType);
+   refreshPayloadMemberTypes(plan);
 }
 
 static subop::CreateHashIndexedView findCreateHashIndexedViewForState(
@@ -622,6 +635,7 @@ static void insertPayloadColumnSpec(llvm::DenseMap<uint64_t, PayloadColumnSpec>&
       spec.inQuery0 |= existing.inQuery0;
       spec.inQuery1 |= existing.inQuery1;
       spec.isJoinKey |= existing.isJoinKey;
+      spec.stableOrder = existing.stableOrder;
       markSide(spec);
       unionCols.erase(existingIt);
       unionCols.try_emplace(spec.semanticHash, std::move(spec));
@@ -629,6 +643,7 @@ static void insertPayloadColumnSpec(llvm::DenseMap<uint64_t, PayloadColumnSpec>&
    }
 
    markSide(spec);
+   spec.stableOrder = nextPayloadStableOrder(unionCols);
    unionCols.try_emplace(spec.semanticHash, std::move(spec));
 }
 
@@ -810,6 +825,7 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
          predSpec.colType = mlir::IntegerType::get(h.getContext(), 1);
          predSpec.semanticKey = reuseFilterPredSemanticKey(reuseQueryIndex);
          predSpec.semanticHash = payloadSyntheticColumnHash(predSpec.scope, predSpec.leaf, predSpec.colType);
+         predSpec.stableOrder = nextPayloadStableOrder(unionCols);
          unionCols.try_emplace(predSpec.semanticHash, predSpec);
       }
       ingestExternalTableColumnsFromBuildStepScan(buildStep, reuse, unionCols);
@@ -825,6 +841,7 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
          predSpec.colType = mlir::IntegerType::get(hivA.getContext(), 1);
          predSpec.semanticKey = reuseFilterPredUnionSemanticKey(unionSlot);
          predSpec.semanticHash = payloadSyntheticColumnHash(predSpec.scope, predSpec.leaf, predSpec.colType);
+         predSpec.stableOrder = nextPayloadStableOrder(unionCols);
          unionCols.try_emplace(predSpec.semanticHash, predSpec);
       }
    }
@@ -834,7 +851,7 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
    for (auto& it : unionCols) ordered.push_back(&it.second);
    llvm::sort(ordered, [](const PayloadColumnSpec* a, const PayloadColumnSpec* b) {
       if (a->isJoinKey != b->isJoinKey) return a->isJoinKey > b->isJoinKey;
-      if (a->semanticHash != b->semanticHash) return a->semanticHash < b->semanticHash;
+      if (a->stableOrder != b->stableOrder) return a->stableOrder < b->stableOrder;
       return a->semanticKey < b->semanticKey;
    });
    for (PayloadColumnSpec* p : ordered) {
@@ -2480,6 +2497,138 @@ static void syncMapInputColsFromGather(subop::GatherOp gather, tuples::ColumnMan
    }
 }
 
+static bool sameColumnIdentity(tuples::ColumnRefAttr a, tuples::ColumnRefAttr b,
+                               tuples::ColumnManager& cm) {
+   auto [aScope, aLeaf] = cm.getName(&a.getColumn());
+   auto [bScope, bLeaf] = cm.getName(&b.getColumn());
+   return aScope == bScope && aLeaf == bLeaf && a.getColumn().type == b.getColumn().type;
+}
+
+static std::optional<unsigned> findNestedMapParameter(subop::NestedMapOp nested,
+                                                      tuples::ColumnRefAttr ref,
+                                                      tuples::ColumnManager& cm) {
+   for (unsigned i = 0; i < nested.getParameters().size(); ++i) {
+      auto existing = mlir::cast<tuples::ColumnRefAttr>(nested.getParameters()[i]);
+      if (sameColumnIdentity(existing, ref, cm)) return i;
+   }
+   return std::nullopt;
+}
+
+static mlir::BlockArgument ensureNestedMapParameter(subop::NestedMapOp nested,
+                                                    tuples::ColumnRefAttr ref,
+                                                    tuples::ColumnManager& cm) {
+   if (auto idx = findNestedMapParameter(nested, ref, cm)) {
+      assert(nested.getRegion().front().getNumArguments() > *idx + 1 &&
+             "nested_map parameter must have a body argument");
+      return nested.getRegion().front().getArgument(*idx + 1);
+   }
+   llvm::SmallVector<mlir::Attribute, 8> params(nested.getParameters().begin(),
+                                                nested.getParameters().end());
+   params.push_back(ref);
+   nested.setParametersAttr(mlir::ArrayAttr::get(nested.getContext(), params));
+   return nested.getRegion().front().addArgument(ref.getColumn().type, nested.getLoc());
+}
+
+static subop::NestedExecutionGroupOp firstNestedExecutionGroup(subop::NestedMapOp nested) {
+   assert(!nested.getRegion().empty());
+   for (mlir::Operation& op : nested.getRegion().front()) {
+      if (auto neg = mlir::dyn_cast<subop::NestedExecutionGroupOp>(&op)) return neg;
+   }
+   llvm_unreachable("nested_map used by join build must contain nested_execution_group");
+}
+
+static mlir::BlockArgument ensureNestedExecutionGroupInput(subop::NestedExecutionGroupOp neg,
+                                                           mlir::Value value) {
+   for (unsigned i = 0; i < neg.getNumOperands(); ++i) {
+      if (neg.getOperand(i) == value) {
+         assert(i < neg.getSubOps().front().getNumArguments());
+         return neg.getSubOps().front().getArgument(i);
+      }
+   }
+   neg.getInputsMutable().append(value);
+   return neg.getSubOps().front().addArgument(value.getType(), neg.getLoc());
+}
+
+static subop::ExecutionStepOp firstExecutionStep(subop::NestedExecutionGroupOp neg) {
+   assert(!neg.getSubOps().empty());
+   for (mlir::Operation& op : neg.getSubOps().front()) {
+      if (auto step = mlir::dyn_cast<subop::ExecutionStepOp>(&op)) return step;
+   }
+   llvm_unreachable("nested_execution_group used by join build must contain execution_step");
+}
+
+static mlir::BlockArgument ensureExecutionStepInput(subop::ExecutionStepOp step,
+                                                    mlir::Value value) {
+   for (unsigned i = 0; i < step.getNumOperands(); ++i) {
+      if (step.getOperand(i) == value) {
+         assert(i < step.getSubOps().front().getNumArguments());
+         return step.getSubOps().front().getArgument(i);
+      }
+   }
+   step.getInputsMutable().append(value);
+   llvm::SmallVector<mlir::Attribute, 8> threadLocal(step.getIsThreadLocal().begin(),
+                                                     step.getIsThreadLocal().end());
+   threadLocal.push_back(mlir::BoolAttr::get(step.getContext(), false));
+   step.setIsThreadLocalAttr(mlir::ArrayAttr::get(step.getContext(), threadLocal));
+   return step.getSubOps().front().addArgument(value.getType(), step.getLoc());
+}
+
+static void materializeColumnOnStreamBefore(mlir::Operation* anchor,
+                                            mlir::Value& stream,
+                                            tuples::ColumnDefAttr def,
+                                            mlir::Value value) {
+   assert(anchor && "join payload threading requires an anchor op");
+   mlir::OpBuilder b(anchor);
+   auto map = b.create<subop::MapOp>(anchor->getLoc(), tuples::TupleStreamType::get(anchor->getContext()),
+                                     stream, b.getArrayAttr({def}), b.getArrayAttr({}));
+   mlir::Block* block = new mlir::Block();
+   map.getFn().push_back(block);
+   mlir::OpBuilder rb(anchor->getContext());
+   rb.setInsertionPointToStart(block);
+   rb.create<tuples::ReturnOp>(anchor->getLoc(), mlir::ValueRange{value});
+   stream = map.getResult();
+}
+
+static void threadTableRefToMaterializeStream(subop::MaterializeOp matOp,
+                                              subop::ScanRefsOp scanOp,
+                                              tuples::ColumnManager& cm) {
+   subop::ExecutionStepOp targetStep = matOp->getParentOfType<subop::ExecutionStepOp>();
+   assert(targetStep && "join payload materialize must live in an execution_step");
+   (void)targetStep;
+
+   tuples::ColumnDefAttr scanDef = scanOp.getRef();
+   scanDef.getColumn().type = scanOp.getRef().getColumn().type;
+   tuples::ColumnRefAttr scanRef = cm.createRef(&scanDef.getColumn());
+
+   llvm::SmallVector<subop::NestedMapOp, 4> nestedMaps;
+   for (mlir::Operation* parent = matOp->getParentOp(); parent; parent = parent->getParentOp()) {
+      if (auto nested = mlir::dyn_cast<subop::NestedMapOp>(parent))
+         nestedMaps.push_back(nested);
+   }
+   std::reverse(nestedMaps.begin(), nestedMaps.end());
+   if (nestedMaps.empty()) return;
+
+   mlir::Value currentValue;
+   for (subop::NestedMapOp nested : nestedMaps) {
+      if (currentValue && !findNestedMapParameter(nested, scanRef, cm)) {
+         mlir::Value stream = nested.getStream();
+         materializeColumnOnStreamBefore(nested.getOperation(), stream, scanDef, currentValue);
+         nested->setOperand(0, stream);
+      }
+
+      mlir::BlockArgument nestedArg = ensureNestedMapParameter(nested, scanRef, cm);
+      subop::NestedExecutionGroupOp neg = firstNestedExecutionGroup(nested);
+      mlir::BlockArgument negArg = ensureNestedExecutionGroupInput(neg, nestedArg);
+      subop::ExecutionStepOp innerStep = firstExecutionStep(neg);
+      currentValue = ensureExecutionStepInput(innerStep, negArg);
+   }
+
+   if (!currentValue) return;
+   mlir::Value stream = matOp.getStream();
+   materializeColumnOnStreamBefore(matOp.getOperation(), stream, scanDef, currentValue);
+   matOp->setOperand(0, stream);
+}
+
 static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
                                              const llvm::DenseSet<void*>* closureFilter,
                                              subop::HashIndexedViewType producerHiv, bool syncGatherOps,
@@ -2646,6 +2795,35 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
          if (scanOp) break;
       }
    }
+   if (!scanOp) {
+      buildStep.walk([&](subop::ScanRefsOp candidate) {
+         if (scanOp) return;
+         if (!mlir::isa<subop::TableType>(candidate.getState().getType())) return;
+         llvm::StringRef donorTableName;
+         ExternalDatasourceProperty ds;
+         bool haveDs = false;
+         subop::TableType donorTableTy;
+         if (!resolveScannedTableExternal(buildStep, candidate.getState(), reuseSynthetic, donorTableName, ds,
+                                          haveDs, donorTableTy) ||
+             !haveDs)
+            return;
+         for (const PayloadColumnSpec& spec : plan.payloadColumns) {
+            unsigned predIdx = 0;
+            if (parseFilterPredLayoutSemanticKey(spec.semanticKey, predIdx)) continue;
+            for (size_t pi = 0; pi < peerHivs.size(); ++pi) {
+               auto [peerMod, peerHiv] = peerHivs[pi];
+               if (!peerMod || !peerHiv) continue;
+               const ModuleReuseInfo& reusePeer = *peerReuses[pi];
+               subop::ExecutionStepOp peerBuild = findJoinBufferBuildStepForHiv(peerMod, peerHiv, reusePeer);
+               if (!peerBuild) continue;
+               if (columnTypeForIdentifierFromPeerBuildScan(peerBuild, reusePeer, donorTableName, spec.leaf)) {
+                  scanOp = candidate;
+                  return;
+               }
+            }
+         }
+      });
+   }
    if (!scanOp) return;
 
    auto rewriteDonorExternalTableForUnion = [&]() {
@@ -2656,8 +2834,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
       subop::TableType donorTableTy;
       bool haveDonorExternal = resolveScannedTableExternal(buildStep, tableState, reuseSynthetic, donorTableName,
                                                            mergedDs, haveDs, donorTableTy) &&
-                               haveDs &&
-                               countUnionPayloadLeavesOnTable(plan.payloadColumns, donorTableTy, mm) > 0;
+                               haveDs;
       if (!haveDonorExternal) return;
 
       llvm::SmallVector<ExternalDatasourceProperty, 4> filterSources;
@@ -2714,16 +2891,6 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    assert(matOp && "join superset: buffer build step must materialize into join buffer");
    alignMaterializedPayloadMembersToUnionPlan(matOp, plan, mm, columnHashes);
 
-   auto collectMaterializedPayloadHashes = [&]() {
-      llvm::DenseSet<uint64_t> keys;
-      for (auto& [member, colRef] : matOp.getMapping().getMapping()) {
-         if (member == plan.linkMember || member == plan.hashMember) continue;
-         keys.insert(payloadColumnIdentityHash(colRef, columnHashes));
-      }
-      return keys;
-   };
-   llvm::DenseSet<uint64_t> materializedHashes = collectMaterializedPayloadHashes();
-
    subop::MapOp hashMapOp = findJoinHashMapBeforeMaterialize(body, matOp);
    assert(hashMapOp);
 
@@ -2735,7 +2902,18 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    };
 
    auto isPayloadMaterialized = [&](const PayloadColumnSpec& spec) {
-      if (materializedHashes.contains(spec.semanticHash)) return true;
+      unsigned predIdx = 0;
+      const bool isPred = parseFilterPredLayoutSemanticKey(spec.semanticKey, predIdx);
+      for (auto& [member, colRef] : matOp.getMapping().getMapping()) {
+         if (member == plan.linkMember || member == plan.hashMember) continue;
+         if (colRef.getColumn().type != cloneTypeToContext(spec.colType, ctx)) continue;
+         auto [scope, leaf] = cm.getName(&colRef.getColumn());
+         if (columnSemanticKey(scope, leaf) == spec.semanticKey) return true;
+         if (normalizeColumnIdentifier(leaf) == normalizeColumnIdentifier(spec.leaf) &&
+             !isPred) {
+            return true;
+         }
+      }
       return false;
    };
 
@@ -2751,6 +2929,8 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
 
       tuples::ColumnDefAttr colDef = cm.createDef(spec.scope, spec.leaf);
       colDef.getColumn().type = cloneTypeToContext(spec.colType, ctx);
+      if (specScan->getBlock() != matOp->getBlock())
+         threadTableRefToMaterializeStream(matOp, specScan, cm);
 
       // Chain union-only gathers on the current materialize stream (clone build chain + prior
       // union-only gathers), not from hashMapOp each time.
@@ -2768,7 +2948,6 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
          gb.create<subop::GatherOp>(mlir::UnknownLoc::get(ctx), gatherTy, mapStream, gatherRef, mapping);
       matOp->setOperand(0, newGather.getRes());
       appendMaterializeMapping(bufMem, colDef);
-      materializedHashes.insert(spec.semanticHash);
       return true;
    };
 
@@ -4866,7 +5045,8 @@ static std::optional<subop::Member> findConsumerMemberByName(llvm::StringRef nam
 
 /// Map semantic table columns to members used on the consumer's cached HIV probe path (pre-align gathers).
 static void collectConsumerPayloadSemanticMembers(mlir::ModuleOp consumer,
-                                                  llvm::StringMap<ConsumerColumnBinding>& out) {
+                                                  llvm::StringMap<ConsumerColumnBinding>& out,
+                                                  subop::HashIndexedViewType targetHiv = nullptr) {
    auto& cm = consumer.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    auto record = [&](subop::Member mem, llvm::StringRef scope, llvm::StringRef leaf, mlir::Type colTy) {
       if (isJoinProbeCompilerScope(scope)) return;
@@ -4880,19 +5060,26 @@ static void collectConsumerPayloadSemanticMembers(mlir::ModuleOp consumer,
 
    consumer.walk([&](subop::GatherOp gather) {
       auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(gather.getRef().getColumn().type);
-      if (!ler || !mlir::isa<subop::HashIndexedViewType>(ler.getState())) return;
+      if (!ler) return;
+      auto st = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState());
+      if (!st) return;
+      if (targetHiv && !sameHashIndexedViewLayout(st, targetHiv)) return;
       for (auto [mem, def] : gather.getMapping().getMapping()) {
          recordOnHivState(mem, def);
       }
    });
    consumer.walk([&](subop::ScatterOp scatter) {
       auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(scatter.getRef().getColumn().type);
-      if (!ler || !mlir::isa<subop::HashIndexedViewType>(ler.getState())) return;
+      if (!ler) return;
+      auto st = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState());
+      if (!st) return;
+      if (targetHiv && !sameHashIndexedViewLayout(st, targetHiv)) return;
       for (auto [mem, colRef] : scatter.getMapping().getMapping()) {
          auto [scope, leaf] = cm.getName(&colRef.getColumn());
          record(mem, scope, leaf, colRef.getColumn().type);
       }
    });
+   if (targetHiv) return;
    consumer.walk([&](subop::MaterializeOp mat) {
       if (!mlir::isa<subop::BufferType>(mat.getState().getType())) return;
       for (auto& [mem, colRef] : mat.getMapping().getMapping()) {
@@ -5067,7 +5254,7 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
 
    llvm::StringMap<ConsumerColumnBinding> semanticToConsumer;
-   collectConsumerPayloadSemanticMembers(consumer, semanticToConsumer);
+   collectConsumerPayloadSemanticMembers(consumer, semanticToConsumer, consumerHivBeforeAlign);
 
    llvm::DenseMap<subop::Member, subop::Member> producerPayloadToConsumer;
    llvm::StringMap<subop::Member> assignedBySemantic;
@@ -5791,15 +5978,9 @@ static void ensureReuseFilterPredColumn(JoinBufferUnionPlan& plan, unsigned quer
    predSpec.colType = mlir::IntegerType::get(ctx, 1);
    predSpec.semanticKey = semKey;
    predSpec.semanticHash = payloadSyntheticColumnHash(predSpec.scope, predSpec.leaf, predSpec.colType);
+   predSpec.stableOrder = nextPayloadStableOrder(plan.payloadColumns);
    plan.payloadColumns.push_back(std::move(predSpec));
-   llvm::sort(plan.payloadColumns, [](const PayloadColumnSpec& a, const PayloadColumnSpec& b) {
-      if (a.isJoinKey != b.isJoinKey) return a.isJoinKey > b.isJoinKey;
-      if (a.semanticHash != b.semanticHash) return a.semanticHash < b.semanticHash;
-      return a.semanticKey < b.semanticKey;
-   });
-   plan.payloadMemberTypes.clear();
-   plan.payloadMemberTypes.reserve(plan.payloadColumns.size());
-   for (const PayloadColumnSpec& spec : plan.payloadColumns) plan.payloadMemberTypes.push_back(spec.colType);
+   refreshPayloadMemberTypes(plan);
 }
 
 void extendSyntheticJoinBuffersToColumnUnionForGroups(

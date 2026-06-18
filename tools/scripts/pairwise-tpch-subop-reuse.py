@@ -5,6 +5,7 @@ import itertools
 import json
 import os
 import re
+import statistics
 import subprocess
 import time
 from dataclasses import dataclass
@@ -243,6 +244,151 @@ def summarize_reuse_counts(subop_payload: Dict[str, Any]) -> Dict[str, Any]:
     return summary
 
 
+def parse_pair_spec(spec: str) -> List[Tuple[int, int]]:
+    pairs: List[Tuple[int, int]] = []
+    if not spec.strip():
+        return pairs
+    for raw in spec.split(","):
+        token = raw.strip().upper()
+        if not token:
+            continue
+        m = re.fullmatch(r"Q?(\d+)\s*[-:]\s*Q?(\d+)", token)
+        if not m:
+            raise SystemExit(f"invalid pair spec entry: {raw!r}")
+        a = int(m.group(1))
+        b = int(m.group(2))
+        if a == b:
+            raise SystemExit(f"invalid self pair: {raw!r}")
+        if not (1 <= a <= 22 and 1 <= b <= 22):
+            raise SystemExit(f"pair out of TPC-H range 1..22: {raw!r}")
+        if a > b:
+            a, b = b, a
+        pairs.append((a, b))
+    seen = set()
+    out: List[Tuple[int, int]] = []
+    for p in pairs:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def compute_ratios(
+    subop_metrics: Dict[str, Any],
+    subop_no_reuse_metrics: Dict[str, Any],
+    q0_execution_time_ms: Optional[float],
+    q1_execution_time_ms: Optional[float],
+) -> Dict[str, float]:
+    ratios: Dict[str, float] = {}
+    if "execution_time_ms_total" in subop_metrics and q0_execution_time_ms is not None and q1_execution_time_ms is not None:
+        denom = q0_execution_time_ms + q1_execution_time_ms
+        if denom > 0:
+            ratios["subop_total_over_run_sql_sum"] = subop_metrics["execution_time_ms_total"] / denom
+            if "execution_time_ms_q0_q1" in subop_metrics:
+                ratios["subop_q0_q1_over_run_sql_sum"] = subop_metrics["execution_time_ms_q0_q1"] / denom
+            if "execution_time_ms_total" in subop_no_reuse_metrics:
+                ratios["subop_no_reuse_total_over_run_sql_sum"] = (
+                    subop_no_reuse_metrics["execution_time_ms_total"] / denom
+                )
+            if "execution_time_ms_q0_q1" in subop_no_reuse_metrics:
+                ratios["subop_no_reuse_q0_q1_over_run_sql_sum"] = (
+                    subop_no_reuse_metrics["execution_time_ms_q0_q1"] / denom
+                )
+    if (
+        "execution_time_ms_total" in subop_metrics
+        and "execution_time_ms_total" in subop_no_reuse_metrics
+        and subop_no_reuse_metrics["execution_time_ms_total"] > 0
+    ):
+        ratios["subop_reuse_over_same_path_no_reuse_total"] = (
+            subop_metrics["execution_time_ms_total"] / subop_no_reuse_metrics["execution_time_ms_total"]
+        )
+        ratios["subop_speedup_over_same_path_no_reuse_total"] = (
+            subop_no_reuse_metrics["execution_time_ms_total"] / subop_metrics["execution_time_ms_total"]
+        )
+    if (
+        "execution_time_ms_q0_q1" in subop_metrics
+        and "execution_time_ms_q0_q1" in subop_no_reuse_metrics
+        and subop_no_reuse_metrics["execution_time_ms_q0_q1"] > 0
+    ):
+        ratios["subop_reuse_over_same_path_no_reuse_q0_q1"] = (
+            subop_metrics["execution_time_ms_q0_q1"] / subop_no_reuse_metrics["execution_time_ms_q0_q1"]
+        )
+        ratios["subop_speedup_over_same_path_no_reuse_q0_q1"] = (
+            subop_no_reuse_metrics["execution_time_ms_q0_q1"] / subop_metrics["execution_time_ms_q0_q1"]
+        )
+    return ratios
+
+
+def summarize_values(values: List[float]) -> Dict[str, Any]:
+    if not values:
+        return {}
+    return {
+        "values": values,
+        "min": min(values),
+        "max": max(values),
+        "mean": statistics.fmean(values),
+        "median": statistics.median(values),
+    }
+
+
+def geo_mean(values: List[float]) -> Optional[float]:
+    positive = [v for v in values if v > 0]
+    if len(positive) != len(values) or not positive:
+        return None
+    return statistics.geometric_mean(positive)
+
+
+def aggregate_pair_runs(pair_runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"repetitions": len(pair_runs)}
+    for section in ("subop", "subop_no_reuse_rewrite"):
+        section_out: Dict[str, Any] = {}
+        for metric in ("execution_time_ms_total", "execution_time_ms_q0_q1", "wall_ms"):
+            values = [run[section][metric] for run in pair_runs if metric in run.get(section, {})]
+            summary = summarize_values(values)
+            if summary:
+                section_out[metric] = summary
+        out[section] = section_out
+    ratio_out: Dict[str, Any] = {}
+    ratio_keys = sorted({k for run in pair_runs for k in run.get("ratios", {}).keys()})
+    for key in ratio_keys:
+        values = [run["ratios"][key] for run in pair_runs if key in run.get("ratios", {})]
+        summary = summarize_values(values)
+        if summary:
+            ratio_out[key] = summary
+    out["ratios"] = ratio_out
+    return out
+
+
+def compact_pair_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    pair_runs = row.get("pair_runs") or [
+        {
+            "subop": row.get("subop", {}),
+            "subop_no_reuse_rewrite": row.get("subop_no_reuse_rewrite", {}),
+        }
+    ]
+    reuse_times = [
+        run["subop"]["execution_time_ms_total"]
+        for run in pair_runs
+        if "execution_time_ms_total" in run.get("subop", {})
+    ]
+    no_reuse_times = [
+        run["subop_no_reuse_rewrite"]["execution_time_ms_total"]
+        for run in pair_runs
+        if "execution_time_ms_total" in run.get("subop_no_reuse_rewrite", {})
+    ]
+    reuse_geo = geo_mean(reuse_times)
+    no_reuse_geo = geo_mean(no_reuse_times)
+    summary = row.get("reuse_summary", {})
+    return {
+        "query_pair": row["pair_id"],
+        "reuse_count": summary.get("reuse_targets_no_table_total"),
+        "state_reuse_total_time_geo_mean_ms": reuse_geo,
+        "no_reuse_total_time_geo_mean_ms": no_reuse_geo,
+        "speedup": (no_reuse_geo / reuse_geo) if reuse_geo and no_reuse_geo else None,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--build-dir", default="build/lingodb-release", help="e.g. build/lingodb-release")
@@ -251,7 +397,12 @@ def main() -> None:
     ap.add_argument("--out", default="tmp_pairwise_tpch_release.json", help="output JSON path")
     ap.add_argument("--timeout-s", type=int, default=600, help="per command timeout")
     ap.add_argument("--skip-existing", action="store_true", help="if out exists, resume by skipping done pairs")
+    ap.add_argument("--pairs", default="", help="comma-separated whitelist, e.g. Q7-Q8,Q8-Q9")
+    ap.add_argument("--repetitions", type=int, default=1, help="number of reuse/no-reuse measurements per pair")
+    ap.add_argument("--compact-output", action="store_true", help="write only a compact JSON list")
     args = ap.parse_args()
+    if args.repetitions < 1:
+        raise SystemExit("--repetitions must be >= 1")
 
     run_sql = os.path.join(args.build_dir, "run-sql")
     subop = os.path.join(args.build_dir, "subop-state-reuse")
@@ -290,7 +441,7 @@ def main() -> None:
             existing_pairs[row["pair_id"]] = row
         results.extend(prev.get("pairs", []))
 
-    pairs = list(itertools.combinations(range(1, 23), 2))
+    pairs = parse_pair_spec(args.pairs) if args.pairs else list(itertools.combinations(range(1, 23), 2))
     total = len(pairs)
     done = 0
     reuse_pair_count = sum(1 for row in results if row.get("reuse_summary", {}).get("has_reuse"))
@@ -308,17 +459,33 @@ def main() -> None:
         sql_a = os.path.join(args.sql_dir, f"{a}.sql")
         sql_b = os.path.join(args.sql_dir, f"{b}.sql")
 
-        r = run_cmd([subop, args.db, sql_a, sql_b], env=env, timeout_s=args.timeout_s)
-        r_no_reuse = run_cmd([subop, "--no-reuse-rewrite", args.db, sql_a, sql_b], env=env, timeout_s=args.timeout_s)
+        pair_runs: List[Dict[str, Any]] = []
+        for repetition in range(args.repetitions):
+            r = run_cmd([subop, args.db, sql_a, sql_b], env=env, timeout_s=args.timeout_s)
+            r_no_reuse = run_cmd([subop, "--no-reuse-rewrite", args.db, sql_a, sql_b], env=env, timeout_s=args.timeout_s)
+            subop_payload = build_subop_result_payload(r, singles, single_result_blocks, a, b)
+            no_reuse_payload = build_subop_result_payload(r_no_reuse, singles, single_result_blocks, a, b)
+            run_row: Dict[str, Any] = {
+                "repetition": repetition + 1,
+                "subop": subop_payload,
+                "subop_no_reuse_rewrite": no_reuse_payload,
+                "ratios": compute_ratios(
+                    subop_payload,
+                    no_reuse_payload,
+                    singles[a]["execution_time_ms"],
+                    singles[b]["execution_time_ms"],
+                ),
+            }
+            pair_runs.append(run_row)
 
         row: Dict[str, Any] = {
             "pair_id": pair_id,
             "q0": a,
             "q1": b,
-            "subop": build_subop_result_payload(r, singles, single_result_blocks, a, b),
-            "subop_no_reuse_rewrite": build_subop_result_payload(
-                r_no_reuse, singles, single_result_blocks, a, b
-            ),
+            "subop": pair_runs[0]["subop"],
+            "subop_no_reuse_rewrite": pair_runs[0]["subop_no_reuse_rewrite"],
+            "pair_runs": pair_runs,
+            "pair_run_aggregate": aggregate_pair_runs(pair_runs),
             "run_sql": {
                 "q0_execution_time_ms": singles[a]["execution_time_ms"],
                 "q1_execution_time_ms": singles[b]["execution_time_ms"],
@@ -334,43 +501,7 @@ def main() -> None:
         if q0 is not None and q1 is not None:
             row["run_sql"]["q0_plus_q1_execution_time_ms"] = q0 + q1
 
-        # Ratios (when data is available).
-        subop_metrics = row["subop"]
-        subop_no_reuse_metrics = row["subop_no_reuse_rewrite"]
-        if "execution_time_ms_total" in subop_metrics and q0 is not None and q1 is not None:
-            denom = q0 + q1
-            if denom > 0:
-                row["ratios"] = {
-                    "subop_total_over_run_sql_sum": subop_metrics["execution_time_ms_total"] / denom,
-                }
-                if "execution_time_ms_q0_q1" in subop_metrics:
-                    row["ratios"]["subop_q0_q1_over_run_sql_sum"] = subop_metrics["execution_time_ms_q0_q1"] / denom
-                if "execution_time_ms_total" in subop_no_reuse_metrics:
-                    row["ratios"]["subop_no_reuse_total_over_run_sql_sum"] = (
-                        subop_no_reuse_metrics["execution_time_ms_total"] / denom
-                    )
-                if "execution_time_ms_q0_q1" in subop_no_reuse_metrics:
-                    row["ratios"]["subop_no_reuse_q0_q1_over_run_sql_sum"] = (
-                        subop_no_reuse_metrics["execution_time_ms_q0_q1"] / denom
-                    )
-        if (
-            "execution_time_ms_total" in subop_metrics
-            and "execution_time_ms_total" in subop_no_reuse_metrics
-            and subop_no_reuse_metrics["execution_time_ms_total"] > 0
-        ):
-            row.setdefault("ratios", {})
-            row["ratios"]["subop_reuse_over_same_path_no_reuse_total"] = (
-                subop_metrics["execution_time_ms_total"] / subop_no_reuse_metrics["execution_time_ms_total"]
-            )
-        if (
-            "execution_time_ms_q0_q1" in subop_metrics
-            and "execution_time_ms_q0_q1" in subop_no_reuse_metrics
-            and subop_no_reuse_metrics["execution_time_ms_q0_q1"] > 0
-        ):
-            row.setdefault("ratios", {})
-            row["ratios"]["subop_reuse_over_same_path_no_reuse_q0_q1"] = (
-                subop_metrics["execution_time_ms_q0_q1"] / subop_no_reuse_metrics["execution_time_ms_q0_q1"]
-            )
+        row["ratios"] = pair_runs[0]["ratios"]
 
         results.append(row)
         done += 1
@@ -389,12 +520,15 @@ def main() -> None:
                     "generated_at_unix": time.time(),
                     "reuse_pair_count": reuse_pair_count,
                     "reuse_no_table_pair_count": reuse_no_table_pair_count,
+                    "pairs_whitelist": args.pairs,
+                    "repetitions": args.repetitions,
                 },
                 "singles_run_sql": singles,
                 "pairs": results,
             }
             with open(args.out, "w", encoding="utf-8") as f:
-                json.dump(out_obj, f, indent=2, sort_keys=True)
+                json.dump([compact_pair_row(row) for row in results] if args.compact_output else out_obj,
+                          f, indent=2, sort_keys=True)
 
     print(f"wrote {args.out}")
 
