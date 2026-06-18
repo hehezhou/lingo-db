@@ -3967,21 +3967,18 @@ class CreateHashIndexedViewLowering : public SubOpConversionPattern<subop::Creat
             if (auto slot = parsePredSlot(memberManager.getName(member))) predMembers.push_back({*slot, member});
          }
          llvm::sort(predMembers, [](const auto& a, const auto& b) { return a.first < b.first; });
-         assert(!predMembers.empty() && predMembers.size() <= 8 &&
-                "mixed HIV pred tag build expects 1..8 physical filter_pred members");
-         llvm::SmallVector<mlir::Value, 10> args;
-         args.push_back(adaptor.getSource());
-         args.push_back(rewriter.create<arith::ConstantIndexOp>(createOp->getLoc(), predMembers.size()));
-         for (unsigned i = 0; i < 8; ++i) {
-            size_t offset = 0;
-            if (i < predMembers.size()) {
-               auto predOffset = getStoredMemberByteOffset(bufferType.getMembers(), predMembers[i].second, typeConverter);
-               assert(predOffset && "could not compute mixed HIV predicate offset");
-               offset = *predOffset;
-            }
-            args.push_back(rewriter.create<arith::ConstantIndexOp>(createOp->getLoc(), offset));
+         assert(!predMembers.empty() && "mixed HIV pred tag build expects at least one physical filter_pred member");
+         auto offsetsSize = rewriter.create<arith::ConstantIndexOp>(createOp->getLoc(), predMembers.size() * sizeof(size_t));
+         mlir::Value offsets = rt::ExecutionContext::allocStateRaw(rewriter, createOp->getLoc())({offsetsSize})[0];
+         offsets = rewriter.create<util::GenericMemrefCastOp>(createOp->getLoc(), util::RefType::get(getContext(), rewriter.getI64Type()), offsets);
+         for (unsigned i = 0; i < predMembers.size(); ++i) {
+            auto predOffset = getStoredMemberByteOffset(bufferType.getMembers(), predMembers[i].second, typeConverter);
+            assert(predOffset && "could not compute mixed HIV predicate offset");
+            auto offsetValue = rewriter.create<arith::ConstantIntOp>(createOp->getLoc(), *predOffset, 64);
+            auto offsetIndex = rewriter.create<arith::ConstantIndexOp>(createOp->getLoc(), i);
+            rewriter.create<util::StoreOp>(createOp->getLoc(), offsetValue, offsets, offsetIndex);
          }
-         htView = rt::HashIndexedView::buildWithPredFlags(rewriter, createOp->getLoc())(args)[0];
+         htView = rt::HashIndexedView::buildWithPredFlagOffsets(rewriter, createOp->getLoc())({adaptor.getSource(), rewriter.create<arith::ConstantIndexOp>(createOp->getLoc(), predMembers.size()), offsets})[0];
       } else {
          htView = rt::HashIndexedView::build(rewriter, createOp->getLoc())({adaptor.getSource()})[0];
       }

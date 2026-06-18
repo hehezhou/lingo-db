@@ -10,6 +10,7 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include <cstdint>
+#include <limits>
 #include <utility>
 
 namespace mlir {
@@ -49,6 +50,9 @@ struct CrossQueryStateMatchPair {
 struct CrossQueryStateMatchEntry {
    int query = -1;
    mlir::Value state;
+   /// Logical reuse slot used for per-subgroup filter_pred/query_id materialization. This is usually the
+   /// query id, but identical-filter subgroups intentionally share one slot.
+   unsigned reuseSlot = std::numeric_limits<unsigned>::max();
 };
 
 struct CrossQueryStateMatchGroup {
@@ -58,6 +62,8 @@ struct CrossQueryStateMatchGroup {
    bool enableFilterPredReuse = true;
    /// True only when matched HIV payload layouts differ and need union layout rewrite.
    bool requiresJoinLayoutUnion = false;
+   /// Cache keys this matched state depends on after previous fixed-point rewrite rounds.
+   llvm::SmallVector<uint64_t, 4> cacheDeps;
 };
 
 struct ModuleReuseInfo {

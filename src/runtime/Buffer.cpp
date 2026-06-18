@@ -12,11 +12,11 @@ static lingodb::utility::Tracer::Event bufferChunk("BufferIterator", "chunk", fa
 
 class FlexibleBufferWorkerResvState {
    public:
-   size_t bufferId;
+   size_t bufferId{0};
    std::shared_mutex mutex;
    size_t resvCursor{0};
    size_t resvId{0};
-   size_t unitAmount;
+   size_t unitAmount{0};
    // workerId steal task from
    size_t stealWorkerId{std::numeric_limits<size_t>::max()};
 

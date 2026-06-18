@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
+#include <limits>
 #include <unordered_set>
 
 namespace lingodb::compiler::dialect::subop {
@@ -60,6 +61,12 @@ static std::string aggregatePayloadScopeSemantic(llvm::StringRef scope) {
 
 static constexpr llvm::StringRef kReuseFilterPredScope = "reuse_filter_pred";
 static constexpr llvm::StringRef kReuseFilterPredUnionScope = "reuse_filter_pred_union";
+
+static unsigned reuseSlotForEntry(const CrossQueryStateMatchEntry& entry) {
+   return entry.reuseSlot == std::numeric_limits<unsigned>::max()
+             ? static_cast<unsigned>(entry.query)
+             : entry.reuseSlot;
+}
 
 static bool isFilterPredPayloadColumn(llvm::StringRef memberName, llvm::StringRef leaf) {
    return memberName.starts_with("filter_pred") || leaf == "filter_pred";
@@ -585,6 +592,18 @@ static void insertPayloadColumnSpec(llvm::DenseMap<uint64_t, PayloadColumnSpec>&
       return;
    }
 
+   for (auto existingIt = unionCols.begin(), e = unionCols.end(); existingIt != e; ++existingIt) {
+      PayloadColumnSpec& existing = existingIt->second;
+      unsigned predIdx = 0;
+      if (parseFilterPredLayoutSemanticKey(existing.semanticKey, predIdx)) continue;
+      if (existing.semanticKey != spec.semanticKey) continue;
+      if (existing.colType != spec.colType) continue;
+      markSide(existing);
+      existing.isJoinKey |= spec.isJoinKey;
+      existing.fromExternalTable |= spec.fromExternalTable;
+      return;
+   }
+
    llvm::StringRef specLeaf = normalizeColumnIdentifier(spec.leaf);
    for (auto existingIt = unionCols.begin(), e = unionCols.end(); existingIt != e; ++existingIt) {
       PayloadColumnSpec& existing = existingIt->second;
@@ -1028,14 +1047,22 @@ static mlir::BlockArgument appendMapInputColumn(subop::MapOp map, tuples::Column
 
 static subop::ScanRefsOp findTableScanRefsInBuildStep(subop::ExecutionStepOp step);
 
-static bool mapHasInputSemantic(subop::MapOp map, llvm::StringRef semantic,
-                                tuples::ColumnManager& cm) {
-   for (auto attr : map.getInputCols()) {
-      auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
-      auto [scope, leaf] = cm.getName(&ref.getColumn());
-      if (columnSemanticKey(scope, leaf) == semantic) return true;
+static std::optional<unsigned> findCompatibleMapInputIndex(subop::MapOp map,
+                                                           llvm::StringRef semantic,
+                                                           llvm::StringRef leaf,
+                                                           mlir::Type type,
+                                                           tuples::ColumnManager& cm) {
+   std::optional<unsigned> byLeaf;
+   for (unsigned i = 0; i < map.getInputCols().size(); ++i) {
+      auto ref = mlir::cast<tuples::ColumnRefAttr>(map.getInputCols()[i]);
+      auto [scope, existingLeaf] = cm.getName(&ref.getColumn());
+      if (columnSemanticKey(scope, existingLeaf) == semantic) return i;
+      if (existingLeaf == leaf && ref.getColumn().type == type) {
+         assert(!byLeaf && "residual filter rewrite: ambiguous alias-compatible predicate input");
+         byLeaf = i;
+      }
    }
-   return false;
+   return byLeaf;
 }
 
 static void ensureSyntheticMapHasPeerInputs(subop::ExecutionStepOp syntheticBuild,
@@ -1055,7 +1082,8 @@ static void ensureSyntheticMapHasPeerInputs(subop::ExecutionStepOp syntheticBuil
       auto peerRef = mlir::cast<tuples::ColumnRefAttr>(attr);
       auto [scope, leaf] = peerCm.getName(&peerRef.getColumn());
       std::string semantic = columnSemanticKey(scope, leaf);
-      if (mapHasInputSemantic(syntheticMap, semantic, synthCm)) continue;
+      mlir::Type inputType = cloneTypeToContext(peerRef.getColumn().type, ctx);
+      if (findCompatibleMapInputIndex(syntheticMap, semantic, leaf, inputType, synthCm)) continue;
       subop::Member member = tableMemberForIdentifier(tableTy, mm, leaf);
       assert(member && "residual filter rewrite: synthetic table scan must contain peer predicate input");
       tuples::ColumnDefAttr def = synthCm.createDef(scope, leaf);
@@ -1096,15 +1124,14 @@ static void renameResidualPredicateMapResult(subop::MapOp map, subop::FilterOp f
    map.setComputedColsAttr(mlir::ArrayAttr::get(map.getContext(), computed));
 }
 
-static mlir::BlockArgument mapBlockArgForInputSemanticLocal(subop::MapOp map, const std::string& semantic,
-                                                            tuples::ColumnManager& cm) {
-   mlir::Block& block = map.getFn().front();
-   for (unsigned i = 0; i < map.getInputCols().size(); ++i) {
-      auto ref = mlir::cast<tuples::ColumnRefAttr>(map.getInputCols()[i]);
-      auto [scope, leaf] = cm.getName(&ref.getColumn());
-      if (columnSemanticKey(scope, leaf) == semantic) return block.getArgument(i);
-   }
-   llvm_unreachable("residual filter: peer predicate input must exist in synthetic predicate map");
+static mlir::BlockArgument mapBlockArgForCompatibleInputLocal(subop::MapOp map,
+                                                              llvm::StringRef semantic,
+                                                              llvm::StringRef leaf,
+                                                              mlir::Type type,
+                                                              tuples::ColumnManager& cm) {
+   std::optional<unsigned> idx = findCompatibleMapInputIndex(map, semantic, leaf, type, cm);
+   assert(idx && "residual filter: peer predicate input must exist in synthetic predicate map");
+   return map.getFn().front().getArgument(*idx);
 }
 
 static mlir::Value cloneResidualPredicateExprToSynthetic(mlir::Value v, mlir::IRMapping& mapping,
@@ -1211,11 +1238,16 @@ static tuples::ColumnRefAttr appendPeerResidualPredicateToSyntheticMap(subop::Ma
    auto& peerCm = peerMap.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
 
    mlir::IRMapping mapping;
+   llvm::DenseSet<unsigned> mappedSyntheticArgs;
    for (unsigned i = 0; i < peerMap.getInputCols().size(); ++i) {
       auto peerInput = mlir::cast<tuples::ColumnRefAttr>(peerMap.getInputCols()[i]);
       auto [scope, leaf] = peerCm.getName(&peerInput.getColumn());
-      mapping.map(peerMap.getFn().front().getArgument(i),
-                  mapBlockArgForInputSemanticLocal(syntheticMap, columnSemanticKey(scope, leaf), synthCm));
+      std::string semantic = columnSemanticKey(scope, leaf);
+      mlir::BlockArgument arg = mapBlockArgForCompatibleInputLocal(
+         syntheticMap, semantic, leaf, cloneTypeToContext(peerInput.getColumn().type, ctx), synthCm);
+      assert(mappedSyntheticArgs.insert(arg.getArgNumber()).second &&
+             "residual filter rewrite: peer predicate is not local to one synthetic build-table row");
+      mapping.map(peerMap.getFn().front().getArgument(i), arg);
    }
 
    mlir::Block& peerBlock = peerMap.getFn().front();
@@ -1429,6 +1461,47 @@ static mlir::Value insertResidualFilterUnionAfterPredicates(mlir::Value stream,
    return filter.getRes();
 }
 
+static mlir::Value insertResidualFilterUnionAfterPredicates(mlir::Value stream,
+                                                            llvm::ArrayRef<tuples::ColumnRefAttr> predRefs) {
+   assert(!predRefs.empty() && "residual filter union requires predicate refs");
+   auto* ctx = predRefs.front().getContext();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   tuples::ColumnDefAttr unionPred = cm.createDef(cm.getUniqueScope("residual_filter_union"), "pred");
+   unionPred.getColumn().type = mlir::IntegerType::get(ctx, 1);
+   tuples::ColumnRefAttr unionRef = cm.createRef(&unionPred.getColumn());
+
+   mlir::Operation* anchor = stream.getDefiningOp();
+   assert(anchor && "residual filter union must be inserted after a stream producer");
+   mlir::OpBuilder b(anchor);
+   b.setInsertionPointAfter(anchor);
+   llvm::SmallVector<mlir::Attribute, 8> predAttrs;
+   for (tuples::ColumnRefAttr ref : predRefs) predAttrs.push_back(ref);
+   auto map = b.create<subop::MapOp>(anchor->getLoc(), tuples::TupleStreamType::get(ctx), stream,
+                                     b.getArrayAttr({unionPred}), b.getArrayAttr(predAttrs));
+   mlir::Block* block = new mlir::Block();
+   for (tuples::ColumnRefAttr ref : predRefs) block->addArgument(ref.getColumn().type, anchor->getLoc());
+   map.getFn().push_back(block);
+   mlir::OpBuilder rb(ctx);
+   rb.setInsertionPointToStart(block);
+   mlir::Value unionValue = block->getArgument(0);
+   for (unsigned i = 1; i < block->getNumArguments(); ++i) {
+      unionValue = rb.create<db::OrOp>(anchor->getLoc(), mlir::ValueRange{unionValue, block->getArgument(i)});
+   }
+   rb.create<tuples::ReturnOp>(anchor->getLoc(), mlir::ValueRange{unionValue});
+
+   b.setInsertionPointAfter(map);
+   auto filter = b.create<subop::FilterOp>(anchor->getLoc(), map.getResult(),
+                                           subop::FilterSemantic::all_true,
+                                           b.getArrayAttr({unionRef}));
+   stream.replaceUsesWithIf(filter.getRes(), [&](mlir::OpOperand& use) {
+      mlir::Operation* owner = use.getOwner();
+      if (owner->getBlock() != filter->getBlock()) return false;
+      if (!filter->isBeforeInBlock(owner)) return false;
+      return owner != map.getOperation() && owner != filter.getOperation();
+   });
+   return filter.getRes();
+}
+
 static void rewireStreamUsesAfterAnchorInStep(mlir::Value oldStream, mlir::Value newStream,
                                               mlir::Operation* anchorOp,
                                               llvm::ArrayRef<mlir::Operation*> excludeOps) {
@@ -1608,6 +1681,82 @@ static bool rewriteSyntheticResidualFiltersAsFilterPreds(subop::ExecutionStepOp 
    return true;
 }
 
+static bool rewriteSyntheticResidualFiltersAsFilterPredsForSlots(
+   subop::ExecutionStepOp syntheticBuild,
+   llvm::ArrayRef<unsigned> predQueryIndices,
+   const llvm::DenseMap<unsigned, subop::ExecutionStepOp>& peerBuilds,
+   subop::MaterializeOp mat,
+   const llvm::DenseMap<unsigned, subop::Member>& predMembers,
+   const llvm::DenseMap<unsigned, llvm::SmallVector<runtime::FilterDescription, 8>>& simpleFilters) {
+   if (predQueryIndices.size() < 2) return false;
+
+   llvm::DenseMap<unsigned, ResidualTableFilter> residualBySlot;
+   llvm::StringSet<> residualFingerprints;
+   for (unsigned qIdx : predQueryIndices) {
+      subop::ExecutionStepOp peerBuild = peerBuilds.lookup(qIdx);
+      assert(peerBuild && "residual filter rewrite: missing peer build");
+      auto residual = findResidualTableFilterInBuildStep(peerBuild);
+      if (!residual) continue;
+      residualFingerprints.insert(residualFilterFingerprint(*residual));
+      residualBySlot.try_emplace(qIdx, *residual);
+   }
+   if (residualBySlot.empty()) return false;
+
+   auto synthResidual = findResidualTableFilterInBuildStep(syntheticBuild);
+   auto* ctx = syntheticBuild.getContext();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+
+   subop::MapOp seedMap = synthResidual ? synthResidual->predMap : residualBySlot.begin()->second.predMap;
+   subop::MapOp syntheticMap = synthResidual ? synthResidual->predMap
+                                             : createResidualPredicateMapAfterTableScan(syntheticBuild, seedMap);
+
+   llvm::DenseMap<unsigned, tuples::ColumnRefAttr> simplePredBySlot;
+   for (unsigned qIdx : predQueryIndices) {
+      auto itSimple = simpleFilters.find(qIdx);
+      if (itSimple == simpleFilters.end() || itSimple->second.empty()) continue;
+      subop::Member predMember = predMembers.lookup(qIdx);
+      assert(predMember && "residual filter rewrite: missing predicate member");
+      insertWriteSidePredIntoBufferConstructionStepForPredMember(syntheticBuild, itSimple->second,
+                                                                 mm.getName(predMember));
+      tuples::ColumnRefAttr simpleRef = materializedColumnForMember(mat, predMember);
+      assert(simpleRef && "residual filter rewrite: simple predicate materialize missing");
+      moveSimplePredicateProducerBeforeResidualMap(syntheticBuild, syntheticMap, simpleRef);
+      simplePredBySlot[qIdx] = simpleRef;
+   }
+
+   for (auto& it : residualBySlot) ensureSyntheticMapHasPeerInputs(syntheticBuild, syntheticMap, it.second.predMap);
+
+   llvm::SmallVector<tuples::ColumnRefAttr, 8> predRefs;
+   predRefs.reserve(predQueryIndices.size());
+   for (unsigned qIdx : predQueryIndices) {
+      subop::Member predMember = predMembers.lookup(qIdx);
+      assert(predMember && "residual filter rewrite: missing predicate member");
+      tuples::ColumnDefAttr predDef = makeResidualFilterPredDef(ctx, qIdx);
+      tuples::ColumnRefAttr predRef;
+      auto itResidual = residualBySlot.find(qIdx);
+      if (itResidual != residualBySlot.end()) {
+         predRef = appendPeerResidualPredicateToSyntheticMap(syntheticMap, itResidual->second.predMap,
+                                                             itResidual->second.filter, predDef);
+      } else {
+         predRef = appendTrueResidualPredicateToSyntheticMap(syntheticMap, predDef);
+      }
+      if (auto itSimple = simplePredBySlot.find(qIdx); itSimple != simplePredBySlot.end()) {
+         unsigned predIdx = syntheticMap.getComputedCols().size() - 1;
+         andResidualPredicateWithSimpleFilter(syntheticMap, predIdx, itSimple->second);
+      }
+      setMaterializeMapping(mat, predMember, predRef);
+      predRefs.push_back(predRef);
+   }
+
+   mlir::Value finalPredicateStream = syntheticMap.getResult();
+   finalPredicateStream = insertResidualFilterUnionAfterPredicates(finalPredicateStream, predRefs);
+   if (synthResidual) {
+      synthResidual->filter.getRes().replaceAllUsesWith(finalPredicateStream);
+      synthResidual->filter.erase();
+   }
+   return true;
+}
+
 static void collectSemanticHashToMemberFromMaterialize(
    subop::MaterializeOp mat, subop::Member linkM, subop::Member hashM, subop::MemberManager& mm,
    const llvm::DenseMap<const void*, uint64_t>& columnHashes, llvm::DenseMap<uint64_t, subop::Member>& out) {
@@ -1618,6 +1767,36 @@ static void collectSemanticHashToMemberFromMaterialize(
       if (mm.getType(member) != colRef.getColumn().type) continue;
       out.try_emplace(payloadColumnIdentityHash(colRef, columnHashes), member);
    }
+}
+
+static void alignMaterializedPayloadMembersToUnionPlan(
+   subop::MaterializeOp mat, const JoinBufferUnionPlan& plan, subop::MemberManager& mm,
+   const llvm::DenseMap<const void*, uint64_t>& columnHashes) {
+   llvm::DenseMap<uint64_t, subop::Member> targetMemberBySemanticHash;
+   assert(plan.payloadColumns.size() == plan.payloadMembers.size());
+   for (size_t i = 0; i < plan.payloadColumns.size(); ++i) {
+      targetMemberBySemanticHash[plan.payloadColumns[i].semanticHash] = plan.payloadMembers[i];
+   }
+
+   bool changed = false;
+   llvm::SmallVector<subop::RefMappingPairT> pairs;
+   pairs.reserve(mat.getMapping().getMapping().size());
+   for (auto& [member, colRef] : mat.getMapping().getMapping()) {
+      subop::Member outMember = member;
+      llvm::StringRef memName = mm.getName(member);
+      if (member != plan.linkMember && member != plan.hashMember && !isJoinBufferInternalMemberName(memName)) {
+         uint64_t semanticHash = payloadColumnIdentityHash(colRef, columnHashes);
+         auto it = targetMemberBySemanticHash.find(semanticHash);
+         if (it != targetMemberBySemanticHash.end()) {
+            outMember = it->second;
+            assert(mm.getType(outMember) == colRef.getColumn().type &&
+                   "join superset: union payload member type must match materialized column");
+         }
+      }
+      if (outMember != member) changed = true;
+      pairs.push_back({outMember, colRef});
+   }
+   if (changed) mat.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(mat.getContext(), pairs));
 }
 
 /// Assign \p plan.payloadMembers from cloned build-step materialize mappings + fresh members for union-only columns.
@@ -2533,6 +2712,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
 
    subop::MaterializeOp matOp = findJoinBufferMaterializeInStep(buildStep);
    assert(matOp && "join superset: buffer build step must materialize into join buffer");
+   alignMaterializedPayloadMembersToUnionPlan(matOp, plan, mm, columnHashes);
 
    auto collectMaterializedPayloadHashes = [&]() {
       llvm::DenseSet<uint64_t> keys;
@@ -3214,8 +3394,8 @@ static tuples::ColumnRefAttr resolveAggregatePayloadSourceColumn(subop::ReduceOp
    abortAggregateUnionUnsupported("aggregate additive payload source is not an input column");
 }
 
-static subop::ExecutionStepOp findAggregateBuildStepForHt(mlir::Value aggregateState,
-                                                          const ModuleReuseInfo& reuse) {
+static subop::ExecutionStepOp tryFindAggregateBuildStepForHt(mlir::Value aggregateState,
+                                                             const ModuleReuseInfo& reuse) {
    llvm::SmallVector<subop::ExecutionStepOp, 2> candidates;
    auto considerState = [&](mlir::Value state) {
       auto it = reuse.writerStepsByState.find(state);
@@ -3226,13 +3406,20 @@ static subop::ExecutionStepOp findAggregateBuildStepForHt(mlir::Value aggregateS
             assert(!reduce && "aggregate union: expected a single reduce in aggregate build step");
             reduce = op;
          });
-         if (reduce) candidates.push_back(step);
+         if (reduce && reduce->getParentOfType<subop::ExecutionStepOp>() == step) candidates.push_back(step);
       }
    };
    considerState(aggregateState);
    forEachShadowChainPredecessor(aggregateState, reuse, considerState);
-   assert(candidates.size() == 1 && "aggregate union: expected one reduce build step for aggregate state");
+   if (candidates.size() != 1) return {};
    return candidates.front();
+}
+
+static subop::ExecutionStepOp findAggregateBuildStepForHt(mlir::Value aggregateState,
+                                                          const ModuleReuseInfo& reuse) {
+   subop::ExecutionStepOp step = tryFindAggregateBuildStepForHt(aggregateState, reuse);
+   assert(step && "aggregate union: expected one reduce build step for aggregate state");
+   return step;
 }
 
 static llvm::SmallVector<AggregatePayloadMemberInfo, 16>
@@ -3454,6 +3641,7 @@ static tuples::ColumnRefAttr mapComputedRefForSemantic(subop::MapOp map, const s
 
 struct AggregatePeerRewriteInput {
    unsigned queryId = 0;
+   unsigned filterSlot = 0;
    mlir::ModuleOp module;
    mlir::Value state;
    subop::ExecutionStepOp buildStep;
@@ -3972,14 +4160,17 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
 
    if (layout.mixedByQueryId) {
       llvm::SmallVector<RuntimeFilterIdClause, 8> clauses;
+      llvm::DenseSet<unsigned> seenClauseSlots;
       RuntimeFilterIdClause donorClause;
       donorClause.id = donorQueryId;
       donorClause.filters = decodeFiltersFromTableScanInExecutionStep(buildStep);
       assert(!donorClause.filters.empty() && "mixed aggregate reuse requires donor simple filters");
       clauses.push_back(std::move(donorClause));
+      seenClauseSlots.insert(donorQueryId);
       for (const AggregatePeerRewriteInput& peer : peers) {
+         if (!seenClauseSlots.insert(peer.filterSlot).second) continue;
          RuntimeFilterIdClause clause;
-         clause.id = peer.queryId;
+         clause.id = peer.filterSlot;
          clause.filters = decodeFiltersFromTableScanInExecutionStep(peer.buildStep);
          assert(!clause.filters.empty() && "mixed aggregate reuse requires peer simple filters");
          clauses.push_back(std::move(clause));
@@ -4009,7 +4200,7 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
    llvm::SmallVector<mlir::Type> newTypes;
    for (subop::Member m : newMembers) newTypes.push_back(mm.getType(m));
 
-   subop::MapOp producerMap = findProducerAggregateMap(buildStep);
+   subop::MapOp producerMap;
    struct InsertedAggregatePayload {
       unsigned idx;
       mlir::Type type;
@@ -4034,6 +4225,7 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
                                                              ->getLoadedDialect<tuples::TupleStreamDialect>()
                                                              ->getColumnManager());
             assert(peerMap && "aggregate union: missing computed aggregate payload requires peer map");
+            if (!producerMap) producerMap = findProducerAggregateMap(buildStep);
             source = clonePeerMapResultIntoProducer(buildStep, producerMap, peerMap, p.sourceColumn,
                                                    reuseSynthetic, peer.reuse, synthetic);
          }
@@ -5058,6 +5250,10 @@ bool joinMatchPeerExternalFiltersIdentical(mlir::ModuleOp query0, mlir::ModuleOp
    return joinMatchPeerExternalFiltersIdenticalImpl(query0, query1, hivA, hivB, reuse0, reuse1);
 }
 
+bool aggregateHashTablePayloadUnionSupported(mlir::Value aggregateState, const ModuleReuseInfo& reuse) {
+   return static_cast<bool>(tryFindAggregateBuildStepForHt(aggregateState, reuse));
+}
+
 double estimateMergedHivExternalFilterRows(mlir::ModuleOp query0, mlir::ModuleOp query1, mlir::Value hivA,
                                            mlir::Value hivB, const ModuleReuseInfo& reuse0,
                                            const ModuleReuseInfo& reuse1,
@@ -5095,24 +5291,57 @@ bool parseReuseFilterPredSemanticKey(llvm::StringRef semanticKey, unsigned& reus
 static bool materializePredMemberFromUpstreamMixedScanList(subop::ExecutionStepOp buildStep,
                                                            llvm::StringRef predMemberName);
 
+static mlir::Value findHashIndexedViewBuiltByStep(mlir::ModuleOp module,
+                                                  subop::ExecutionStepOp buildStep,
+                                                  const ModuleReuseInfo& reuseSynthetic) {
+   mlir::Value found;
+   module.walk([&](subop::CreateHashIndexedView create) {
+      if (found) return;
+      subop::ExecutionStepOp producer = findStrictJoinBufferBuildStepForHiv(module, create.getResult(), reuseSynthetic);
+      if (producer != buildStep) return;
+      auto parentStep = create->getParentOfType<subop::ExecutionStepOp>();
+      assert(parentStep && "hash-indexed view create must be inside an execution_step");
+      auto ret = mlir::cast<subop::ExecutionStepReturnOp>(parentStep.getSubOps().front().getTerminator());
+      for (unsigned i = 0; i < ret.getOperands().size(); ++i) {
+         if (ret.getOperand(i) == create.getResult()) {
+            found = parentStep.getResult(i);
+            return;
+         }
+      }
+      llvm_unreachable("hash-indexed view create result must be returned by its execution_step");
+   });
+   return found;
+}
+
 ClonedJoinBufferBuildSitesByKey recordClonedJoinBufferBuildSites(mlir::ModuleOp synthetic,
                                                                  llvm::ArrayRef<CacheTarget> targetsInSynthetic,
                                                                  const ModuleReuseInfo& reuseSynthetic) {
    ClonedJoinBufferBuildSitesByKey out;
    for (const CacheTarget& t : targetsInSynthetic) {
-      if (!t.state || !mlir::isa<subop::HashIndexedViewType>(t.state.getType())) continue;
-      mlir::Value mergedBuf = resolveJoinMergedBuffer(t.state, synthetic, reuseSynthetic);
-      subop::ExecutionStepOp buildStep = findBufferBuildStepWithTableMaterialize(mergedBuf, reuseSynthetic);
-      if (!buildStep) buildStep = findBufferBuildStepWithTableScan(synthetic);
-      if (!buildStep) continue;
+      if (!t.state || !asHashIndexedViewLayoutType(t.state.getType())) continue;
+      subop::ExecutionStepOp buildStep = findStrictJoinBufferBuildStepForHiv(synthetic, t.state, reuseSynthetic);
+      assert(buildStep && "recordClonedJoinBufferBuildSites: cache target must have an exact join-buffer build step");
       ClonedJoinBufferBuildSite site;
       site.cacheKey = t.cacheKey;
-      site.syntheticHiv = t.state;
-      site.syntheticMergedBuffer = mergedBuf;
+      site.syntheticHiv = findHashIndexedViewBuiltByStep(synthetic, buildStep, reuseSynthetic);
+      assert(site.syntheticHiv &&
+             "recordClonedJoinBufferBuildSites: exact join-buffer build step must feed a hash-indexed view");
+      site.syntheticMergedBuffer = resolveJoinMergedBuffer(site.syntheticHiv, synthetic, reuseSynthetic);
       site.syntheticBuildStep = buildStep;
       out[t.cacheKey] = site;
    }
    return out;
+}
+
+void refreshClonedJoinBufferBuildSiteStates(mlir::ModuleOp synthetic,
+                                            ClonedJoinBufferBuildSitesByKey& buildSites,
+                                            const ModuleReuseInfo& reuseSynthetic) {
+   for (auto& [key, site] : buildSites) {
+      mlir::Value hiv = findHashIndexedViewBuiltByStep(synthetic, site.syntheticBuildStep, reuseSynthetic);
+      assert(hiv && "refreshClonedJoinBufferBuildSiteStates: build step must feed a hash-indexed view");
+      site.syntheticHiv = hiv;
+      site.syntheticMergedBuffer = resolveJoinMergedBuffer(hiv, synthetic, reuseSynthetic);
+   }
 }
 
 void insertSyntheticFilterPredsAfterColumnUnion(
@@ -5255,37 +5484,58 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
       if (itL == layoutsByKey.end() || itG == groupByKey.end() || itB == buildSites.end()) continue;
       const CachedJoinBufferLayout& layout = itL->second;
       const CrossQueryStateMatchGroup& group = *itG->second;
-      if (!group.enableFilterPredReuse) continue;
+      bool layoutHasFilterPredSlots = false;
+      for (size_t i = 0; i < layout.payloadMembers.size(); ++i) {
+         unsigned slot = 0;
+         llvm::StringRef semantic;
+         if (i < layout.payloadSemanticKeys.size()) semantic = layout.payloadSemanticKeys[i];
+         if (parseReuseFilterPredSemanticKey(semantic, slot) ||
+             parseReuseFilterPredUnionSemanticKey(semantic, slot) ||
+             parseFilterPredMemberSlot(mm.getName(layout.payloadMembers[i])).has_value()) {
+            layoutHasFilterPredSlots = true;
+            break;
+         }
+      }
+      if (!group.enableFilterPredReuse && !layoutHasFilterPredSlots) continue;
       subop::ExecutionStepOp buildStep = itB->second.syntheticBuildStep;
       if (!buildStep) continue;
 
-      llvm::DenseMap<unsigned, mlir::Value> hivByQuery;
-      llvm::DenseMap<unsigned, ModuleReuseInfo*> reuseInfoByQuery;
-      llvm::DenseMap<unsigned, mlir::ModuleOp> moduleByQuery;
+      llvm::DenseMap<unsigned, mlir::Value> hivBySlot;
+      llvm::DenseMap<unsigned, ModuleReuseInfo*> reuseInfoBySlot;
+      llvm::DenseMap<unsigned, mlir::ModuleOp> moduleBySlot;
       for (const CrossQueryStateMatchEntry& entry : group.entries) {
          if (entry.query < 0 || static_cast<size_t>(entry.query) >= queries.size() || !entry.state) continue;
-         auto qIdx = static_cast<unsigned>(entry.query);
+         unsigned slot = reuseSlotForEntry(entry);
+         if (hivBySlot.contains(slot)) continue;
          ModuleReuseInfo& reuse = reuseByQuery[entry.query];
-         hivByQuery[qIdx] = resolveCacheTargetStateForReuse(entry.state, reuse);
-         reuseInfoByQuery[qIdx] = &reuse;
-         moduleByQuery[qIdx] = queries[entry.query];
+         hivBySlot[slot] = resolveCacheTargetStateForReuse(entry.state, reuse);
+         reuseInfoBySlot[slot] = &reuse;
+         moduleBySlot[slot] = queries[entry.query];
       }
 
       llvm::DenseMap<unsigned, subop::ExecutionStepOp> peerBuilds;
       llvm::DenseMap<unsigned, subop::Member> predMembers;
       llvm::SmallVector<subop::Member, 2> unionPredMembers;
-      for (size_t i = 0; i < layout.payloadSemanticKeys.size(); ++i) {
+      for (size_t i = 0; i < layout.payloadMembers.size(); ++i) {
          unsigned qIdx = 0;
-         if (parseReuseFilterPredUnionSemanticKey(layout.payloadSemanticKeys[i], qIdx)) {
+         llvm::StringRef semantic;
+         if (i < layout.payloadSemanticKeys.size()) semantic = layout.payloadSemanticKeys[i];
+         if (parseReuseFilterPredUnionSemanticKey(semantic, qIdx)) {
             unionPredMembers.push_back(layout.payloadMembers[i]);
             continue;
          }
-         if (!parseReuseFilterPredSemanticKey(layout.payloadSemanticKeys[i], qIdx)) continue;
-         auto itH = hivByQuery.find(qIdx);
-         auto itR = reuseInfoByQuery.find(qIdx);
-         auto itM = moduleByQuery.find(qIdx);
-         assert(itH != hivByQuery.end() && itR != reuseInfoByQuery.end() && itM != moduleByQuery.end() &&
-                "insertSyntheticFilterPredsForGroups: filter_pred slot must belong to the match group");
+         if (!parseReuseFilterPredSemanticKey(semantic, qIdx)) {
+            auto slot = parseFilterPredMemberSlot(mm.getName(layout.payloadMembers[i]));
+            if (!slot) continue;
+            qIdx = *slot;
+         }
+         auto itH = hivBySlot.find(qIdx);
+         auto itR = reuseInfoBySlot.find(qIdx);
+         auto itM = moduleBySlot.find(qIdx);
+         if (itH == hivBySlot.end() || itR == reuseInfoBySlot.end() || itM == moduleBySlot.end()) {
+            unionPredMembers.push_back(layout.payloadMembers[i]);
+            continue;
+         }
          predMembers[qIdx] = layout.payloadMembers[i];
          peerBuilds[qIdx] = findJoinBufferBuildStepForHiv(itM->second, itH->second, *itR->second);
          assert(peerBuilds.lookup(qIdx) &&
@@ -5296,9 +5546,7 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
       for (auto& kv : predMembers) predQueryIndices.push_back(kv.first);
       llvm::sort(predQueryIndices);
 
-      if (predQueryIndices.size() == 2 && predMembers[predQueryIndices[0]] &&
-          predMembers[predQueryIndices[1]] && peerBuilds[predQueryIndices[0]] &&
-          peerBuilds[predQueryIndices[1]]) {
+      if (predQueryIndices.size() >= 2) {
          subop::MaterializeOp mat = findJoinBufferMaterializeInStep(buildStep);
          assert(mat && "insertSyntheticFilterPredsForGroups: synthetic build step must materialize join buffer");
          llvm::DenseMap<unsigned, llvm::SmallVector<runtime::FilterDescription, 8>> simpleFilters;
@@ -5306,11 +5554,8 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
             auto peerFilters = decodeFiltersFromTableScanInExecutionStep(peerBuilds[qIdx]);
             simpleFilters[qIdx] = restrictFiltersToTableScanInExecutionStep(buildStep, peerFilters);
          }
-         unsigned q0 = predQueryIndices[0];
-         unsigned q1 = predQueryIndices[1];
-         if (rewriteSyntheticResidualFiltersAsFilterPreds(buildStep, peerBuilds[q0], peerBuilds[q1], mat,
-                                                          q0, q1, predMembers[q0], predMembers[q1],
-                                                          simpleFilters[q0], simpleFilters[q1])) {
+         if (rewriteSyntheticResidualFiltersAsFilterPredsForSlots(buildStep, predQueryIndices, peerBuilds, mat,
+                                                                  predMembers, simpleFilters)) {
             for (subop::Member unionPredMember : unionPredMembers) {
                materializeConstantTruePredMemberOnBufferMaterialize(
                   mat, mm.getName(unionPredMember), /*updateStreamOperand=*/true);
@@ -5590,8 +5835,17 @@ void extendSyntheticJoinBuffersToColumnUnionForGroups(
       for (const CrossQueryStateMatchEntry& entry : group.entries) {
          if (&entry == donor) continue;
          if (entry.query < 0 || static_cast<size_t>(entry.query) >= queries.size() || !entry.state) continue;
+         if (group.enableFilterPredReuse && reuseSlotForEntry(entry) == reuseSlotForEntry(*donor)) continue;
          firstPeer = &entry;
          break;
+      }
+      if (!firstPeer) {
+         for (const CrossQueryStateMatchEntry& entry : group.entries) {
+            if (&entry == donor) continue;
+            if (entry.query < 0 || static_cast<size_t>(entry.query) >= queries.size() || !entry.state) continue;
+            firstPeer = &entry;
+            break;
+         }
       }
       if (!firstPeer) continue;
 
@@ -5613,15 +5867,17 @@ void extendSyntheticJoinBuffersToColumnUnionForGroups(
 
       JoinBufferUnionPlan plan =
          buildUnionPlan(hivDonor, hivPeer, reuseDonor, reusePeer, queries[donor->query],
-                        queries[firstPeer->query], static_cast<unsigned>(donor->query),
-                        static_cast<unsigned>(firstPeer->query), group.enableFilterPredReuse);
+                        queries[firstPeer->query], reuseSlotForEntry(*donor),
+                        reuseSlotForEntry(*firstPeer), /*enableFilterPredReuse=*/false);
       if (group.enableFilterPredReuse) {
          llvm::SmallVector<unsigned, 8> queryIndices;
+         llvm::DenseSet<unsigned> seenSlots;
          for (const CrossQueryStateMatchEntry& entry : group.entries) {
             if (entry.query < 0 || static_cast<size_t>(entry.query) >= queries.size()) continue;
-            auto qIdx = static_cast<unsigned>(entry.query);
-            queryIndices.push_back(qIdx);
-            ensureReuseFilterPredColumn(plan, qIdx, synthetic.getContext());
+            unsigned slot = reuseSlotForEntry(entry);
+            if (!seenSlots.insert(slot).second) continue;
+            queryIndices.push_back(slot);
+            ensureReuseFilterPredColumn(plan, slot, synthetic.getContext());
          }
          unsigned unionSlot = filterPredUnionSlotForQueryIndices(queryIndices);
          if (unionSlot < 8) {
@@ -5790,9 +6046,13 @@ void extendSyntheticAggregateHashTablesToPayloadUnionForGroups(
          if (!e.state) continue;
          assert(mlir::isa<subop::PreAggrHtType>(e.state.getType()) &&
                 "aggregate union group must contain optimistic_ht states");
+         if (!tryFindAggregateBuildStepForHt(e.state, collectModuleReuseInfo(queries[e.query]))) {
+            donor = nullptr;
+            break;
+         }
          if (!donor || e.query < donor->query) donor = &e;
       }
-      assert(donor && "aggregate union group must have a donor entry");
+      if (!donor) continue;
 
       CachedAggregateLayout layout;
       layout.producerHt = mlir::cast<subop::PreAggrHtType>(t.state.getType());
@@ -5813,6 +6073,7 @@ void extendSyntheticAggregateHashTablesToPayloadUnionForGroups(
          if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
          AggregatePeerRewriteInput peer;
          peer.queryId = static_cast<unsigned>(e.query);
+         peer.filterSlot = reuseSlotForEntry(e);
          peer.module = queries[e.query];
          peer.state = e.state;
          peer.reuse = collectModuleReuseInfo(peer.module);
@@ -5822,15 +6083,17 @@ void extendSyntheticAggregateHashTablesToPayloadUnionForGroups(
       }
       assert(!peers.empty() && "aggregate union group must have peer entries");
       applySyntheticAggregatePayloadUnion(synthetic, t.state, layout, peers, reuseSynthetic,
-                                          static_cast<unsigned>(donor->query));
+                                          reuseSlotForEntry(*donor));
       if (outLayouts) (*outLayouts)[t.cacheKey] = std::move(layout);
    }
 }
 
 void alignConsumerModulesToCachedAggregateLayout(mlir::ModuleOp consumer, const CachedAggregateLayout& layout,
                                                  std::optional<uint64_t> cacheKey,
-                                                 std::optional<unsigned> consumerReuseQueryIndex) {
+                                                 std::optional<unsigned> consumerReuseQueryIndex,
+                                                 std::optional<unsigned> consumerReuseFilterSlot) {
    if (!consumerReuseQueryIndex) return;
+   if (!consumerReuseFilterSlot) consumerReuseFilterSlot = consumerReuseQueryIndex;
    auto* ctx = consumer.getContext();
    ConsumerAggregateAlignment alignment =
       buildConsumerAggregateAlignment(layout, *consumerReuseQueryIndex, ctx);
@@ -5875,7 +6138,7 @@ void alignConsumerModulesToCachedAggregateLayout(mlir::ModuleOp consumer, const 
          ref.getColumn().type = alignedEntryRef;
          scan.setRefAttr(ref);
          if (layout.mixedByQueryId) insertAggregateQueryIdConsumerFilter(scan, alignment.queryIdMember,
-                                                                         *consumerReuseQueryIndex);
+                                                                         *consumerReuseFilterSlot);
       });
       consumer.walk([&](subop::GatherOp gather) {
          auto refTy = mlir::dyn_cast<subop::PreAggrHTEntryRefType>(gather.getRef().getColumn().type);

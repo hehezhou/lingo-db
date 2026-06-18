@@ -1886,18 +1886,19 @@ void materializeConstantTruePredMemberOnBufferMaterialize(subop::MaterializeOp m
    }
    assert(predMember);
 
-   mlir::Value feedForPred = matOp.getStream();
-   while (mlir::Operation* def = feedForPred.getDefiningOp()) {
-      auto mapOp = mlir::dyn_cast<subop::MapOp>(def);
-      if (!mapOp || mapOp.getComputedCols().size() != 1) break;
-      auto defAttr = mlir::cast<tuples::ColumnDefAttr>(mapOp.getComputedCols()[0]);
-      if (!mlir::isa<mlir::IntegerType>(defAttr.getColumn().type)) break;
-      feedForPred = mapOp.getStream();
+   for (auto& pr : matOp.getMapping().getMapping()) {
+      if (pr.first == predMember) return;
    }
+
+   mlir::Value feedForPred = matOp.getStream();
 
    mlir::OpBuilder pb(matOp);
    mlir::Location loc = matOp.getLoc();
-   pb.setInsertionPointAfter(feedForPred.getDefiningOp() ? feedForPred.getDefiningOp() : matOp.getOperation());
+   if (mlir::Operation* defOp = feedForPred.getDefiningOp()) {
+      pb.setInsertionPointAfter(defOp);
+   } else {
+      pb.setInsertionPoint(matOp);
+   }
    std::string scopeSeed = "reuse_write_pred_const";
    if (auto slot = parseFilterPredMemberSlot(predMemberName)) scopeSeed = ("reuse_write_pred_const$" + llvm::Twine(*slot)).str();
    std::string sc = cm.getUniqueScope(scopeSeed);

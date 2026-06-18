@@ -28,11 +28,7 @@ class HashIndexedView {
 
    public:
    static HashIndexedView* build(GrowingBuffer* buffer);
-   static HashIndexedView* buildWithPredFlags(GrowingBuffer* buffer, size_t predSlotCount,
-                                              size_t filterPred0Offset, size_t filterPred1Offset,
-                                              size_t filterPred2Offset, size_t filterPred3Offset,
-                                              size_t filterPred4Offset, size_t filterPred5Offset,
-                                              size_t filterPred6Offset, size_t filterPred7Offset);
+   static HashIndexedView* buildWithPredFlagOffsets(GrowingBuffer* buffer, size_t predSlotCount, const size_t* filterPredOffsets);
    static void destroy(HashIndexedView*);
    ~HashIndexedView();
 };

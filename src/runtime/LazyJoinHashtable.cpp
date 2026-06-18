@@ -4,13 +4,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <vector>
 
 namespace {
 static lingodb::utility::Tracer::Event buildEvent("HashIndexedView", "build");
 } // end namespace
 lingodb::runtime::HashIndexedView* lingodb::runtime::HashIndexedView::buildInternal(lingodb::runtime::GrowingBuffer* buffer, size_t predSlotCount, const size_t* filterPredOffsets) {
    utility::Tracer::Trace trace(buildEvent);
-   assert(predSlotCount <= 8 && "HashIndexedView::buildWithPredFlags currently accepts up to 8 predicate offsets");
    auto* executionContext = lingodb::runtime::getCurrentExecutionContext();
    auto& values = buffer->getValues();
    size_t htSize = std::max(nextPow2(values.getLen() * 1.25), static_cast<uint64_t>(1));
@@ -24,15 +24,16 @@ lingodb::runtime::HashIndexedView* lingodb::runtime::HashIndexedView::buildInter
       std::atomic_ref<Entry*> slot(htView->ht[pos]);
       Entry* current = slot.load();
       Entry* newEntry;
-      uint64_t predSelectors = 0;
+      thread_local std::vector<uint64_t> predSelectorWords;
       if (predSlotCount) {
+         predSelectorWords.assign((predSlotCount + 63) / 64, 0);
          for (size_t predOrdinal = 0; predOrdinal < predSlotCount; ++predOrdinal) {
-            if (*(ptr + filterPredOffsets[predOrdinal])) predSelectors |= (uint64_t{1} << predOrdinal);
+            if (*(ptr + filterPredOffsets[predOrdinal])) predSelectorWords[predOrdinal / 64] |= (uint64_t{1} << (predOrdinal % 64));
          }
       }
       do {
          entry->next = lingodb::runtime::untag(current);
-         newEntry = predSlotCount ? lingodb::runtime::tagWithFilterPreds(entry, current, hash, predSelectors, predSlotCount) : lingodb::runtime::tag(entry, current, hash);
+         newEntry = predSlotCount ? lingodb::runtime::tagWithFilterPredWords(entry, current, hash, predSelectorWords.data(), predSlotCount) : lingodb::runtime::tag(entry, current, hash);
       } while (!slot.compare_exchange_weak(current, newEntry));
    });
    trace.stop();
@@ -41,14 +42,8 @@ lingodb::runtime::HashIndexedView* lingodb::runtime::HashIndexedView::buildInter
 lingodb::runtime::HashIndexedView* lingodb::runtime::HashIndexedView::build(lingodb::runtime::GrowingBuffer* buffer) {
    return buildInternal(buffer, 0, nullptr);
 }
-lingodb::runtime::HashIndexedView* lingodb::runtime::HashIndexedView::buildWithPredFlags(lingodb::runtime::GrowingBuffer* buffer, size_t predSlotCount,
-                                                                                         size_t filterPred0Offset, size_t filterPred1Offset,
-                                                                                         size_t filterPred2Offset, size_t filterPred3Offset,
-                                                                                         size_t filterPred4Offset, size_t filterPred5Offset,
-                                                                                         size_t filterPred6Offset, size_t filterPred7Offset) {
-   size_t offsets[] = {filterPred0Offset, filterPred1Offset, filterPred2Offset, filterPred3Offset,
-                       filterPred4Offset, filterPred5Offset, filterPred6Offset, filterPred7Offset};
-   return buildInternal(buffer, predSlotCount, offsets);
+lingodb::runtime::HashIndexedView* lingodb::runtime::HashIndexedView::buildWithPredFlagOffsets(lingodb::runtime::GrowingBuffer* buffer, size_t predSlotCount, const size_t* filterPredOffsets) {
+   return buildInternal(buffer, predSlotCount, filterPredOffsets);
 }
 void lingodb::runtime::HashIndexedView::destroy(lingodb::runtime::HashIndexedView* ht) {
    delete ht;

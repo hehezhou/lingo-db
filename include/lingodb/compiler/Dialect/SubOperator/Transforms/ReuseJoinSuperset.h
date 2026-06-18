@@ -68,6 +68,10 @@ double estimateMergedHivExternalFilterRows(mlir::ModuleOp query0, mlir::ModuleOp
                                            const ModuleReuseInfo& reuse1,
                                            lingodb::catalog::Catalog& catalog);
 
+/// Current aggregate union rewrite supports a single top-level reduce build step. Nested aggregate builds
+/// require explicit tuple-column threading before they can be safely reused across disjoint filters.
+bool aggregateHashTablePayloadUnionSupported(mlir::Value aggregateState, const ModuleReuseInfo& reuse);
+
 /// Per \c cache_get: aligned HIV + SSA closure of probe-side uses (lookup → scan_list), same discovery as
 /// \c alignConsumerModulesToCachedJoinLayout.
 struct ConsumerCacheGetProbeClosure {
@@ -127,12 +131,18 @@ void alignConsumerModulesToCachedJoinLayout(mlir::ModuleOp consumer, const Cache
 
 void alignConsumerModulesToCachedAggregateLayout(mlir::ModuleOp consumer, const CachedAggregateLayout& layout,
                                                  std::optional<uint64_t> cacheKey = std::nullopt,
-                                                 std::optional<unsigned> consumerReuseQueryIndex = std::nullopt);
+                                                 std::optional<unsigned> consumerReuseQueryIndex = std::nullopt,
+                                                 std::optional<unsigned> consumerReuseFilterSlot = std::nullopt);
 
 /// After \c extendSyntheticJoinBuffersToColumnUnion, record table→buffer build steps in cloned synthetic IR.
 ClonedJoinBufferBuildSitesByKey recordClonedJoinBufferBuildSites(mlir::ModuleOp synthetic,
                                                                  llvm::ArrayRef<CacheTarget> targetsInSynthetic,
                                                                  const ModuleReuseInfo& reuseSynthetic);
+
+/// Refresh \c syntheticHiv values after layout/type rewrites while preserving the already chosen build step.
+void refreshClonedJoinBufferBuildSiteStates(mlir::ModuleOp synthetic,
+                                            ClonedJoinBufferBuildSitesByKey& buildSites,
+                                            const ModuleReuseInfo& reuseSynthetic);
 
 /// Materialize each per-query \c filter_pred$N on the synthetic join-buffer writer (table descr → MLIR after
 /// \c scan_refs). Requires union layout and \p buildSites from \c recordClonedJoinBufferBuildSites.

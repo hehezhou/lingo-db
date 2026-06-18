@@ -226,16 +226,17 @@ T* tag(T* ptr, T* previousPtr, size_t hash) {
    return res;
 }
 template <typename T>
-T* tagWithFilterPreds(T* ptr, T* previousPtr, size_t hash, uint64_t predSelectors, uint64_t predSlotCount) {
+T* tagWithFilterPredWords(T* ptr, T* previousPtr, size_t hash, const uint64_t* predSelectorWords, uint64_t predSlotCount) {
    auto asInt = reinterpret_cast<uintptr_t>(ptr);
    uint16_t previousTag = reinterpret_cast<uintptr_t>(previousPtr);
    uint16_t currentTag = bloomMasks[hash >> (64 - 11)];
    if (useFilterPredBloomAdaptation) {
-      currentTag = 0;
-      for (uint64_t predOrdinal = 0; predOrdinal < predSlotCount && predOrdinal < 64; ++predOrdinal) {
-         if (predSelectors & (uint64_t{1} << predOrdinal))
-            currentTag |= predBloomTag(hash, predOrdinal, predSlotCount);
+      uint16_t predTag = 0;
+      for (uint64_t predOrdinal = 0; predOrdinal < predSlotCount; ++predOrdinal) {
+         if (predSelectorWords[predOrdinal / 64] & (uint64_t{1} << (predOrdinal % 64)))
+            predTag |= predBloomTag(hash, predOrdinal, predSlotCount);
       }
+      currentTag |= predTag;
    }
    return reinterpret_cast<T*>(asInt << 16 | (currentTag | previousTag));
 }
