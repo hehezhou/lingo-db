@@ -62,6 +62,10 @@ struct CrossQueryStateMatchGroup {
    bool enableFilterPredReuse = true;
    /// True only when matched HIV payload layouts differ and need union layout rewrite.
    bool requiresJoinLayoutUnion = false;
+   /// True when the matched states cannot be unioned into one physical state. The synthetic
+   /// producer must share the pre-materialize build stream, then materialize one output state per
+   /// logical reuse slot and cache each output under a derived per-slot cache key.
+   bool requiresSplitMaterialize = false;
    /// Cache keys this matched state depends on after previous fixed-point rewrite rounds.
    llvm::SmallVector<uint64_t, 4> cacheDeps;
 };

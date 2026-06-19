@@ -1572,6 +1572,12 @@ struct StepDagHasher {
    llvm::DenseMap<mlir::Value, uint64_t> memo;
    llvm::DenseMap<const lingodb::compiler::dialect::tuples::Column*, uint64_t> columnHashByColumn;
    llvm::DenseMap<const lingodb::compiler::dialect::tuples::Column*, mlir::Value> refStateByColumn;
+   struct ColumnSource {
+      enum class Kind { Unknown, Single, Mixed };
+      Kind kind = Kind::Unknown;
+      mlir::Value state;
+   };
+   llvm::DenseMap<const lingodb::compiler::dialect::tuples::Column*, ColumnSource> columnSourceByColumn;
    llvm::DenseMap<mlir::Value, uint64_t> regionValueHashByValue;
    llvm::DenseMap<const void*, uint64_t>* outColumnHashByColumn = nullptr;
    using SelectedColumnSet = llvm::SmallSet<uint64_t, 8>;
@@ -1588,7 +1594,7 @@ struct StepDagHasher {
    }
 
    bool targetAllowsResidualTableFilterSkip() const {
-      return mlir::isa_and_nonnull<subop::HashIndexedViewType>(targetStateType);
+      return mlir::isa_and_nonnull<subop::HashIndexedViewType, subop::ResultTableType>(targetStateType);
    }
 
    subop::MemberManager& memberManagerForType(mlir::Type t) const {
@@ -1807,9 +1813,50 @@ struct StepDagHasher {
       if (outColumnHashByColumn) (*outColumnHashByColumn)[&def.getColumn()] = h;
    }
 
+   void defineColumnSource(lingodb::compiler::dialect::tuples::ColumnDefAttr def, ColumnSource source) {
+      columnSourceByColumn[&def.getColumn()] = source;
+   }
+
+   ColumnSource singleColumnSource(mlir::Value state) const {
+      assert(state && "single column source requires a state");
+      return ColumnSource{ColumnSource::Kind::Single, canonicalizeStateValueDeep(state)};
+   }
+
+   ColumnSource mixedColumnSource() const {
+      return ColumnSource{ColumnSource::Kind::Mixed, mlir::Value{}};
+   }
+
+   ColumnSource columnSourceFor(lingodb::compiler::dialect::tuples::ColumnRefAttr ref) const {
+      auto it = columnSourceByColumn.find(&ref.getColumn());
+      if (it == columnSourceByColumn.end()) return ColumnSource{};
+      return it->second;
+   }
+
+   ColumnSource combineColumnSources(llvm::ArrayRef<ColumnSource> sources) const {
+      std::optional<mlir::Value> state;
+      bool sawSingle = false;
+      for (ColumnSource source : sources) {
+         if (source.kind != ColumnSource::Kind::Single) return mixedColumnSource();
+         mlir::Value s = canonicalizeStateValueDeep(source.state);
+         if (!s) return mixedColumnSource();
+         if (!state) {
+            state = s;
+            sawSingle = true;
+            continue;
+         }
+         if (*state != s) return mixedColumnSource();
+      }
+      if (!sawSingle) return mixedColumnSource();
+      return singleColumnSource(*state);
+   }
+
    void defineRefColumn(lingodb::compiler::dialect::tuples::ColumnDefAttr def, uint64_t h, mlir::Value state) {
       defineColumn(def, h);
-      if (state) refStateByColumn[&def.getColumn()] = canonicalizeStateValueDeep(state);
+      if (state) {
+         mlir::Value canon = canonicalizeStateValueDeep(state);
+         refStateByColumn[&def.getColumn()] = canon;
+         defineColumnSource(def, singleColumnSource(canon));
+      }
    }
 
    uint64_t hashColumnRef(lingodb::compiler::dialect::tuples::ColumnRefAttr ref) {
@@ -1932,6 +1979,7 @@ struct StepDagHasher {
          for (auto& [member, colDef] : gather.getMapping().getMapping()) {
             uint64_t colH = hashStateMemberColumn(refState, member, colDef.getColumn().type);
             defineColumn(colDef, colH);
+            defineColumnSource(colDef, singleColumnSource(refState));
             bool isJoinKey = joinKeyColumnAttrHashes->contains(colH);
             if (!isJoinKey && joinKeyColumnIdentifiersSanitized && columnManager) {
                auto [scope, name] = columnManager->getName(&colDef.getColumn());
@@ -1964,6 +2012,20 @@ struct StepDagHasher {
       return findUniqueMaterializeForStatesInStep(step, *targetConstructionStates, multiple);
    }
 
+   bool filterPredicateColumnsOnlyFromSourceState(subop::MapOp map, subop::FilterOp filter,
+                                                  mlir::Value sourceState) {
+      assert(sourceState && "residual relaxation requires a stream source state");
+      sourceState = canonicalizeStateValueDeep(sourceState);
+      hashMapOp(map);
+      for (auto attr : filter.getConditions()) {
+         auto cond = mlir::cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(attr);
+         ColumnSource source = columnSourceFor(cond);
+         if (source.kind != ColumnSource::Kind::Single) return false;
+         if (canonicalizeStateValueDeep(source.state) != sourceState) return false;
+      }
+      return true;
+   }
+
    bool isRelaxedResidualFilterOnTargetMaterializeChain(subop::FilterOp filter, subop::MapOp& predMap) {
       if (!targetAllowsResidualTableFilterSkip()) return false;
       subop::MaterializeOp mat = findUniqueTargetMaterialize();
@@ -1971,6 +2033,7 @@ struct StepDagHasher {
       ResidualMaterializeStreamTrace trace = traceResidualFilterOnMaterializeStream(step, mat);
       if (trace.split || trace.unsupported || !trace.filter) return false;
       if (trace.filter != filter) return false;
+      if (!filterPredicateColumnsOnlyFromSourceState(trace.predMap, trace.filter, trace.sourceState)) return false;
       predMap = trace.predMap;
       return static_cast<bool>(predMap);
    }
@@ -1987,10 +2050,14 @@ struct StepDagHasher {
    uint64_t hashMapOp(subop::MapOp map) {
       uint64_t upstream = hashValue(map.getStream());
       llvm::SmallVector<uint64_t, 8> inputHashes;
+      llvm::SmallVector<ColumnSource, 8> inputSources;
       inputHashes.reserve(map.getInputCols().size());
       for (auto attr : map.getInputCols()) {
-         inputHashes.push_back(hashColumnRef(mlir::cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(attr)));
+         auto ref = mlir::cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(attr);
+         inputHashes.push_back(hashColumnRef(ref));
+         inputSources.push_back(columnSourceFor(ref));
       }
+      ColumnSource mapSource = combineColumnSources(inputSources);
       bindRegionArgs(map.getFn(), inputHashes);
 
       auto ret = mlir::cast<tuples::ReturnOp>(map.getFn().front().getTerminator());
@@ -2009,6 +2076,7 @@ struct StepDagHasher {
          for (uint64_t inH : sortedInputHashes) colH = hashCombineU64(colH, inH);
          colH = hashCombineU64(colH, hashMlirType(def.getColumn().type));
          defineColumn(def, colH);
+         defineColumnSource(def, mapSource);
       }
       return upstream;
    }
@@ -2034,6 +2102,7 @@ struct StepDagHasher {
       for (auto& [member, colDef] : scan.getMapping().getMapping()) {
          uint64_t colH = hashStateMemberColumn(state, member, colDef.getColumn().type);
          defineColumn(colDef, colH);
+         defineColumnSource(colDef, singleColumnSource(state));
          h = hashCombineU64(h, colH);
       }
       return h;
@@ -2076,6 +2145,7 @@ struct StepDagHasher {
       for (auto& [member, colDef] : gather.getMapping().getMapping()) {
          uint64_t colH = hashStateMemberColumn(state, member, colDef.getColumn().type);
          defineColumn(colDef, colH);
+         defineColumnSource(colDef, singleColumnSource(state));
       }
       return h;
    }
@@ -2087,8 +2157,10 @@ struct StepDagHasher {
          assert(def.getFromExisting() && "renaming columns must carry fromExisting");
          auto arr = mlir::dyn_cast<mlir::ArrayAttr>(def.getFromExisting());
          assert(arr && arr.size() == 1 && "renaming fromExisting must be a single column ref");
-         uint64_t fromH = hashColumnRef(mlir::cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(arr[0]));
+         auto from = mlir::cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(arr[0]);
+         uint64_t fromH = hashColumnRef(from);
          defineColumn(def, fromH);
+         defineColumnSource(def, columnSourceFor(from));
       }
       return h;
    }
@@ -3290,6 +3362,16 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
       prof.depTokensSorted.assign(depElig.depTokensSorted.begin(), depElig.depTokensSorted.end());
 
       if (prof.eligible) {
+         bool hasAnyResidualFilter =
+            constructionHasResidualFilter(state, module, constructionStepIndices, module.stepByIndex,
+                                          /*requireSupported*/ false);
+         prof.hasResidualTableFilter =
+            constructionHasResidualFilter(state, module, constructionStepIndices, module.stepByIndex,
+                                          /*requireSupported*/ true);
+         prof.hasComplexResidualTableFilter =
+            constructionHasComplexResidualTableFilter(state, module, constructionStepIndices,
+                                                      module.stepByIndex);
+         prof.hasUnsupportedResidualTableFilter = hasAnyResidualFilter && !prof.hasResidualTableFilter;
          if (mlir::isa<subop::HashIndexedViewType>(state.getType())) {
             JoinHivMatchDetails joinHivDetails = computeJoinHivMatchDetails(
                state, mlir::cast<subop::HashIndexedViewType>(state.getType()), memberManager,
@@ -3297,16 +3379,6 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
                module.stepByIndex);
             relaxJoinHivDepTokensInProfile(prof.depTokensSorted, joinHivDetails,
                                            module.reuse.externalDatasourceByTableState, tableDescrByTableState);
-            bool hasAnyResidualFilter =
-               constructionHasResidualFilter(state, module, constructionStepIndices, module.stepByIndex,
-                                             /*requireSupported*/ false);
-            prof.hasResidualTableFilter =
-               constructionHasResidualFilter(state, module, constructionStepIndices, module.stepByIndex,
-                                             /*requireSupported*/ true);
-            prof.hasComplexResidualTableFilter =
-               constructionHasComplexResidualTableFilter(state, module, constructionStepIndices,
-                                                         module.stepByIndex);
-            prof.hasUnsupportedResidualTableFilter = hasAnyResidualFilter && !prof.hasResidualTableFilter;
          }
          StateConstructionMatchHashes hashes = computeEligibleStateMatchHashes(
             state, constructionStepIndices, module, tableDescrByTableState, stateHashEnv, memberManager,
@@ -4538,6 +4610,10 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
       }
       return deps + "@@type=" + p.typeFingerprintStr + "@@hiv_relaxed";
    };
+   auto makeSplitMaterializeKeyStr = [](const StateMatchProfile& p) -> std::string {
+      return aggregateDependencyNoFilterFingerprint(p.depTokensSorted) + "@@type=" + p.typeFingerprintStr +
+             "@@h=" + std::to_string(p.constructionHash) + "@@split_materialize";
+   };
    auto complexResidualMatchAllowed = [&](const StateMatchProfile& a, const QueryModel* modelA,
                                           const StateMatchProfile& b, const QueryModel* modelB) {
       if (!a.hasComplexResidualTableFilter && !b.hasComplexResidualTableFilter) return true;
@@ -4581,6 +4657,15 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
       appendToBucket(hivProfilesByRelaxedHash, hivRelaxedHashOrder, hash, p);
    }
 
+   ProfileBucketMap splitMaterializeProfilesByRelaxedHash;
+   llvm::SmallVector<uint64_t, 32> splitMaterializeRelaxedHashOrder;
+   for (auto* p : all) {
+      if (!mlir::isa<subop::ResultTableType>(p->value.getType())) continue;
+      std::string k = makeSplitMaterializeKeyStr(*p);
+      uint64_t hash = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
+      appendToBucket(splitMaterializeProfilesByRelaxedHash, splitMaterializeRelaxedHashOrder, hash, p);
+   }
+
    llvm::SmallVector<CrossQueryStateMatchGroup, 64> out;
    llvm::DenseSet<mlir::Value> matchedStates;
 
@@ -4621,20 +4706,26 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
          }
       }
       bool allHiv = true;
+      bool allResultTable = true;
       bool sameStoredHivLayout = true;
       std::optional<std::string> firstStoredHivLayout;
       for (const StateMatchProfile* p : members) {
          if (!mlir::isa<subop::HashIndexedViewType>(p->value.getType())) {
             allHiv = false;
-            break;
          }
-         if (!firstStoredHivLayout) {
-            firstStoredHivLayout = p->storedValueMembersFingerprint;
-         } else if (*firstStoredHivLayout != p->storedValueMembersFingerprint) {
-            sameStoredHivLayout = false;
+         if (!mlir::isa<subop::ResultTableType>(p->value.getType())) {
+            allResultTable = false;
+         }
+         if (mlir::isa<subop::HashIndexedViewType>(p->value.getType())) {
+            if (!firstStoredHivLayout) {
+               firstStoredHivLayout = p->storedValueMembersFingerprint;
+            } else if (*firstStoredHivLayout != p->storedValueMembersFingerprint) {
+               sameStoredHivLayout = false;
+            }
          }
       }
       if (allHiv && !sameStoredHivLayout) g.requiresJoinLayoutUnion = true;
+      if (allResultTable && enableFilterPredReuse) g.requiresSplitMaterialize = true;
       bool needsFilterPredReuse = enableFilterPredReuse;
       if (needsFilterPredReuse && allHiv) {
          needsFilterPredReuse = false;
@@ -4659,6 +4750,10 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
       }
       g.enableFilterPredReuse = needsFilterPredReuse;
       if (allHiv && needsFilterPredReuse) g.requiresJoinLayoutUnion = true;
+      if (g.requiresSplitMaterialize) {
+         g.enableFilterPredReuse = false;
+         g.requiresJoinLayoutUnion = false;
+      }
       for (const StateMatchProfile* p : members) {
          unsigned reuseSlot = static_cast<unsigned>(p->queryId);
          if (reuseSlotByProfile) {
@@ -5105,6 +5200,26 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
             return true;
          },
          makeKeyStr, /*enableFilterPredReuse=*/true);
+   }
+
+   for (uint64_t hash : splitMaterializeRelaxedHashOrder) {
+      auto bucketIt = splitMaterializeProfilesByRelaxedHash.find(hash);
+      assert(bucketIt != splitMaterializeProfilesByRelaxedHash.end());
+      auto& bucket = bucketIt->second;
+      appendGroupFromBucket(
+         bucket,
+         [](const StateMatchProfile& p) {
+            return mlir::isa<subop::ResultTableType>(p.value.getType());
+         },
+         [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+            if (!mlir::isa<subop::ResultTableType>(b.value.getType())) return false;
+            if (a.hasUnsupportedResidualTableFilter || b.hasUnsupportedResidualTableFilter) return false;
+            if (a.constructionHash != b.constructionHash) return false;
+            if (a.typeFingerprintStr != b.typeFingerprintStr) return false;
+            return aggregateDependencyNoFilterFingerprint(a.depTokensSorted) ==
+                   aggregateDependencyNoFilterFingerprint(b.depTokensSorted);
+         },
+         makeSplitMaterializeKeyStr, /*enableFilterPredReuse=*/true);
    }
 
    for (uint64_t hash : hivRelaxedHashOrder) {

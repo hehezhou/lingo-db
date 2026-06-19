@@ -692,8 +692,16 @@ static SubOpStateReuseBatchResult runSubOpStateReuseBatch(
       }
    }
 
-   for (auto& r : runs) result.verifyFailed |= mlir::failed(mlir::verify(r.module));
-   result.verifyFailed |= (rewriteRes.synthetic && mlir::failed(mlir::verify(*rewriteRes.synthetic)));
+   for (size_t i = 0; i < runs.size(); ++i) {
+      if (mlir::failed(mlir::verify(runs[i].module))) {
+         llvm::errs() << kToolName << ": MLIR verification failed in rewritten query[" << i << "]\n";
+         result.verifyFailed = true;
+      }
+   }
+   if (rewriteRes.synthetic && mlir::failed(mlir::verify(*rewriteRes.synthetic))) {
+      llvm::errs() << kToolName << ": MLIR verification failed in rewritten synthetic query\n";
+      result.verifyFailed = true;
+   }
    if (result.verifyFailed) {
       llvm::errs() << kToolName << ": MLIR verification failed after cross-query reuse rewrite"
                    << " (optimization_ms=" << result.optimizationMs << ")\n";
