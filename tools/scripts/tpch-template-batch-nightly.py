@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-MODES = ["reuse_off", "reuse_on_bloom_on", "reuse_on_bloom_off"]
+MODES = ["reuse_off", "reuse_on_bloom_on", "reuse_on_bloom_off", "reuse_on_bloom_on_no_hiv_disjoint"]
 
 TIMING_RE = re.compile(
     r"^//\s+timing:\s+optimization_ms=([0-9.eE+\-]+)\s+execution_time_ms=([0-9.eE+\-]+)\s*$",
@@ -143,6 +143,10 @@ def build_env(mode: str) -> Dict[str, str]:
         env["LINGODB_DISABLE_FILTER_PRED_BLOOM_ADAPTATION"] = "1"
     else:
         env.pop("LINGODB_DISABLE_FILTER_PRED_BLOOM_ADAPTATION", None)
+    if mode == "reuse_on_bloom_on_no_hiv_disjoint":
+        env["LINGODB_DISABLE_HIV_DISJOINT_CLUSTERING"] = "1"
+    else:
+        env.pop("LINGODB_DISABLE_HIV_DISJOINT_CLUSTERING", None)
     return env
 
 
@@ -256,8 +260,33 @@ def build_summary(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def annotate_mismatches(records: List[Dict[str, Any]]) -> None:
+    refs: Dict[Tuple[str, int, int, int], Dict[str, Any]] = {}
+    for r in records:
+        r.setdefault("exact_mismatches_vs_reuse_off", [])
+        r.setdefault("rowset_mismatches_vs_reuse_off", [])
+        r.setdefault("order_only_mismatches_vs_reuse_off", [])
+        r.setdefault("reference_missing", False)
+        if r.get("mode") == "reuse_off" and r.get("returncode") == 0:
+            refs[(r["db_label"], r["template"], r["batch_size"], r["rep"])] = r
+    for r in records:
+        if r.get("mode") == "reuse_off":
+            continue
+        ref = refs.get((r["db_label"], r["template"], r["batch_size"], r["rep"]))
+        if ref is None:
+            r["reference_missing"] = True
+            continue
+        rowset = r.get("result_rowset_block_hashes", [])
+        ref_rowset = ref.get("result_rowset_block_hashes", [])
+        r["rowset_mismatches_vs_reuse_off"] = mismatch_indices(rowset, ref_rowset)
+        # The in-process batch driver records rowset hashes only; exact output order is intentionally ignored.
+        r["exact_mismatches_vs_reuse_off"] = []
+        r["order_only_mismatches_vs_reuse_off"] = []
+
+
 def write_json(path: Path, meta: Dict[str, Any], records: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    annotate_mismatches(records)
     data = {
         "meta": {**meta, "updated_at_unix": time.time()},
         "records": records,
@@ -267,6 +296,108 @@ def write_json(path: Path, meta: Dict[str, Any], records: List[Dict[str, Any]]) 
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
     tmp.replace(path)
+
+
+def run_batch_driver_for_mode(
+    subop_binary: str,
+    db: str,
+    query_dir: Path,
+    mode: str,
+    templates: List[int],
+    batch_sizes: List[int],
+    repetitions: int,
+    out_path: Path,
+    timeout_s: int,
+) -> List[Dict[str, Any]]:
+    argv = [
+        subop_binary,
+        "--batch-nightly",
+        db,
+        "--mode",
+        mode,
+        "--query-dir",
+        str(query_dir),
+        "--out",
+        str(out_path),
+        "--templates",
+        ",".join(str(x) for x in templates),
+        "--batch-sizes",
+        ",".join(str(x) for x in batch_sizes),
+        "--repetitions",
+        str(repetitions),
+    ]
+    env = build_env(mode)
+    timeout = None if timeout_s <= 0 else timeout_s
+    proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=timeout)
+    stdout = proc.stdout.decode("utf-8", errors="replace")
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    if stderr:
+        print(stderr, end="", flush=True)
+    if proc.returncode != 0:
+        if stdout:
+            print("\n".join(stdout.splitlines()[-80:]), flush=True)
+        raise SystemExit(f"batch driver failed for db={db} mode={mode} rc={proc.returncode}")
+    with out_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("records", [])
+
+
+def run_batch_driver(args: argparse.Namespace) -> None:
+    dbs = parse_str_list(args.dbs)
+    templates = parse_int_list(args.templates)
+    batch_sizes = parse_int_list(args.batch_sizes)
+    modes = parse_str_list(args.modes)
+    for mode in modes:
+        if mode not in MODES:
+            raise SystemExit(f"unknown mode {mode}; expected one of {MODES}")
+    if "reuse_off" not in modes:
+        raise SystemExit("modes must include reuse_off because it is the correctness reference")
+
+    out_path = Path(args.out)
+    query_dir = Path(args.query_dir)
+    max_batch = max(batch_sizes)
+    for template in templates:
+        missing = [str(query_dir / f"q{template}_{i}.sql") for i in range(1, max_batch + 1)
+                   if not (query_dir / f"q{template}_{i}.sql").exists()]
+        if missing:
+            raise SystemExit(f"missing query files for template {template}: {missing[:5]}")
+
+    meta = {
+        "driver": "subop-state-reuse --batch-nightly",
+        "dbs": dbs,
+        "query_dir": args.query_dir,
+        "subop_binary": args.subop_binary,
+        "templates": templates,
+        "batch_sizes": batch_sizes,
+        "modes": modes,
+        "repetitions": args.repetitions,
+        "timeout_s": args.timeout_s,
+        "created_at_unix": time.time(),
+    }
+
+    records: List[Dict[str, Any]] = []
+    partial_dir = out_path.parent / "by-db-mode"
+    partial_dir.mkdir(parents=True, exist_ok=True)
+    for db in dbs:
+        db_label = make_db_label(db)
+        ordered_modes = ["reuse_off"] + [m for m in modes if m != "reuse_off"]
+        for mode in ordered_modes:
+            partial = partial_dir / f"{db_label}-{mode}.json"
+            if args.resume and partial.exists():
+                with partial.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                mode_records = data.get("records", [])
+                print(f"reuse existing {partial} ({len(mode_records)} records)", flush=True)
+            else:
+                print(f"run batch driver db={db_label} mode={mode}", flush=True)
+                mode_records = run_batch_driver_for_mode(
+                    args.subop_binary, db, query_dir, mode, templates, batch_sizes,
+                    args.repetitions, partial, args.timeout_s)
+            records.extend(mode_records)
+            write_json(out_path, meta, records)
+
+    write_json(out_path, meta, records)
+    print(f"wrote {out_path}")
 
 
 def main() -> None:
@@ -282,7 +413,12 @@ def main() -> None:
     ap.add_argument("--timeout-s", type=int, default=3600)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--progress-every", type=int, default=10)
+    ap.add_argument("--driver", choices=["batch", "legacy"], default="batch")
     args = ap.parse_args()
+
+    if args.driver == "batch":
+        run_batch_driver(args)
+        return
 
     dbs = parse_str_list(args.dbs)
     templates = parse_int_list(args.templates)

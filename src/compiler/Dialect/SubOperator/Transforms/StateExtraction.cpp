@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <string>
@@ -4489,6 +4490,7 @@ llvm::DenseMap<const void*, uint64_t> collectStateConstructionColumnHashes(mlir:
 llvm::SmallVector<CrossQueryStateMatchGroup, 64>
 collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> queries) {
    assert(queries.size() >= 2 && "need at least two modules to compare");
+   const bool disableHivDisjointClustering = std::getenv("LINGODB_DISABLE_HIV_DISJOINT_CLUSTERING") != nullptr;
 
    struct QueryModel {
       int id = -1;
@@ -5060,8 +5062,17 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
             members.push_back(b);
             seenQueries.insert(b->queryId);
          }
-      if (members.size() < 2) continue;
-      if (tryEmitIdenticalFilterSubgroupDisjointGroups(members, keyForSeed, enableFilterPredReuse)) continue;
+         if (members.size() < 2) continue;
+         const bool allHiv = llvm::all_of(members, [](const StateMatchProfile* p) {
+            return mlir::isa<subop::HashIndexedViewType>(p->value.getType());
+         });
+         if (!(disableHivDisjointClustering && allHiv) &&
+             tryEmitIdenticalFilterSubgroupDisjointGroups(members, keyForSeed, enableFilterPredReuse))
+            continue;
+         if (disableHivDisjointClustering && allHiv) {
+            emitMatchGroupCapped(members, *a, "", keyForSeed, enableFilterPredReuse);
+            continue;
+         }
          if (tryEmitSimpleFilterUnionFindClusteredGroups(members, keyForSeed, enableFilterPredReuse)) continue;
          emitMatchGroupCapped(members, *a, "", keyForSeed, enableFilterPredReuse);
       }
