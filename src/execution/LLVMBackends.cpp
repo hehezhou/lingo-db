@@ -44,6 +44,7 @@
 #include "llvm/Transforms/Scalar/GVN.h"
 
 #include <csignal>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <regex>
@@ -554,6 +555,17 @@ static bool lowerToLLVMDialect(mlir::ModuleOp& moduleOp, std::shared_ptr<executi
       pm2.addPass(mlir::createReconcileUnrealizedCastsPass());
       pm2.addPass(mlir::createCSEPass());
       if (mlir::failed(pm2.run(moduleOp))) {
+         if (const char* dumpDir = std::getenv("LINGODB_DUMP_LLVM_DIALECT_DIR")) {
+            std::string err;
+            std::string path = (llvm::Twine(dumpDir) + "/failed-lower-to-llvm.mlir").str();
+            auto file = mlir::openOutputFile(path, &err);
+            if (file) {
+               moduleOp.print(file->os());
+               file->keep();
+            } else {
+               llvm::errs() << "could not dump failed LLVM dialect module: " << err << "\n";
+            }
+         }
          return false;
       }
       return true;

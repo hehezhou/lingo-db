@@ -105,6 +105,13 @@ void extendSyntheticJoinBuffersToColumnUnionForGroups(
    llvm::ArrayRef<CacheTarget> targetsInSynthetic,
    CachedJoinBufferLayoutsByKey* outLayouts = nullptr);
 
+/// Some reused HIVs are built by probing an upstream mixed HIV. In that case the downstream HIV must
+/// inherit the upstream `filter_pred$N` slots so consumers can keep selecting their own slice.
+void extendSyntheticJoinBuffersWithInheritedMixedPreds(
+   mlir::ModuleOp synthetic, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+   CachedJoinBufferLayoutsByKey* outLayouts = nullptr,
+   llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t, 4>>* outInheritedDepsByCacheKey = nullptr);
+
 void extendSyntheticAggregateHashTablesToPayloadUnion(mlir::ModuleOp synthetic, mlir::ModuleOp query0,
                                                       mlir::ModuleOp query1,
                                                       llvm::ArrayRef<CrossQueryStateMatchPair> matches,
@@ -161,6 +168,10 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
 /// Retag cached HIV probe closures to MixedHIV so scan_list applies the stored filter_pred$N slot directly.
 void applyProbePredFiltersForConsumerClosures(mlir::ModuleOp consumer,
                                               llvm::MutableArrayRef<ConsumerCacheGetProbeClosure> probeClosures);
+
+/// For mixed HIV lookups whose state value comes from the given \c cache_get key, use \c filter_pred$slot as
+/// the lookup predicate key. The state source is found through execution-step/nested-group def-use ports.
+void setMixedLookupPredSlotForCacheGet(mlir::ModuleOp module, uint64_t cacheKey, unsigned slot);
 
 /// After \c insertCachePutsForTargets on the synthetic module, re-record layouts from \c cache_put
 /// state types (includes `filter_pred$0` when join-buffer pred reuse is enabled).

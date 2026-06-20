@@ -445,8 +445,30 @@ class EntryStorageHelper {
 
    void storeFromColumns(subop::ColumnRefMemberMappingAttr mapping, ColumnMapping& columnMapping, mlir::Value ref, mlir::OpBuilder& rewriter, mlir::Location loc) {
       auto values = getValueMap(ref, rewriter, loc);
+      auto& memberManager = members.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
       for (auto x : mapping.getMapping()) {
-         values.set(x.first, columnMapping.resolve(op, x.second));
+         Member member = x.first;
+         if (!memberInfos.contains(member)) {
+            auto name = memberManager.getName(member);
+            auto type = memberManager.getType(member);
+            auto isSameInternalRole = [&](subop::Member candidate) {
+               auto candidateName = memberManager.getName(candidate);
+               if (name.starts_with("hash$") && candidateName.starts_with("hash$")) return true;
+               if (name.starts_with("link$") && candidateName.starts_with("link$")) return true;
+               return false;
+            };
+            Member resolved;
+            for (auto candidate : members.getMembers()) {
+               if (memberManager.getType(candidate) == type &&
+                   (memberManager.getName(candidate) == name || isSameInternalRole(candidate))) {
+                  resolved = candidate;
+                  break;
+               }
+            }
+            if (!resolved) llvm_unreachable("materialize mapping member must exist in target state layout");
+            member = resolved;
+         }
+         values.set(member, columnMapping.resolve(op, x.second));
       }
       values.store();
    }
@@ -2730,8 +2752,11 @@ class LookupHashIndexedViewLowering : public SubOpTupleStreamConsumerConversionP
       Value refValid = mixed ? rewriter.create<util::IsRefValidOp>(loc, rewriter.getI1Type(), ptr).getResult()
                              : rewriter.create<util::PtrTagMatches>(loc, rewriter.getI1Type(), ptr, hash).getResult();
       mlir::Value lookupPred = rewriter.create<arith::ConstantIntOp>(loc, 1, 1);
-      if (mlir::isa<subop::MixedHashIndexedViewType>(lookupOp.getState().getType()) && lookupArgs.size() > 1) {
-         lookupPred = lookupArgs[1];
+      if (mlir::isa<subop::MixedHashIndexedViewType>(lookupOp.getState().getType())) {
+         for (mlir::Value predArg : llvm::drop_begin(lookupArgs, 1)) {
+            assert(predArg.getType().isInteger(1) && "mixed HIV lookup predicate key must be i1");
+            lookupPred = rewriter.create<arith::AndIOp>(loc, lookupPred, predArg);
+         }
       }
       if (mixed) {
          refValid = rewriter.create<arith::AndIOp>(loc, refValid, lookupPred);

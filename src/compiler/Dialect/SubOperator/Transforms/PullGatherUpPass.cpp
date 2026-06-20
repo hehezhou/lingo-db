@@ -21,13 +21,14 @@ class PullGatherUpPass : public mlir::PassWrapper<PullGatherUpPass, mlir::Operat
       });
       for (auto gatherOp : gatherOps) {
          auto remaining = gatherOp.getMapping().getMapping();
-         gatherOp.getRes().replaceAllUsesWith(gatherOp.getStream());
          auto* currentChild = gatherOp.getStream().getDefiningOp();
          mlir::Block* safeBlock = gatherOp->getBlock();
+         bool foundRefProducer = false;
          while (currentChild) {
             if (auto refProducer = mlir::dyn_cast_or_null<subop::ReferenceProducer>(currentChild)) {
                if (&refProducer.getProducedReference().getColumn() == &gatherOp.getRef().getColumn()) {
-                  mlir::Block* minimalSafeBlock = nullptr;
+                  foundRefProducer = true;
+                  mlir::Block* minimalSafeBlock = currentChild->getBlock();
                   for (auto operand : currentChild->getOperands()) {
                      if (!mlir::isa<tuples::TupleStreamType>(operand.getType())) {
                         mlir::Block* localSafeBlock;
@@ -49,6 +50,8 @@ class PullGatherUpPass : public mlir::PassWrapper<PullGatherUpPass, mlir::Operat
             }
             currentChild = currentChild->getNumOperands() == 1 ? currentChild->getOperand(0).getDefiningOp() : nullptr;
          }
+         if (!foundRefProducer) continue;
+         gatherOp.getRes().replaceAllUsesWith(gatherOp.getStream());
          mlir::Value currStream = gatherOp.getStream();
          gatherOp->setOperand(0, gatherOp.getResult());
          mlir::Operation* currentParent;
