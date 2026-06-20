@@ -27,9 +27,11 @@ struct CachedJoinBufferLayout {
    /// Per matched query: semantic keys present in that query's join-buffer build (pre-union).
    llvm::SmallVector<std::string> query0SemanticKeys;
    llvm::SmallVector<std::string> query1SemanticKeys;
+   llvm::DenseMap<unsigned, llvm::SmallVector<std::string, 8>> querySemanticKeysById;
    /// For each entry in \c query0SemanticKeys / \c query1SemanticKeys, index into the union-ordered arrays above.
    llvm::SmallVector<unsigned> query0SlotInUnion;
    llvm::SmallVector<unsigned> query1SlotInUnion;
+   llvm::DenseMap<unsigned, llvm::SmallVector<unsigned, 8>> querySlotInUnionById;
    /// Pre–\c cache_get probe \c gather member slots remapped to aligned \c cache_get HIV members.
    llvm::DenseMap<subop::Member, subop::Member> probeGatherMemberRemap;
 };

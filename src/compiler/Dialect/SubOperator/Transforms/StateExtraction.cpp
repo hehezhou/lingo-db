@@ -90,7 +90,7 @@ static std::string renderExternalDataSourceDescrMatchString(
          case FilterOp::NOTNULL: return "NOTNULL";
          case FilterOp::IN: return "IN";
       }
-      return "UNKNOWN";
+      llvm_unreachable("unknown runtime filter op");
    };
    auto filterValueToStr = [](const FilterDescription& f) -> std::string {
       std::string out;
@@ -389,8 +389,9 @@ static mlir::Value canonicalizeStateValueDeep(mlir::Value v) {
    while (true) {
       assert(v && "canonicalizeStateValueDeep called with null value");
       void* key = v.getAsOpaquePointer();
-      auto seenInsert = seen.insert(key);
-      assert(seenInsert.second && "canonicalizeStateValueDeep hit a cycle");
+      bool inserted = seen.insert(key).second;
+      (void)inserted;
+      assert(inserted && "canonicalizeStateValueDeep hit a cycle");
       auto step = findEnclosingExecutionStep(v);
       if (!step) {
          // Outside any execution_step: must be a func argument (external), otherwise missing mapping.
@@ -573,8 +574,9 @@ static StateDepEligibility resolveDepEligibilityRec(
    const llvm::DenseSet<mlir::Value>& transparentStates,
    const llvm::DenseMap<mlir::Value, std::string>& tableDescrByTableState, llvm::DenseSet<mlir::Value>& visiting) {
    mlir::Value stateCanon = canonicalizeStateValueDeep(state);
-   auto visitingInsert = visiting.insert(stateCanon);
-   assert(visitingInsert.second && "state dependency graph must be acyclic");
+   bool inserted = visiting.insert(stateCanon).second;
+   (void)inserted;
+   assert(inserted && "state dependency graph must be acyclic");
 
    llvm::ArrayRef<mlir::Value> preds = directPredecessorsInDepGraph(stateCanon, dag);
 
@@ -1016,8 +1018,7 @@ static mlir::Value findUpstreamLookupHashIndexedView(mlir::Value v) {
          for (mlir::Value op : def->getOperands()) stack.push_back(op);
       }
    }
-   assert(false && "could not trace SSA back to a subop state (lookup/list/entry-ref pipeline)");
-   return v;
+   llvm_unreachable("could not trace SSA back to a subop state (lookup/list/entry-ref pipeline)");
 }
 
 static std::optional<subop::LookupOp> findUniqueUpstreamLookupOp(mlir::Value v, bool& multiple) {
@@ -1208,8 +1209,9 @@ struct StateHashEnv {
       if (it != hashByState.end()) return it->second;
 
       if (transparentStates && depGraph && transparentStates->contains(state)) {
-         auto inserted = visiting.insert(state);
-         assert(inserted.second && "transparent state hash resolution must be acyclic");
+         bool inserted = visiting.insert(state).second;
+         (void)inserted;
+         assert(inserted && "transparent state hash resolution must be acyclic");
          llvm::SmallVector<uint64_t, 4> predHashes;
          for (mlir::Value pred : directPredecessorsInDepGraph(state, *depGraph)) {
             pred = canonicalizeStateValueDeep(pred);
@@ -1267,7 +1269,7 @@ static subop::CreateHashIndexedView findCreateHashIndexedViewForState(
       ws.walk([&](subop::CreateHashIndexedView op) { found = op; });
       if (found) return found;
    }
-   assert(false && "hash_indexed_view must be produced by create_hash_indexed_view");
+   llvm_unreachable("hash_indexed_view must be produced by create_hash_indexed_view");
 }
 
 static JoinHivMatchDetails computeJoinHivMatchDetails(
@@ -1445,6 +1447,7 @@ static bool residualPredicateMapSupportedForRelaxedHiv(subop::MapOp map,
          break;
       }
       assert(found && "residual predicate condition must be produced by predicate map");
+      (void)found;
    }
    return true;
 }
@@ -1507,8 +1510,10 @@ static mlir::Value scanLikeSourceState(mlir::Operation* op) {
 
 struct ResidualMaterializeStreamTrace {
    mlir::Value sourceState;
+   mlir::Operation* scanLike = nullptr;
    subop::MapOp predMap;
    subop::FilterOp filter;
+   bool relaxedMixedScan = false;
    bool split = false;
    bool unsupported = false;
    bool complex = false;
@@ -1540,12 +1545,23 @@ static ResidualMaterializeStreamTrace traceResidualFilterOnMaterializeStream(
       }
       if (mlir::Value source = scanLikeSourceState(def)) {
          trace.sourceState = source;
+         trace.scanLike = def;
          if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(def)) {
             if (mlir::isa<subop::MixedHashIndexedViewType>(canonicalizeStateValueDeep(source).getType())) {
+               trace.relaxedMixedScan = true;
                bool multipleLookups = false;
                std::optional<subop::LookupOp> lookup =
                   findUniqueUpstreamLookupOp(scanList.getList(), multipleLookups);
-               if (multipleLookups || !lookup) trace.unsupported = true;
+               if (multipleLookups || !lookup) {
+                  trace.unsupported = true;
+               } else {
+                  auto keys = lookup->getKeys();
+                  assert(!keys.empty() && "mixed HIV lookup must have a hash key");
+                  for (mlir::Attribute keyAttr : llvm::drop_begin(keys, 1)) {
+                     auto keyRef = mlir::dyn_cast<tuples::ColumnRefAttr>(keyAttr);
+                     if (!keyRef || !keyRef.getColumn().type.isInteger(1)) trace.unsupported = true;
+                  }
+               }
             }
          }
          return trace;
@@ -1629,6 +1645,7 @@ struct StepDagHasher {
    llvm::DenseMap<const lingodb::compiler::dialect::tuples::Column*, ColumnSource> columnSourceByColumn;
    llvm::DenseMap<mlir::Value, uint64_t> regionValueHashByValue;
    llvm::DenseMap<const void*, uint64_t>* outColumnHashByColumn = nullptr;
+   mlir::Operation* relaxedResidualSourceScanLike = nullptr;
    using SelectedColumnSet = llvm::SmallSet<uint64_t, 8>;
 
    bool isWithinStep(mlir::Operation* op) {
@@ -2090,8 +2107,21 @@ struct StepDagHasher {
       if (trace.filter != filter) return false;
       if (!sourceAllowsResidualFilterSkip(trace.sourceState)) return false;
       if (!filterPredicateColumnsOnlyFromSourceState(trace.predMap, trace.filter, trace.sourceState)) return false;
+      relaxedResidualSourceScanLike = trace.scanLike;
       predMap = trace.predMap;
       return static_cast<bool>(predMap);
+   }
+
+   bool isRelaxedMixedScanOnTargetMaterializeChain(subop::ScanListOp scan) {
+      if (!targetAllowsResidualTableFilterSkip()) return false;
+      subop::MaterializeOp mat = findUniqueTargetMaterialize();
+      if (!mat) return false;
+      ResidualMaterializeStreamTrace trace = traceResidualFilterOnMaterializeStream(step, mat);
+      if (trace.split || trace.unsupported || !trace.relaxedMixedScan) return false;
+      if (trace.scanLike != scan.getOperation()) return false;
+      if (!sourceAllowsResidualFilterSkip(trace.sourceState)) return false;
+      relaxedResidualSourceScanLike = trace.scanLike;
+      return true;
    }
 
    void bindRegionArgs(mlir::Region& r, llvm::ArrayRef<uint64_t> argHashes) {
@@ -2174,7 +2204,22 @@ struct StepDagHasher {
    }
 
    uint64_t hashScanListOp(subop::ScanListOp scan) {
-      uint64_t listH = hashValue(scan.getList());
+      uint64_t listH = 0;
+      if (scan.getOperation() == relaxedResidualSourceScanLike ||
+          isRelaxedMixedScanOnTargetMaterializeChain(scan)) {
+         auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(scan.getElem().getColumn().type);
+         if (ler && mlir::isa<subop::MixedHashIndexedViewType>(ler.getState())) {
+            bool multipleLookups = false;
+            std::optional<subop::LookupOp> lookup = findUniqueUpstreamLookupOp(scan.getList(), multipleLookups);
+            assert(lookup && !multipleLookups && "relaxed mixed HIV source must have a unique lookup");
+            llvm::SmallVector<mlir::Attribute, 1> hashOnlyKeys;
+            assert(!lookup->getKeys().empty() && "mixed HIV lookup must have a hash key");
+            hashOnlyKeys.push_back(*lookup->getKeys().begin());
+            listH = hashLookupLikeOp(*lookup->getOperation(), lookup->getStream(), lookup->getState(),
+                                     mlir::ArrayAttr::get(lookup->getContext(), hashOnlyKeys), lookup->getRef());
+         }
+      }
+      if (!listH) listH = hashValue(scan.getList());
       uint64_t refH = hashString("scan_list_ref");
       refH = hashCombineU64(refH, listH);
       defineRefColumn(scan.getElem(), refH, findUpstreamLookupHashIndexedView(scan.getList()));
@@ -2554,7 +2599,7 @@ struct StepDagHasher {
          assert(isWithinStep(def));
          h = hashOp(*def);
       } else {
-         assert(0);
+         llvm_unreachable("unsupported value kind in step DAG hasher");
       }
       memo[v] = h;
       return h;
@@ -2873,6 +2918,7 @@ llvm::DenseMap<mlir::Value, std::string> buildTableDescrByTableState(mlir::Modul
          }
       }
       assert(found && "table_ref step must contain get_external");
+      (void)found;
       assert(step.getNumResults() == 1 && "table_ref step must return one value");
       mlir::Value t = canonicalizeStateValueDeep(step.getResult(0));
       tableDescr[t] = normalizeExternalDataSourceDescrHex(geOp.getDescr());
@@ -2898,7 +2944,7 @@ struct StateMatchProfile {
    /// Aggregate hash-table group-key identity. Payloads are intentionally excluded from aggregate matching.
    std::string aggregateGroupKeyFingerprint;
    /// A scan-like source -> ... -> map(predicate) -> filter residual stream filter was observed
-   /// in the HIV construction closure. Used to keep relaxed HIV fallback matching filter-specific.
+   /// in the HIV construction closure. Used to keep residual-relaxed HIV matching filter-specific.
    bool hasResidualTableFilter = false;
    bool hasComplexResidualTableFilter = false;
    bool hasUnsupportedResidualTableFilter = false;
@@ -2993,37 +3039,17 @@ static void collectStateAndShadowConstructionStates(
                                       });
 }
 
-static bool stepHasResidualFilterForProfile(subop::ExecutionStepOp step,
-                                            const llvm::DenseSet<mlir::Value>& constructionStates,
-                                            bool requireSupported) {
-   bool multiple = false;
-   subop::MaterializeOp mat = findUniqueMaterializeForStatesInStep(step, constructionStates, multiple);
-   if (!mat || multiple) return false;
-   ResidualMaterializeStreamTrace trace = traceResidualFilterOnMaterializeStream(step, mat);
-   if (!trace.filter || !trace.sourceState || trace.split) return false;
-   if (requireSupported && trace.unsupported) return false;
-   return true;
-}
+struct ConstructionResidualFilterSummary {
+   bool any = false;
+   bool supported = false;
+   bool complex = false;
+};
 
-static bool constructionHasResidualFilter(
-   mlir::Value state, const ModuleMatchAndReuseAnalysis& module,
-   llvm::ArrayRef<int> constructionStepIndices,
-   const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex,
-   bool requireSupported) {
-   llvm::DenseSet<mlir::Value> constructionStates;
-   collectStateAndShadowConstructionStates(state, module, constructionStates);
-   for (int si : constructionStepIndices) {
-      auto itS = stepByIndex.find(si);
-      assert(itS != stepByIndex.end());
-      if (stepHasResidualFilterForProfile(itS->second, constructionStates, requireSupported)) return true;
-   }
-   return false;
-}
-
-static bool constructionHasComplexResidualTableFilter(
+static ConstructionResidualFilterSummary constructionResidualFilterSummary(
    mlir::Value state, const ModuleMatchAndReuseAnalysis& module,
    llvm::ArrayRef<int> constructionStepIndices,
    const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex) {
+   ConstructionResidualFilterSummary out;
    llvm::DenseSet<mlir::Value> constructionStates;
    collectStateAndShadowConstructionStates(state, module, constructionStates);
    for (int si : constructionStepIndices) {
@@ -3033,9 +3059,13 @@ static bool constructionHasComplexResidualTableFilter(
       subop::MaterializeOp mat = findUniqueMaterializeForStatesInStep(itS->second, constructionStates, multiple);
       if (!mat || multiple) continue;
       ResidualMaterializeStreamTrace trace = traceResidualFilterOnMaterializeStream(itS->second, mat);
-      if (trace.filter && trace.sourceState && !trace.split && !trace.unsupported && trace.complex) return true;
+      if ((!trace.filter && !trace.relaxedMixedScan) || !trace.sourceState || trace.split) continue;
+      out.any = true;
+      if (trace.unsupported) continue;
+      out.supported = true;
+      out.complex |= trace.complex;
    }
-   return false;
+   return out;
 }
 
 static bool constructionHasTupleStreamSplitOnTargetMaterialize(
@@ -3116,6 +3146,7 @@ static void registerModuleExecutionSteps(mlir::ModuleOp moduleOp, ModuleMatchAnd
          for (mlir::Value r : keys) {
             mlir::Value key = canonicalizeStateValueDeep(r);
             auto [it, inserted] = a.reuse.createOnlyStepForState.try_emplace(key, step);
+            (void)inserted;
             assert(inserted || it->second == step);
          }
       }
@@ -3438,16 +3469,11 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
       prof.depTokensSorted.assign(depElig.depTokensSorted.begin(), depElig.depTokensSorted.end());
 
       if (prof.eligible) {
-         bool hasAnyResidualFilter =
-            constructionHasResidualFilter(state, module, constructionStepIndices, module.stepByIndex,
-                                          /*requireSupported*/ false);
-         prof.hasResidualTableFilter =
-            constructionHasResidualFilter(state, module, constructionStepIndices, module.stepByIndex,
-                                          /*requireSupported*/ true);
-         prof.hasComplexResidualTableFilter =
-            constructionHasComplexResidualTableFilter(state, module, constructionStepIndices,
-                                                      module.stepByIndex);
-         prof.hasUnsupportedResidualTableFilter = hasAnyResidualFilter && !prof.hasResidualTableFilter;
+         ConstructionResidualFilterSummary residual =
+            constructionResidualFilterSummary(state, module, constructionStepIndices, module.stepByIndex);
+         prof.hasResidualTableFilter = residual.supported;
+         prof.hasComplexResidualTableFilter = residual.complex;
+         prof.hasUnsupportedResidualTableFilter = residual.any && !residual.supported;
          if (mlir::isa<subop::HashIndexedViewType>(state.getType())) {
             JoinHivMatchDetails joinHivDetails = computeJoinHivMatchDetails(
                state, mlir::cast<subop::HashIndexedViewType>(state.getType()), memberManager,
@@ -3614,7 +3640,7 @@ static void addMatchRangeConstraint(MatchNumericFilterRange& range, lingodb::run
          break;
       }
       default:
-         break;
+         llvm_unreachable("simple filter range preprocessing received a non-range numeric filter op");
    }
 }
 
@@ -3677,7 +3703,7 @@ static void addMatchStringRangeConstraint(MatchStringFilterRange& range, lingodb
          break;
       }
       default:
-         break;
+         llvm_unreachable("simple filter range preprocessing received a non-range string filter op");
    }
 }
 
@@ -3942,7 +3968,7 @@ static std::string matchFilterFingerprint(llvm::ArrayRef<lingodb::runtime::Filte
          case FilterOp::NOTNULL: return "NOTNULL";
          case FilterOp::IN: return "IN";
       }
-      return "UNKNOWN";
+      llvm_unreachable("unknown runtime filter op");
    };
    auto filterValueToStr = [](const FilterDescription& f) -> std::string {
       std::ostringstream os;
@@ -4729,6 +4755,9 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
    };
    auto relaxedHivPayloadUnionAllowed = [&](const StateMatchProfile& a, const StateMatchProfile& b) {
       if (!hasCacheDependency(a) && !hasCacheDependency(b)) return true;
+      if (a.hasResidualTableFilter && b.hasResidualTableFilter &&
+          !a.hasUnsupportedResidualTableFilter && !b.hasUnsupportedResidualTableFilter)
+         return true;
       if (a.mixedHivLookupPredFingerprint.empty() || b.mixedHivLookupPredFingerprint.empty()) return false;
       if (mixedHivLookupPredFingerprintUsesUnion(a.mixedHivLookupPredFingerprint) ||
          mixedHivLookupPredFingerprintUsesUnion(b.mixedHivLookupPredFingerprint))
@@ -4887,39 +4916,6 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
       out.push_back(std::move(g));
    };
 
-   auto emitMatchGroupCapped = [&](llvm::ArrayRef<const StateMatchProfile*> members,
-                                   const StateMatchProfile& keySeed,
-                                   llvm::StringRef keySuffix,
-                                   llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
-                                   bool enableFilterPredReuse,
-                                   const llvm::DenseMap<const StateMatchProfile*, unsigned>* reuseSlotByProfile = nullptr) {
-      bool allHiv = llvm::all_of(members, [](const StateMatchProfile* p) {
-         return mlir::isa<subop::HashIndexedViewType>(p->value.getType());
-      });
-      if (!enableFilterPredReuse || !allHiv) {
-         emitMatchGroup(members, keySeed, keySuffix, keyForSeed, enableFilterPredReuse, reuseSlotByProfile);
-         return;
-      }
-
-      llvm::SmallVector<unsigned, 16> orderedSlots;
-      llvm::DenseMap<unsigned, llvm::SmallVector<const StateMatchProfile*, 4>> membersBySlot;
-      for (const StateMatchProfile* p : members) {
-         unsigned slot = static_cast<unsigned>(p->queryId);
-         if (reuseSlotByProfile) {
-            auto itSlot = reuseSlotByProfile->find(p);
-            assert(itSlot != reuseSlotByProfile->end() && "subgrouped match entry must have a reuse slot");
-            slot = itSlot->second;
-         }
-         if (!membersBySlot.contains(slot)) orderedSlots.push_back(slot);
-         membersBySlot[slot].push_back(p);
-      }
-      if (orderedSlots.size() <= 8) {
-         emitMatchGroup(members, keySeed, keySuffix, keyForSeed, enableFilterPredReuse, reuseSlotByProfile);
-         return;
-      }
-      emitMatchGroup(members, keySeed, keySuffix, keyForSeed, enableFilterPredReuse, reuseSlotByProfile);
-   };
-
    auto tryEmitIdenticalFilterSubgroupDisjointGroups =
       [&](llvm::ArrayRef<const StateMatchProfile*> members,
           llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
@@ -5006,8 +5002,8 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
          }
          if (group.subgroupIndices.size() == 1 && groupedMembers.size() < 2) continue;
          bool mixedReuse = allowMixedReuse && group.subgroupIndices.size() > 1;
-         emitMatchGroupCapped(groupedMembers, *groupedMembers.front(), suffix, keyForSeed, mixedReuse,
-                              &slotByProfile);
+         emitMatchGroup(groupedMembers, *groupedMembers.front(), suffix, keyForSeed, mixedReuse,
+                        &slotByProfile);
          emittedAny = true;
       }
       return emittedAny;
@@ -5239,8 +5235,8 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
                }
             }
 
-            emitMatchGroupCapped(currentMembers, *currentMembers.front(), keySuffix, keyForSeed,
-                                 enableFilterPredReuse);
+            emitMatchGroup(currentMembers, *currentMembers.front(), keySuffix, keyForSeed,
+                           enableFilterPredReuse);
             emittedAny = true;
          };
 
@@ -5285,11 +5281,11 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
              tryEmitIdenticalFilterSubgroupDisjointGroups(members, keyForSeed, enableFilterPredReuse))
             continue;
          if (disableHivDisjointClustering && allHiv) {
-            emitMatchGroupCapped(members, *a, "", keyForSeed, enableFilterPredReuse);
+            emitMatchGroup(members, *a, "", keyForSeed, enableFilterPredReuse);
             continue;
          }
          if (tryEmitSimpleFilterUnionFindClusteredGroups(members, keyForSeed, enableFilterPredReuse)) continue;
-         emitMatchGroupCapped(members, *a, "", keyForSeed, enableFilterPredReuse);
+         emitMatchGroup(members, *a, "", keyForSeed, enableFilterPredReuse);
       }
    };
 

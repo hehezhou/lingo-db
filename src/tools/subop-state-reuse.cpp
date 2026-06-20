@@ -272,8 +272,8 @@ void runPasses(mlir::ModuleOp moduleOp, lingodb::catalog::Catalog* catalog) {
       mlir::PassManager qoptPm(moduleOp.getContext());
       qoptPm.enableVerifier(true);
       relalg::createQueryOptPipeline(qoptPm, catalog);
-      auto res = qoptPm.run(moduleOp);
-      assert(succeeded(res));
+      [[maybe_unused]] bool ok = succeeded(qoptPm.run(moduleOp));
+      assert(ok);
    }
 
    // 2) Lower RelAlg -> SubOp.
@@ -281,8 +281,8 @@ void runPasses(mlir::ModuleOp moduleOp, lingodb::catalog::Catalog* catalog) {
       mlir::PassManager lowerRelAlgPm(moduleOp.getContext());
       lowerRelAlgPm.enableVerifier(true);
       relalg::createLowerRelAlgToSubOpPipeline(lowerRelAlgPm);
-      auto res = lowerRelAlgPm.run(moduleOp);
-      assert(succeeded(res));
+      [[maybe_unused]] bool ok = succeeded(lowerRelAlgPm.run(moduleOp));
+      assert(ok);
    }
 
    // 3) SubOp "opt" pipeline (matching Execution.cpp up to PrepareLoweringPass).
@@ -306,8 +306,8 @@ void runPasses(mlir::ModuleOp moduleOp, lingodb::catalog::Catalog* catalog) {
       }
       optSubOpPm.addPass(subop::createPrepareLoweringPass());
 
-      auto res = optSubOpPm.run(moduleOp);
-      assert(succeeded(res));
+      [[maybe_unused]] bool ok = succeeded(optSubOpPm.run(moduleOp));
+      assert(ok);
    }
 }
 
@@ -466,7 +466,7 @@ static SubOpExecuteTiming executeFromSubOpLayer(mlir::ModuleOp subopModule,
    auto lowerStart = std::chrono::high_resolution_clock::now();
    if (!lowerFromSubOpLayer(subopModule)) {
       subopModule.dump();
-      assert(0 && "lowerFromSubOpLayer failed (dumped module above)");
+      llvm_unreachable("lowerFromSubOpLayer failed (dumped module above)");
    }
    out.lowerMs = millisSince(lowerStart);
 
@@ -874,6 +874,21 @@ static void writeJsonFile(const llvm::Twine& path, const llvm::json::Value& valu
    os << llvm::formatv("{0:2}", value) << "\n";
 }
 
+enum class BatchNightlyMode {
+   ReuseOff,
+   ReuseOnBloomOn,
+   ReuseOnBloomOff,
+   ReuseOnBloomOnNoHivDisjoint,
+};
+
+static BatchNightlyMode parseBatchNightlyMode(llvm::StringRef mode) {
+   if (mode == "reuse_off") return BatchNightlyMode::ReuseOff;
+   if (mode == "reuse_on_bloom_on") return BatchNightlyMode::ReuseOnBloomOn;
+   if (mode == "reuse_on_bloom_off") return BatchNightlyMode::ReuseOnBloomOff;
+   if (mode == "reuse_on_bloom_on_no_hiv_disjoint") return BatchNightlyMode::ReuseOnBloomOnNoHivDisjoint;
+   llvm_unreachable("unknown batch nightly mode");
+}
+
 static int runBatchNightlyMain(int argc, char** argv) {
    assert(argc >= 4 && "usage: subop-state-reuse --batch-nightly <db_dir> --mode <mode> [options]");
    std::string dbDir = argv[2];
@@ -887,39 +902,36 @@ static int runBatchNightlyMain(int argc, char** argv) {
 
    for (int i = 3; i < argc; i++) {
       llvm::StringRef arg(argv[i]);
-      auto requireValue = [&](llvm::StringRef flag) -> const char* {
+      auto requireValue = [&]() -> const char* {
          assert(i + 1 < argc && "missing option value");
-         (void)flag;
          return argv[++i];
       };
-      if (arg == "--mode") mode = requireValue(arg);
-      else if (arg == "--query-dir") queryDir = requireValue(arg);
-      else if (arg == "--out") outPath = requireValue(arg);
-      else if (arg == "--templates") templatesSpec = requireValue(arg);
-      else if (arg == "--batch-sizes") batchSizesSpec = requireValue(arg);
+      if (arg == "--mode") mode = requireValue();
+      else if (arg == "--query-dir") queryDir = requireValue();
+      else if (arg == "--out") outPath = requireValue();
+      else if (arg == "--templates") templatesSpec = requireValue();
+      else if (arg == "--batch-sizes") batchSizesSpec = requireValue();
       else if (arg == "--repetitions") {
-         llvm::StringRef v(requireValue(arg));
+         llvm::StringRef v(requireValue());
          bool bad = v.getAsInteger(10, repetitions);
          (void)bad;
          assert(!bad && "invalid repetitions");
       } else if (arg == "--no-force-sequential") {
          forceSequential = false;
       } else {
-         llvm::errs() << kToolName << ": unknown --batch-nightly option " << arg << "\n";
-         return 2;
+         llvm_unreachable("unknown --batch-nightly option");
       }
    }
    assert(!mode.empty() && "--mode is required");
    assert(!outPath.empty() && "--out is required");
-   assert(mode == "reuse_off" || mode == "reuse_on_bloom_on" || mode == "reuse_on_bloom_off" ||
-          mode == "reuse_on_bloom_on_no_hiv_disjoint");
+   BatchNightlyMode parsedMode = parseBatchNightlyMode(mode);
 
    if (forceSequential) setenv("LINGODB_SUBOP_FORCE_SEQUENTIAL", "1", /*overwrite=*/0);
-   if (mode == "reuse_on_bloom_off")
+   if (parsedMode == BatchNightlyMode::ReuseOnBloomOff)
       setenv("LINGODB_DISABLE_FILTER_PRED_BLOOM_ADAPTATION", "1", /*overwrite=*/1);
    else
       unsetenv("LINGODB_DISABLE_FILTER_PRED_BLOOM_ADAPTATION");
-   if (mode == "reuse_on_bloom_on_no_hiv_disjoint")
+   if (parsedMode == BatchNightlyMode::ReuseOnBloomOnNoHivDisjoint)
       setenv("LINGODB_DISABLE_HIV_DISJOINT_CLUSTERING", "1", /*overwrite=*/1);
    else
       unsetenv("LINGODB_DISABLE_HIV_DISJOINT_CLUSTERING");
@@ -954,7 +966,7 @@ static int runBatchNightlyMain(int argc, char** argv) {
          }
          for (int rep = 0; rep < repetitions; rep++) {
             SubOpStateReuseOptions opts;
-            opts.skipReuseRewrite = (mode == "reuse_off");
+            opts.skipReuseRewrite = parsedMode == BatchNightlyMode::ReuseOff;
             opts.captureResultHashes = true;
             auto t0 = std::chrono::high_resolution_clock::now();
             SubOpStateReuseBatchResult res = runSubOpStateReuseBatch(queries, catalog.get(), session.get(), opts);

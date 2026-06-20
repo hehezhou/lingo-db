@@ -1200,7 +1200,7 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
          }
          return acc;
       }
-      assert(false && "runtime filter IR: IN filter has unsupported values variant");
+      llvm_unreachable("runtime filter IR: IN filter has unsupported values variant");
    }
    if (std::holds_alternative<int64_t>(f.value)) {
       int64_t v = std::get<int64_t>(f.value);
@@ -1214,7 +1214,7 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
          case runtime::FilterOp::LTE: p = P::sle; break;
          case runtime::FilterOp::GT: p = P::sgt; break;
          case runtime::FilterOp::GTE: p = P::sge; break;
-         default: assert(false && "runtime filter IR: unsupported filter op");
+         default: llvm_unreachable("runtime filter IR: unsupported filter op");
       }
       return rb.create<mlir::arith::CmpIOp>(loc, p, colV, c);
    }
@@ -1235,7 +1235,7 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
          case runtime::FilterOp::LTE: p = P::lte; break;
          case runtime::FilterOp::GT: p = P::gt; break;
          case runtime::FilterOp::GTE: p = P::gte; break;
-         default: assert(false && "runtime filter IR: unsupported filter op");
+         default: llvm_unreachable("runtime filter IR: unsupported filter op");
       }
       auto cmp = rb.create<lingodb::compiler::dialect::db::CmpOp>(loc, p, colV, rhs);
       return deriveDbPredicateTruthValue(rb, loc, cmp);
@@ -1254,12 +1254,11 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
          case runtime::FilterOp::LTE: p = P::OLE; break;
          case runtime::FilterOp::GT: p = P::OGT; break;
          case runtime::FilterOp::GTE: p = P::OGE; break;
-         default: assert(false && "runtime filter IR: unsupported filter op");
+         default: llvm_unreachable("runtime filter IR: unsupported filter op");
       }
       return rb.create<mlir::arith::CmpFOp>(loc, p, colV, c);
    }
-   assert(false && "runtime filter IR: unsupported filter literal type (expected int64, double, or string)");
-   return {};
+   llvm_unreachable("runtime filter IR: unsupported filter literal type (expected int64, double, or string)");
 }
 
 // Convert runtime filter descriptions into MLIR subop.map + subop.filter.
@@ -1864,14 +1863,15 @@ std::optional<subop::Member> findFilterPredMemberOnHashIndexedView(subop::HashIn
    auto* ctx = hiv.getContext();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    for (subop::Member m : hiv.getValueMembers().getMembers()) {
-      if (mm.getName(m).starts_with("filter_pred")) return m;
+      llvm::StringRef name = mm.getName(m);
+      if (name == "filter_pred" || parseFilterPredMemberSlot(name)) return m;
    }
    return std::nullopt;
 }
 
 void materializeConstantTruePredMemberOnBufferMaterialize(subop::MaterializeOp matOp,
-	                                                                 llvm::StringRef predMemberName,
-	                                                                 bool updateStreamOperand) {
+                                                          llvm::StringRef predMemberName,
+                                                          bool updateStreamOperand) {
    auto* ctx = matOp.getContext();
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
@@ -2227,59 +2227,6 @@ static llvm::SmallVector<subop::ScanListOp, 4> findHivScanListsInStep(
    return out;
 }
 
-static bool lookupTargetsHashIndexedViewPredMember(subop::LookupOp lookup, subop::Member predMember) {
-   auto* ctx = lookup.getContext();
-   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   auto stateTy = lookup.getState().getType();
-   subop::StateMembersAttr valueMembers;
-   if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(stateTy)) {
-      valueMembers = hiv.getValueMembers();
-   } else if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(stateTy)) {
-      valueMembers = mixed.getValueMembers();
-   } else {
-      return false;
-   }
-   return valueMembersContainMemberNamed(ctx, valueMembers, mm.getName(predMember));
-}
-
-static void attachConstantTruePredArgToMixedLookup(subop::LookupOp lookup, subop::Member predMember) {
-   auto* ctx = lookup.getContext();
-   auto mixedTy = getMixedHashIndexedViewTypeForPredMember(ctx, lookup.getState().getType(), predMember);
-   if (!mixedTy) return;
-
-   lookup.getState().setType(mixedTy);
-   auto ref = lookup.getRef();
-   ref.getColumn().type = subop::ListType::get(ctx, subop::LookupEntryRefType::get(ctx, mixedTy));
-   lookup.setRefAttr(ref);
-
-   if (lookup.getKeys().size() > 1) return;
-
-   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
-   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   std::string scopeSeed = "mixed_hiv_lookup_pred";
-   if (auto slot = parseFilterPredMemberSlot(mm.getName(predMember)))
-      scopeSeed = ("mixed_hiv_lookup_pred$" + llvm::Twine(*slot)).str();
-   tuples::ColumnDefAttr predDef = cm.createDef(cm.getUniqueScope(scopeSeed), "filter_pred");
-   predDef.getColumn().type = mlir::IntegerType::get(ctx, 1);
-
-   mlir::OpBuilder builder(lookup);
-   builder.setInsertionPoint(lookup);
-   subop::MapCreationHelper helper(ctx);
-   helper.buildBlock(builder, [&](mlir::OpBuilder& rb) {
-      mlir::Value t = rb.create<mlir::arith::ConstantIntOp>(lookup.getLoc(), 1, 1);
-      rb.create<tuples::ReturnOp>(lookup.getLoc(), mlir::ValueRange{t});
-   });
-   auto mapOp = builder.create<subop::MapOp>(lookup.getLoc(), tuples::TupleStreamType::get(ctx), lookup.getStream(),
-                                             builder.getArrayAttr({predDef}), helper.getColRefs());
-   mapOp.getFn().push_back(helper.getMapBlock());
-   lookup->setOperand(0, mapOp.getResult());
-
-   llvm::SmallVector<mlir::Attribute> keys;
-   for (mlir::Attribute key : lookup.getKeys()) keys.push_back(key);
-   keys.push_back(cm.createRef(&predDef.getColumn()));
-   lookup.setKeysAttr(mlir::ArrayAttr::get(ctx, keys));
-}
-
 static void retagHivScanListToMixed(subop::ScanListOp scanList, subop::Member predMember) {
    auto* ctx = scanList.getContext();
    auto listTy = mlir::dyn_cast<subop::ListType>(scanList.getList().getType());
@@ -2350,11 +2297,6 @@ void insertHashIndexedViewGatherPredFilters(ExecutionStepOp step, subop::Member 
    mlir::ModuleOp module = step->getParentOfType<mlir::ModuleOp>();
    if (!module) return;
    retagHivCarrierValuesToMixed(module, predMember, closureFilter);
-   module.walk([&](subop::LookupOp lookup) {
-      if (closureFilter && !opOperandsOrNestedBlockArgsTouchClosure(lookup.getOperation(), *closureFilter)) return;
-      if (!lookupTargetsHashIndexedViewPredMember(lookup, predMember)) return;
-      attachConstantTruePredArgToMixedLookup(lookup, predMember);
-   });
    synchronizeExecutionStepPortTypes(module, nullptr);
 }
 
