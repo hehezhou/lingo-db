@@ -835,6 +835,7 @@ static mlir::Value streamInputOfLinearSuffixOp(mlir::Operation* op) {
    if (auto map = mlir::dyn_cast<subop::MapOp>(op)) return map.getStream();
    if (auto filter = mlir::dyn_cast<subop::FilterOp>(op)) return filter.getStream();
    if (auto rename = mlir::dyn_cast<subop::RenamingOp>(op)) return rename.getStream();
+   if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(op)) return lookup.getStream();
    llvm_unreachable("split-materialize residual suffix contains unsupported stream op");
 }
 
@@ -843,8 +844,11 @@ static mlir::Value streamResultOfLinearSuffixOp(mlir::Operation* op) {
    if (auto map = mlir::dyn_cast<subop::MapOp>(op)) return map.getResult();
    if (auto filter = mlir::dyn_cast<subop::FilterOp>(op)) return filter.getRes();
    if (auto rename = mlir::dyn_cast<subop::RenamingOp>(op)) return rename.getResult();
+   if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(op)) return lookup.getRes();
    llvm_unreachable("split-materialize residual suffix contains unsupported stream op");
 }
+
+static mlir::Value executionStepOperandForBlockArgument(mlir::Value value);
 
 static mlir::Value cloneLinearStreamSuffixBefore(mlir::OpBuilder& b,
                                                  mlir::Value suffixStart,
@@ -875,7 +879,125 @@ static mlir::Value cloneLinearStreamSuffixBefore(mlir::OpBuilder& b,
    return current;
 }
 
-static ExecutionStepOp findUniqueMaterializeStepWritingState(mlir::ModuleOp module, mlir::Value state) {
+struct SplitAggregateBuild {
+   ExecutionStepOp step;
+   subop::ScanRefsOp scan;
+   subop::LookupOrInsertOp lookup;
+   subop::ReduceOp reduce;
+};
+
+static SplitAggregateBuild findUniqueAggregateBuildWritingState(mlir::ModuleOp module, mlir::Value state) {
+   state = canonicalizeStateValueForReuse(state);
+   SplitAggregateBuild found;
+   module.walk([&](subop::LookupOrInsertOp lookup) {
+      mlir::Value lookupState = canonicalizeStateValueForReuse(
+         executionStepOperandForBlockArgument(lookup.getState()));
+      if (lookupState != state) return;
+      assert(!found.lookup && "split-aggregate reuse expects one lookup_or_insert writer");
+      found.lookup = lookup;
+      found.step = lookup->getParentOfType<ExecutionStepOp>();
+      assert(found.step && "split-aggregate lookup_or_insert must be inside an execution_step");
+   });
+   assert(found.lookup && "split-aggregate reuse requires a lookup_or_insert writer");
+
+   tuples::Column* lookupRefColumn = &found.lookup.getRef().getColumn();
+   found.step.walk([&](subop::ReduceOp reduce) {
+      if (&reduce.getRef().getColumn() != lookupRefColumn) return;
+      assert(!found.reduce && "split-aggregate reuse expects one reduce for lookup_or_insert");
+      found.reduce = reduce;
+   });
+   assert(found.reduce && "split-aggregate reuse requires a reduce after lookup_or_insert");
+   found.scan = findFirstScanRefsInStep(found.step);
+   return found;
+}
+
+static llvm::SmallVector<mlir::Operation*, 8>
+linearStreamOpsBeforeReduce(mlir::Value suffixStart, subop::ReduceOp reduce) {
+   llvm::SmallVector<mlir::Operation*, 8> reverseOps;
+   mlir::Value stream = reduce.getStream();
+   while (stream != suffixStart) {
+      mlir::Operation* def = stream.getDefiningOp();
+      assert(def && "split-aggregate suffix must be local SSA");
+      reverseOps.push_back(def);
+      stream = streamInputOfLinearSuffixOp(def);
+   }
+   llvm::SmallVector<mlir::Operation*, 8> ops;
+   for (mlir::Operation* op : llvm::reverse(reverseOps)) ops.push_back(op);
+   return ops;
+}
+
+static subop::PreAggrHtFragmentType preAggrFragmentTypeFromBuildState(mlir::Type type) {
+   if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(type)) type = tl.getWrapped();
+   return mlir::dyn_cast<subop::PreAggrHtFragmentType>(type);
+}
+
+static void alignClonedAggregateRefAndReduceMembers(subop::LookupOrInsertOp lookup,
+                                                    subop::ReduceOp reduce,
+                                                    mlir::Value targetState) {
+   auto fragment = preAggrFragmentTypeFromBuildState(targetState.getType());
+   assert(fragment && "split-aggregate target must be an optimistic_ht_fragment");
+   auto* ctx = lookup.getContext();
+   auto refDef = lookup.getRef();
+   refDef.getColumn().type = subop::LookupEntryRefType::get(ctx, fragment);
+   lookup.setRefAttr(refDef);
+   auto ref = reduce.getRef();
+   ref.getColumn().type = refDef.getColumn().type;
+   reduce.setRefAttr(ref);
+
+   llvm::SmallVector<mlir::Attribute, 16> members;
+   for (subop::Member member : fragment.getValueMembers().getMembers())
+      members.push_back(subop::MemberAttr::get(ctx, member));
+   assert(members.size() == reduce.getMembers().size() &&
+          "split-aggregate reduce member layout must align by ordinal");
+   reduce.setMembersAttr(mlir::ArrayAttr::get(ctx, members));
+}
+
+static void cloneAggregateSuffixToReduce(mlir::OpBuilder& b,
+                                         mlir::Value suffixStart,
+                                         subop::ReduceOp reduce,
+                                         mlir::Value newStart,
+                                         mlir::Value newState) {
+   llvm::SmallVector<mlir::Operation*, 8> ops = linearStreamOpsBeforeReduce(suffixStart, reduce);
+   mlir::IRMapping mapping;
+   subop::ColumnMapping columnMapping;
+   mapping.map(suffixStart, newStart);
+   mlir::Value current = newStart;
+   subop::LookupOrInsertOp clonedLookup;
+   for (mlir::Operation* op : ops) {
+      mapping.map(streamInputOfLinearSuffixOp(op), current);
+      if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(op))
+         mapping.map(lookup.getState(), newState);
+      auto sub = mlir::cast<subop::SubOperator>(op);
+      mlir::Operation* cloned = sub.cloneSubOp(b, mapping, columnMapping);
+      if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(cloned)) clonedLookup = lookup;
+      current = streamResultOfLinearSuffixOp(cloned);
+   }
+   mapping.map(reduce.getStream(), current);
+   auto* clonedReduceOp =
+      mlir::cast<subop::SubOperator>(reduce.getOperation()).cloneSubOp(b, mapping, columnMapping);
+   auto clonedReduce = mlir::cast<subop::ReduceOp>(clonedReduceOp);
+   assert(clonedLookup && "split-aggregate suffix must clone lookup_or_insert");
+   alignClonedAggregateRefAndReduceMembers(clonedLookup, clonedReduce, newState);
+}
+
+static void eraseOriginalAggregateSuffix(mlir::Value suffixStart, subop::ReduceOp reduce) {
+   llvm::SmallVector<mlir::Operation*, 8> ops = linearStreamOpsBeforeReduce(suffixStart, reduce);
+   reduce.erase();
+   for (mlir::Operation* op : llvm::reverse(ops))
+      op->erase();
+}
+
+static mlir::Value executionStepOperandForBlockArgument(mlir::Value value) {
+   auto arg = mlir::dyn_cast<mlir::BlockArgument>(value);
+   if (!arg) return value;
+   auto step = mlir::dyn_cast_or_null<ExecutionStepOp>(arg.getOwner()->getParentOp());
+   if (!step) return value;
+   if (arg.getArgNumber() >= step.getNumOperands()) return value;
+   return step.getOperand(arg.getArgNumber());
+}
+
+static std::optional<ExecutionStepOp> tryFindUniqueMaterializeStepWritingState(mlir::ModuleOp module,
+                                                                               mlir::Value state) {
    state = canonicalizeStateValueForReuse(state);
    ExecutionStepOp found;
    module.walk([&](ExecutionStepOp step) {
@@ -887,8 +1009,37 @@ static ExecutionStepOp findUniqueMaterializeStepWritingState(mlir::ModuleOp modu
       assert(!found && "split-materialize reuse expects one materialize step for the output state");
       found = step;
    });
-   if (!found) llvm_unreachable("split-materialize reuse requires a materialize step");
+   if (!found) return std::nullopt;
    return found;
+}
+
+static ExecutionStepOp findUniqueMaterializeStepWritingState(mlir::ModuleOp module, mlir::Value state) {
+   std::optional<ExecutionStepOp> found = tryFindUniqueMaterializeStepWritingState(module, state);
+   if (!found) llvm_unreachable("split-materialize reuse requires a materialize step");
+   return *found;
+}
+
+static std::optional<mlir::Value> mergeInputForFinalState(mlir::ModuleOp module, mlir::Value state) {
+   state = canonicalizeStateValueForReuse(state);
+   mlir::Value found;
+   module.walk([&](subop::MergeOp merge) {
+      if (canonicalizeStateValueForReuse(merge.getResult()) != state) return;
+      assert(!found && "split-materialize reuse expects one merge producer for final state");
+      found = executionStepOperandForBlockArgument(merge.getThreadLocal());
+   });
+   if (!found) return std::nullopt;
+   return found;
+}
+
+static mlir::Value resolveSplitMaterializeBuildState(mlir::ModuleOp module, mlir::Value target,
+                                                     const ModuleReuseInfo& reuse) {
+   if (auto itShadow = findReuseMap(reuse.mergedFromShadowState, target);
+       itShadow != reuse.mergedFromShadowState.end()) {
+      return itShadow->second;
+   }
+   if (tryFindUniqueMaterializeStepWritingState(module, target)) return target;
+   if (std::optional<mlir::Value> mergeInput = mergeInputForFinalState(module, target)) return *mergeInput;
+   return target;
 }
 
 llvm::SmallVector<CacheTarget, 64> cacheTargetsWithFilterPredReuse(llvm::ArrayRef<CacheTarget> targets) {
@@ -1957,7 +2108,8 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
          if (!e.state) continue;
          mlir::Value targetState = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
          assert(targetState && "batch reuse target must resolve during aggregate support check");
-         if (mlir::isa<subop::PreAggrHtType>(targetState.getType()) &&
+         if (!g.requiresSplitMaterialize &&
+             mlir::isa<subop::PreAggrHtType>(targetState.getType()) &&
              !aggregateHashTablePayloadUnionSupported(e.state, reuseEarly[e.query])) {
             unsupportedAggregateUnion = true;
             break;
@@ -2213,10 +2365,76 @@ static void expandSplitMaterializeTargetsInSynthetic(
       auto itTarget = groupTargetByKey.find(g.cacheKey);
       assert(itTarget != groupTargetByKey.end() && "split-materialize group must have a cloned donor target");
       CacheTarget donorSyntheticTarget = itTarget->second;
-      mlir::Value donorSyntheticBuildState = donorSyntheticTarget.state;
-      if (auto itShadow = findReuseMap(reuseSynthetic.mergedFromShadowState, donorSyntheticTarget.state);
-          itShadow != reuseSynthetic.mergedFromShadowState.end()) {
-         donorSyntheticBuildState = itShadow->second;
+      mlir::Value donorSyntheticBuildState =
+         resolveSplitMaterializeBuildState(synthetic, donorSyntheticTarget.state, reuseSynthetic);
+      if (!tryFindUniqueMaterializeStepWritingState(synthetic, donorSyntheticBuildState)) {
+         SplitAggregateBuild aggBuild =
+            findUniqueAggregateBuildWritingState(synthetic, donorSyntheticBuildState);
+         clearGetExternalFiltersForState(canonicalizeStateValueForReuse(aggBuild.scan.getState()));
+         mlir::Value suffixStart = aggBuild.scan.getRes();
+
+         for (const CrossQueryStateMatchEntry& e : g.entries) {
+            assert(e.query >= 0 && static_cast<size_t>(e.query) < queries.size());
+            unsigned slot = e.reuseSlot == std::numeric_limits<unsigned>::max()
+                               ? static_cast<unsigned>(e.query)
+                               : e.reuseSlot;
+            uint64_t outputKey = splitMaterializeOutputCacheKey(g.cacheKey, slot);
+
+            mlir::Value entryTarget = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
+            assert(entryTarget && "split-aggregate entry target must resolve");
+            mlir::Value syntheticFinalState = donorMappings[e.query].lookupOrNull(entryTarget);
+            mlir::Value syntheticBuildState;
+            if (syntheticFinalState) {
+               syntheticBuildState = resolveSplitMaterializeBuildState(synthetic, syntheticFinalState, reuseSynthetic);
+            } else {
+               mlir::Value entryBuildState = entryTarget;
+               if (auto itShadow = findReuseMap(reuseEarly[e.query].mergedFromShadowState, entryTarget);
+                   itShadow != reuseEarly[e.query].mergedFromShadowState.end()) {
+                  entryBuildState = itShadow->second;
+               }
+               auto itCreate = findReuseMap(reuseEarly[e.query].createOnlyStepForState, entryBuildState);
+               assert(itCreate != reuseEarly[e.query].createOnlyStepForState.end() &&
+                      "split-aggregate peer build state needs a create-only step");
+               syntheticBuildState = cloneCreateOnlyStepBefore(aggBuild.step, itCreate->second, entryBuildState);
+
+               if (canonicalizeStateValueForReuse(entryBuildState) == canonicalizeStateValueForReuse(entryTarget)) {
+                  syntheticFinalState = syntheticBuildState;
+               } else {
+                  auto itMerge = findReuseMap(reuseEarly[e.query].writerStepsByState, entryTarget);
+                  assert(itMerge != reuseEarly[e.query].writerStepsByState.end() && itMerge->second.size() == 1 &&
+                         "split-aggregate peer final state needs one merge writer");
+                  syntheticFinalState =
+                     cloneMergeStepAfter(aggBuild.step, itMerge->second.front(), entryBuildState,
+                                         syntheticBuildState, entryTarget);
+               }
+            }
+
+            mlir::Value stateArg = threadStateToNestedMaterializeStep(aggBuild.step, syntheticBuildState);
+            llvm::SmallVector<CacheTarget, 1> filterTarget{CacheTarget{entryTarget, outputKey, false}};
+            llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>> decodedByTarget =
+               decodeFiltersByCacheTargets(filterTarget, reuseEarly[e.query]);
+            mlir::Value branchStream = suffixStart;
+            if (auto itFilters = decodedByTarget.find(entryTarget);
+                itFilters != decodedByTarget.end() && !itFilters->second.empty()) {
+               auto [predStream, predRef] = materializeRuntimeFiltersAsPredicateColumnAfterScanRefs(
+                  aggBuild.scan, itFilters->second, "split_agg_pred", /*rewireDownstreamUses=*/false);
+               mlir::Operation* predAnchor = predStream.getDefiningOp();
+               assert(predAnchor && "split-aggregate predicate stream must be op-defined");
+               mlir::OpBuilder fb(predAnchor);
+               fb.setInsertionPointAfter(predAnchor);
+               auto filter = fb.create<subop::FilterOp>(aggBuild.scan.getLoc(), predStream,
+                                                        subop::FilterSemantic::all_true,
+                                                        fb.getArrayAttr({predRef}));
+               branchStream = filter.getRes();
+            }
+
+            mlir::OpBuilder b(aggBuild.lookup);
+            b.setInsertionPoint(aggBuild.lookup);
+            cloneAggregateSuffixToReduce(b, suffixStart, aggBuild.reduce, branchStream, stateArg);
+            expanded.push_back(CacheTarget{syntheticFinalState, outputKey, /*enableFilterPredReuse=*/false});
+         }
+         eraseOriginalAggregateSuffix(suffixStart, aggBuild.reduce);
+         continue;
       }
       ExecutionStepOp matStep = findUniqueMaterializeStepWritingState(synthetic, donorSyntheticBuildState);
       subop::MaterializeOp donorMat = findUniqueMaterializeWritingState(matStep, donorSyntheticBuildState);
@@ -2279,12 +2497,7 @@ static void expandSplitMaterializeTargetsInSynthetic(
          mlir::Value syntheticFinalState = donorMappings[e.query].lookupOrNull(entryTarget);
          mlir::Value syntheticBuildState;
          if (syntheticFinalState) {
-            if (auto itShadow = findReuseMap(reuseSynthetic.mergedFromShadowState, syntheticFinalState);
-                itShadow != reuseSynthetic.mergedFromShadowState.end()) {
-               syntheticBuildState = itShadow->second;
-            } else {
-               syntheticBuildState = syntheticFinalState;
-            }
+            syntheticBuildState = resolveSplitMaterializeBuildState(synthetic, syntheticFinalState, reuseSynthetic);
          } else {
             mlir::Value entryBuildState = entryTarget;
             if (auto itShadow = findReuseMap(reuseEarly[e.query].mergedFromShadowState, entryTarget);

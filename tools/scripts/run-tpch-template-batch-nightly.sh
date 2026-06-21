@@ -17,9 +17,7 @@ BATCH_SIZES="${BATCH_SIZES:-2,4,8,16,32,64,128}"
 MODES="${MODES:-reuse_off,reuse_on_bloom_on,reuse_on_bloom_off,reuse_on_bloom_on_no_hiv_disjoint}"
 REPETITIONS="${REPETITIONS:-5}"
 TIMEOUT_S="${TIMEOUT_S:-0}"
-PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 RESUME="${RESUME:-1}"
-DRIVER="${DRIVER:-batch}"
 
 mkdir -p "$OUT_DIR"
 
@@ -34,7 +32,6 @@ echo "  batch_sizes: $BATCH_SIZES"
 echo "  modes: $MODES"
 echo "  repetitions: $REPETITIONS"
 echo "  timeout_s: $TIMEOUT_S"
-echo "  driver: $DRIVER"
 
 cmd=(
   python3 tools/scripts/tpch-template-batch-nightly.py
@@ -47,8 +44,6 @@ cmd=(
   --modes "$MODES"
   --repetitions "$REPETITIONS"
   --timeout-s "$TIMEOUT_S"
-  --progress-every "$PROGRESS_EVERY"
-  --driver "$DRIVER"
 )
 
 if [[ "$RESUME" != "0" ]]; then

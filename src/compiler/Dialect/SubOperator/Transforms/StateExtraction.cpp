@@ -4838,7 +4838,8 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
                              llvm::StringRef keySuffix,
                              llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
                              bool enableFilterPredReuse,
-                             const llvm::DenseMap<const StateMatchProfile*, unsigned>* reuseSlotByProfile = nullptr) {
+                             const llvm::DenseMap<const StateMatchProfile*, unsigned>* reuseSlotByProfile = nullptr,
+                             bool forceSplitMaterialize = false) {
       assert(members.size() >= 2 && "singleton clusters must not be materialized as reuse groups");
       std::string k = keyForSeed(keySeed);
       k.append(keySuffix.data(), keySuffix.size());
@@ -4874,7 +4875,7 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
          }
       }
       if (allHiv && !sameStoredHivLayout) g.requiresJoinLayoutUnion = true;
-      if (allResultTable && enableFilterPredReuse) g.requiresSplitMaterialize = true;
+      if (forceSplitMaterialize || (allResultTable && enableFilterPredReuse)) g.requiresSplitMaterialize = true;
       bool needsFilterPredReuse = enableFilterPredReuse;
       if (needsFilterPredReuse && allHiv) {
          needsFilterPredReuse = false;
@@ -5248,7 +5249,8 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
                                     llvm::function_ref<bool(const StateMatchProfile&)> seedOk,
                                     llvm::function_ref<bool(const StateMatchProfile&, const StateMatchProfile&)> peerOk,
                                     llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
-                                    bool enableFilterPredReuse) {
+                                    bool enableFilterPredReuse,
+                                    bool forceSplitMaterialize = false) {
       for (size_t i = 0; i < bucket.size(); i++) {
          auto* a = bucket[i];
          if (matchedStates.contains(a->value)) continue;
@@ -5277,6 +5279,11 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
          const bool allHiv = llvm::all_of(members, [](const StateMatchProfile* p) {
             return mlir::isa<subop::HashIndexedViewType>(p->value.getType());
          });
+         if (forceSplitMaterialize) {
+            emitMatchGroup(members, *a, "", keyForSeed, enableFilterPredReuse,
+                           /*reuseSlotByProfile=*/nullptr, /*forceSplitMaterialize=*/true);
+            continue;
+         }
          if (!(disableHivDisjointClustering && allHiv) &&
              tryEmitIdenticalFilterSubgroupDisjointGroups(members, keyForSeed, enableFilterPredReuse))
             continue;
@@ -5417,6 +5424,35 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
                    matchFiltersDefinitelyDisjoint(filtersA, filtersB);
          },
          aggregateNoFilterMatchKeyStr, /*enableFilterPredReuse=*/true);
+   }
+
+   for (uint64_t hash : aggregateNoFilterHashOrder) {
+      auto bucketIt = aggregateProfilesByNoFilterHash.find(hash);
+      assert(bucketIt != aggregateProfilesByNoFilterHash.end());
+      auto& bucket = bucketIt->second;
+      appendGroupFromBucket(
+         bucket,
+         [](const StateMatchProfile& p) {
+            return mlir::isa<subop::PreAggrHtType>(p.value.getType());
+         },
+         [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+            if (!mlir::isa<subop::PreAggrHtType>(b.value.getType())) return false;
+            if (a.hasUnsupportedResidualTableFilter || b.hasUnsupportedResidualTableFilter) return false;
+            if (aggregateDependencyNoFilterFingerprint(a.depTokensSorted) !=
+                aggregateDependencyNoFilterFingerprint(b.depTokensSorted))
+               return false;
+            if (a.aggregateGroupKeyFingerprint != b.aggregateGroupKeyFingerprint) return false;
+            if (!aggregateMixedPredDisjointReuseAllowed(a, b)) return false;
+            const QueryModel* modelA = modelByQueryId.lookup(a.queryId);
+            const QueryModel* modelB = modelByQueryId.lookup(b.queryId);
+            assert(modelA && modelB && "missing query model for aggregate split-materialize profile");
+            auto filtersA = decodeSimpleMatchFiltersAlongShadowChain(a.value, modelA->reuse);
+            auto filtersB = decodeSimpleMatchFiltersAlongShadowChain(b.value, modelB->reuse);
+            return !filtersA.empty() || !filtersB.empty() ||
+                   a.hasResidualTableFilter || b.hasResidualTableFilter;
+         },
+         aggregateNoFilterMatchKeyStr, /*enableFilterPredReuse=*/false,
+         /*forceSplitMaterialize=*/true);
    }
 
    ProfileBucketMap aggregateProfilesByMatchHash;
