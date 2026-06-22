@@ -155,6 +155,17 @@ static mlir::Value threadStateToNestedMaterializeStep(ExecutionStepOp materializ
    return ensureExecutionStepInput(materializeStep, current);
 }
 
+static bool valueDefinedInSameBlockBefore(mlir::Value value, mlir::Operation* op) {
+   mlir::Operation* def = value.getDefiningOp();
+   return def && def->getBlock() == op->getBlock() && def->isBeforeInBlock(op);
+}
+
+static mlir::Value stateToNestedBuildStep(ExecutionStepOp buildStep, mlir::Value state) {
+   if (valueDefinedInSameBlockBefore(state, buildStep.getOperation()))
+      return ensureExecutionStepInput(buildStep, state);
+   return threadStateToNestedMaterializeStep(buildStep, state);
+}
+
 static subop::MaterializeOp findUniqueMaterializeWritingState(ExecutionStepOp step, mlir::Value state) {
    state = canonicalizeStateValueForReuse(state);
    subop::MaterializeOp found;
@@ -209,12 +220,45 @@ static void clearGetExternalFiltersForState(mlir::Value tableState) {
    ge.setDescrAttr(mlir::StringAttr::get(ge.getContext(), lingodb::utility::serializeToHexString(ds)));
 }
 
+static void clearGetExternalFiltersMatchingColumns(
+   mlir::ModuleOp module,
+   llvm::ArrayRef<runtime::FilterDescription> filters) {
+   llvm::StringSet<> columns;
+   for (const runtime::FilterDescription& f : filters) {
+      if (f.op == runtime::FilterOp::NOTNULL) continue;
+      columns.insert(f.columnName);
+   }
+   if (columns.empty()) return;
+   module.walk([&](subop::GetExternalOp ge) {
+      auto ds = lingodb::utility::deserializeFromHexString<runtime::ExternalDatasourceProperty>(ge.getDescr());
+      bool touchesColumn = false;
+      for (const runtime::FilterDescription& f : ds.filterDescriptions) {
+         if (columns.contains(f.columnName)) {
+            touchesColumn = true;
+            break;
+         }
+      }
+      if (!touchesColumn) return;
+      ds.filterDescriptions.clear();
+      ds.orFilterClauses.clear();
+      ge.setDescrAttr(mlir::StringAttr::get(ge.getContext(), lingodb::utility::serializeToHexString(ds)));
+   });
+}
+
 static subop::ScanRefsOp findFirstScanRefsInStep(ExecutionStepOp step) {
    subop::ScanRefsOp found;
    step.walk([&](subop::ScanRefsOp scan) {
       if (!found) found = scan;
    });
    assert(found && "split-materialize branch filtering requires a scan_refs source");
+   return found;
+}
+
+static subop::ScanRefsOp tryFindFirstScanRefsInStep(ExecutionStepOp step) {
+   subop::ScanRefsOp found;
+   step.walk([&](subop::ScanRefsOp scan) {
+      if (!found) found = scan;
+   });
    return found;
 }
 
@@ -882,11 +926,23 @@ static mlir::Value cloneLinearStreamSuffixBefore(mlir::OpBuilder& b,
 struct SplitAggregateBuild {
    ExecutionStepOp step;
    subop::ScanRefsOp scan;
+   mlir::Value suffixStart;
    subop::LookupOrInsertOp lookup;
    subop::ReduceOp reduce;
 };
 
-static SplitAggregateBuild findUniqueAggregateBuildWritingState(mlir::ModuleOp module, mlir::Value state) {
+static mlir::Value findAggregateSuffixStart(subop::ReduceOp reduce) {
+   mlir::Value stream = reduce.getStream();
+   for (;;) {
+      mlir::Operation* def = stream.getDefiningOp();
+      if (!def) return {};
+      if (mlir::isa<subop::ScanRefsOp, subop::ScanListOp>(def)) return stream;
+      stream = streamInputOfLinearSuffixOp(def);
+   }
+}
+
+static std::optional<SplitAggregateBuild> tryFindUniqueAggregateBuildWritingState(mlir::ModuleOp module,
+                                                                                  mlir::Value state) {
    state = canonicalizeStateValueForReuse(state);
    SplitAggregateBuild found;
    module.walk([&](subop::LookupOrInsertOp lookup) {
@@ -898,7 +954,7 @@ static SplitAggregateBuild findUniqueAggregateBuildWritingState(mlir::ModuleOp m
       found.step = lookup->getParentOfType<ExecutionStepOp>();
       assert(found.step && "split-aggregate lookup_or_insert must be inside an execution_step");
    });
-   assert(found.lookup && "split-aggregate reuse requires a lookup_or_insert writer");
+   if (!found.lookup) return std::nullopt;
 
    tuples::Column* lookupRefColumn = &found.lookup.getRef().getColumn();
    found.step.walk([&](subop::ReduceOp reduce) {
@@ -906,9 +962,17 @@ static SplitAggregateBuild findUniqueAggregateBuildWritingState(mlir::ModuleOp m
       assert(!found.reduce && "split-aggregate reuse expects one reduce for lookup_or_insert");
       found.reduce = reduce;
    });
-   assert(found.reduce && "split-aggregate reuse requires a reduce after lookup_or_insert");
-   found.scan = findFirstScanRefsInStep(found.step);
+   if (!found.reduce) return std::nullopt;
+   found.scan = tryFindFirstScanRefsInStep(found.step);
+   found.suffixStart = found.scan ? found.scan.getRes() : findAggregateSuffixStart(found.reduce);
+   if (!found.suffixStart) return std::nullopt;
    return found;
+}
+
+static SplitAggregateBuild findUniqueAggregateBuildWritingState(mlir::ModuleOp module, mlir::Value state) {
+   std::optional<SplitAggregateBuild> found = tryFindUniqueAggregateBuildWritingState(module, state);
+   assert(found && "split-aggregate reuse requires a lookup_or_insert/reduce writer");
+   return *found;
 }
 
 static llvm::SmallVector<mlir::Operation*, 8>
@@ -952,18 +1016,132 @@ static void alignClonedAggregateRefAndReduceMembers(subop::LookupOrInsertOp look
    reduce.setMembersAttr(mlir::ArrayAttr::get(ctx, members));
 }
 
+static llvm::StringRef stripReuseSuffix(llvm::StringRef s) {
+   size_t pos = s.find('$');
+   return pos == llvm::StringRef::npos ? s : s.take_front(pos);
+}
+
+static void rememberAggregateBranchColumn(mlir::MLIRContext* ctx,
+                                          llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
+                                          tuples::ColumnDefAttr def) {
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   tuples::ColumnRefAttr ref = cm.createRef(&def.getColumn());
+   auto [scope, leaf] = cm.getName(&def.getColumn());
+   (void)scope;
+   colByName[leaf] = ref;
+   colByName[stripReuseSuffix(leaf)] = ref;
+}
+
+static void rememberAggregateBranchGatherColumns(
+   subop::GatherOp gather,
+   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName) {
+   auto* ctx = gather.getContext();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (auto& [member, def] : gather.getMapping().getMapping()) {
+      tuples::ColumnRefAttr ref = cm.createRef(&def.getColumn());
+      llvm::StringRef memberName = mm.getName(member);
+      colByName[memberName] = ref;
+      colByName[stripReuseSuffix(memberName)] = ref;
+      auto [scope, leaf] = cm.getName(&def.getColumn());
+      (void)scope;
+      colByName[leaf] = ref;
+      colByName[stripReuseSuffix(leaf)] = ref;
+   }
+}
+
+static void rememberAggregateBranchMapColumns(
+   subop::MapOp map,
+   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
+   tuples::ColumnRefAttr& tableEntryRef) {
+   for (auto attr : map.getComputedCols()) {
+      auto def = mlir::cast<tuples::ColumnDefAttr>(attr);
+      rememberAggregateBranchColumn(map.getContext(), colByName, def);
+      if (mlir::isa<subop::TableEntryRefType>(def.getColumn().type)) {
+         auto& cm = map.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+         tableEntryRef = cm.createRef(&def.getColumn());
+      }
+   }
+}
+
+static std::optional<subop::Member> findTableEntryMemberForFilter(tuples::ColumnRefAttr tableEntryRef,
+                                                                  llvm::StringRef columnName) {
+   auto refTy = mlir::dyn_cast<subop::TableEntryRefType>(tableEntryRef.getColumn().type);
+   if (!refTy) return std::nullopt;
+   auto* ctx = tableEntryRef.getContext();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (subop::Member member : refTy.getTableColumns().getMembers()) {
+      if (stripReuseSuffix(mm.getName(member)) == columnName) return member;
+   }
+   return std::nullopt;
+}
+
+static mlir::Value gatherMissingAggregateBranchFilterColumns(
+   mlir::OpBuilder& b,
+   mlir::Location loc,
+   mlir::Value stream,
+   tuples::ColumnRefAttr tableEntryRef,
+   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
+   llvm::ArrayRef<runtime::FilterDescription> filters) {
+   llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>, 8> mappings;
+   auto* ctx = b.getContext();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   llvm::StringSet<> seen;
+   for (const runtime::FilterDescription& f : filters) {
+      if (f.op == runtime::FilterOp::NOTNULL || colByName.contains(f.columnName)) continue;
+      if (!seen.insert(f.columnName).second) continue;
+      assert(tableEntryRef && "split aggregate scan_list branch needs table entry ref for filter columns");
+      std::optional<subop::Member> member = findTableEntryMemberForFilter(tableEntryRef, f.columnName);
+      assert(member && "split aggregate scan_list branch missing filter member on table entry ref");
+      tuples::ColumnDefAttr def = cm.createDef(cm.getUniqueScope("split_agg_filter_col"), f.columnName);
+      def.getColumn().type = mm.getType(*member);
+      mappings.push_back({*member, def});
+   }
+   if (mappings.empty()) return stream;
+   llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> attrMappings(mappings.begin(), mappings.end());
+   auto gather = b.create<subop::GatherOp>(loc, stream, tableEntryRef,
+                                           subop::ColumnDefMemberMappingAttr::get(ctx, attrMappings));
+   rememberAggregateBranchGatherColumns(gather, colByName);
+   b.setInsertionPointAfter(gather);
+   return gather.getRes();
+}
+
+static mlir::Value materializeAggregateBranchFiltersBeforeLookup(
+   mlir::OpBuilder& b,
+   mlir::Location loc,
+   mlir::Value stream,
+   tuples::ColumnRefAttr tableEntryRef,
+   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
+   llvm::ArrayRef<runtime::FilterDescription> filters) {
+   if (filters.empty()) return stream;
+   stream = gatherMissingAggregateBranchFilterColumns(b, loc, stream, tableEntryRef, colByName, filters);
+   mlir::Value filtered = materializeRuntimeFiltersAsSubopFilter(b, loc, stream, colByName, filters);
+   if (mlir::Operation* def = filtered.getDefiningOp()) b.setInsertionPointAfter(def);
+   return filtered;
+}
+
 static void cloneAggregateSuffixToReduce(mlir::OpBuilder& b,
                                          mlir::Value suffixStart,
                                          subop::ReduceOp reduce,
                                          mlir::Value newStart,
-                                         mlir::Value newState) {
+                                         mlir::Value newState,
+                                         llvm::ArrayRef<runtime::FilterDescription> filters = {}) {
    llvm::SmallVector<mlir::Operation*, 8> ops = linearStreamOpsBeforeReduce(suffixStart, reduce);
    mlir::IRMapping mapping;
    subop::ColumnMapping columnMapping;
    mapping.map(suffixStart, newStart);
    mlir::Value current = newStart;
+   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr> colByName;
+   tuples::ColumnRefAttr tableEntryRef;
+   bool filtersInserted = filters.empty();
    subop::LookupOrInsertOp clonedLookup;
    for (mlir::Operation* op : ops) {
+      if (!filtersInserted && mlir::isa<subop::LookupOrInsertOp>(op)) {
+         current = materializeAggregateBranchFiltersBeforeLookup(b, op->getLoc(), current, tableEntryRef,
+                                                                 colByName, filters);
+         filtersInserted = true;
+      }
       mapping.map(streamInputOfLinearSuffixOp(op), current);
       if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(op))
          mapping.map(lookup.getState(), newState);
@@ -971,7 +1149,13 @@ static void cloneAggregateSuffixToReduce(mlir::OpBuilder& b,
       mlir::Operation* cloned = sub.cloneSubOp(b, mapping, columnMapping);
       if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(cloned)) clonedLookup = lookup;
       current = streamResultOfLinearSuffixOp(cloned);
+      if (auto gather = mlir::dyn_cast<subop::GatherOp>(cloned)) {
+         rememberAggregateBranchGatherColumns(gather, colByName);
+      } else if (auto map = mlir::dyn_cast<subop::MapOp>(cloned)) {
+         rememberAggregateBranchMapColumns(map, colByName, tableEntryRef);
+      }
    }
+   assert(filtersInserted && "split aggregate branch filters must be inserted before lookup_or_insert");
    mapping.map(reduce.getStream(), current);
    auto* clonedReduceOp =
       mlir::cast<subop::SubOperator>(reduce.getOperation()).cloneSubOp(b, mapping, columnMapping);
@@ -1040,6 +1224,13 @@ static mlir::Value resolveSplitMaterializeBuildState(mlir::ModuleOp module, mlir
    if (tryFindUniqueMaterializeStepWritingState(module, target)) return target;
    if (std::optional<mlir::Value> mergeInput = mergeInputForFinalState(module, target)) return *mergeInput;
    return target;
+}
+
+static bool splitAggregateBuildRewriteSupported(mlir::ModuleOp module, mlir::Value target,
+                                                const ModuleReuseInfo& reuse) {
+   mlir::Value buildState = resolveSplitMaterializeBuildState(module, target, reuse);
+   std::optional<SplitAggregateBuild> build = tryFindUniqueAggregateBuildWritingState(module, buildState);
+   return build && build->suffixStart;
 }
 
 llvm::SmallVector<CacheTarget, 64> cacheTargetsWithFilterPredReuse(llvm::ArrayRef<CacheTarget> targets) {
@@ -1862,6 +2053,10 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    };
    res.numTargetsQuery0NoTable = countNoTable(targets0);
    res.numTargetsQuery1NoTable = countNoTable(targets1);
+   res.numUnionTargetsQuery0 = res.numTargetsQuery0;
+   res.numUnionTargetsQuery1 = res.numTargetsQuery1;
+   res.numUnionTargetsQuery0NoTable = res.numTargetsQuery0NoTable;
+   res.numUnionTargetsQuery1NoTable = res.numTargetsQuery1NoTable;
 
    if (targets0.empty() || targets1.empty()) {
       return res;
@@ -1920,6 +2115,8 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
    }
    res.numTargetsQuery0Mapped = targetsQ0.size();
    res.numTargetsQuery0MappedNoTable = countNoTable(targetsQ0);
+   res.numUnionTargetsQuery0Mapped = res.numTargetsQuery0Mapped;
+   res.numUnionTargetsQuery0MappedNoTable = res.numTargetsQuery0MappedNoTable;
    if (targetsQ0.empty()) {
       return res;
    }
@@ -2029,6 +2226,10 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
    BatchReusePlanRewriteResult res;
    res.numTargetsPerQuery.resize(queries.size(), 0);
    res.numTargetsNoTablePerQuery.resize(queries.size(), 0);
+   res.numUnionTargetsPerQuery.resize(queries.size(), 0);
+   res.numUnionTargetsNoTablePerQuery.resize(queries.size(), 0);
+   res.numBuildStepTargetsPerQuery.resize(queries.size(), 0);
+   res.numBuildStepTargetsNoTablePerQuery.resize(queries.size(), 0);
 
    llvm::SmallVector<ModuleReuseInfo, 8> reuseEarly;
    reuseEarly.reserve(queries.size());
@@ -2087,8 +2288,10 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
       int donorQuery = -1;
       mlir::Value donorState;
       CacheTarget donorTarget;
+      bool isBuildStepReuse = false;
    };
    llvm::SmallVector<DonorGroup, 32> donorGroups;
+   llvm::SmallVector<CrossQueryStateMatchGroup, 64> activeRewriteGroups;
    llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>> consumerSlotByCacheKeyAndQuery;
 
    auto countNoTable = [](llvm::ArrayRef<CacheTarget> targets) -> size_t {
@@ -2102,21 +2305,28 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
    for (const CrossQueryStateMatchGroup& g : rewriteGroups) {
       if (g.entries.size() < 2) continue;
       const CrossQueryStateMatchEntry* donor = nullptr;
-      bool unsupportedAggregateUnion = false;
+      bool unsupportedAggregateGroup = false;
       for (const CrossQueryStateMatchEntry& e : g.entries) {
          if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
          if (!e.state) continue;
          mlir::Value targetState = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
          assert(targetState && "batch reuse target must resolve during aggregate support check");
-         if (!g.requiresSplitMaterialize &&
-             mlir::isa<subop::PreAggrHtType>(targetState.getType()) &&
-             !aggregateHashTablePayloadUnionSupported(e.state, reuseEarly[e.query])) {
-            unsupportedAggregateUnion = true;
+         if (mlir::isa<subop::PreAggrHtType>(targetState.getType())) {
+            bool supported = g.requiresSplitMaterialize
+                                ? splitAggregateBuildRewriteSupported(queries[e.query], targetState,
+                                                                      reuseEarly[e.query])
+                                : aggregateHashTablePayloadUnionSupported(e.state, reuseEarly[e.query]);
+            if (!supported) {
+               unsupportedAggregateGroup = true;
+               break;
+            }
+         }
+         if (unsupportedAggregateGroup) {
             break;
          }
          if (!donor || e.query < donor->query) donor = &e;
       }
-      if (unsupportedAggregateUnion) continue;
+      if (unsupportedAggregateGroup) continue;
       if (!donor) continue;
 
       mlir::Value donorTargetState =
@@ -2128,7 +2338,9 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
       EffectiveGroupRewriteFlags flags = flagsByCacheKey.lookup(g.cacheKey);
       donorGroups.push_back(DonorGroup{
          &g, donor->query, donor->state,
-         CacheTarget{donorTargetState, g.cacheKey, flags.enableFilterPredReuse}});
+         CacheTarget{donorTargetState, g.cacheKey, flags.enableFilterPredReuse},
+         g.requiresSplitMaterialize});
+      activeRewriteGroups.push_back(g);
 
       for (const CrossQueryStateMatchEntry& e : g.entries) {
          if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
@@ -2143,12 +2355,20 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
                                       ? splitMaterializeOutputCacheKey(g.cacheKey, splitSlot)
                                       : g.cacheKey;
          targetsByQuery[e.query].push_back(CacheTarget{targetState, targetCacheKey, flags.enableFilterPredReuse});
+         llvm::SmallVector<size_t, 8>& categoryTargets =
+            g.requiresSplitMaterialize ? res.numBuildStepTargetsPerQuery : res.numUnionTargetsPerQuery;
+         llvm::SmallVector<size_t, 8>& categoryTargetsNoTable =
+            g.requiresSplitMaterialize ? res.numBuildStepTargetsNoTablePerQuery
+                                       : res.numUnionTargetsNoTablePerQuery;
+         categoryTargets[e.query]++;
+         if (!mlir::isa<TableType>(targetState.getType())) categoryTargetsNoTable[e.query]++;
          consumerSlotByCacheKeyAndQuery[g.cacheKey][static_cast<unsigned>(e.query)] =
             mlir::isa<subop::PreAggrHtType>(targetState.getType())
                ? splitSlot
                : static_cast<unsigned>(e.query);
       }
    }
+   rewriteGroups = std::move(activeRewriteGroups);
    inheritConsumerSlotsFromGroupDeps(rewriteGroups, consumerSlotByCacheKeyAndQuery);
 
    for (size_t i = 0; i < targetsByQuery.size(); ++i) {
@@ -2192,7 +2412,9 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
       stepsToClone = augmentStepsWithOperandProducerClosure(donorGroup, stepsToClone);
       donorMappings[qi] = cloneExecutionStepsToQuery0(synthGroup, stepsToClone);
 
-      for (const CacheTarget& t : donorTargets) {
+      for (const DonorGroup& dg : donorGroups) {
+         if (static_cast<size_t>(dg.donorQuery) != qi) continue;
+         const CacheTarget& t = dg.donorTarget;
          mlir::Value mapped = donorMappings[qi].lookupOrNull(t.state);
          if (!mapped && !t.state.getDefiningOp()) {
             if (auto itW = reuseEarly[qi].writerStepsByState.find(t.state);
@@ -2203,6 +2425,13 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
          }
          assert(mapped && "batch reuse target must map into synthetic module");
          targetsSynthetic.push_back(CacheTarget{mapped, t.cacheKey, t.enableFilterPredReuse});
+         if (dg.isBuildStepReuse) {
+            res.numBuildStepTargetsSyntheticMapped++;
+            if (!mlir::isa<TableType>(mapped.getType())) res.numBuildStepTargetsSyntheticMappedNoTable++;
+         } else {
+            res.numUnionTargetsSyntheticMapped++;
+            if (!mlir::isa<TableType>(mapped.getType())) res.numUnionTargetsSyntheticMappedNoTable++;
+         }
       }
    }
 
@@ -2367,14 +2596,36 @@ static void expandSplitMaterializeTargetsInSynthetic(
       CacheTarget donorSyntheticTarget = itTarget->second;
       mlir::Value donorSyntheticBuildState =
          resolveSplitMaterializeBuildState(synthetic, donorSyntheticTarget.state, reuseSynthetic);
-      if (!tryFindUniqueMaterializeStepWritingState(synthetic, donorSyntheticBuildState)) {
-         SplitAggregateBuild aggBuild =
-            findUniqueAggregateBuildWritingState(synthetic, donorSyntheticBuildState);
-         clearGetExternalFiltersForState(canonicalizeStateValueForReuse(aggBuild.scan.getState()));
-         mlir::Value suffixStart = aggBuild.scan.getRes();
+	      if (!tryFindUniqueMaterializeStepWritingState(synthetic, donorSyntheticBuildState)) {
+	         SplitAggregateBuild aggBuild =
+	            findUniqueAggregateBuildWritingState(synthetic, donorSyntheticBuildState);
+	         llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>> decodedFiltersByEntryTarget;
+	         llvm::SmallVector<runtime::FilterDescription, 32> allBranchFilters;
+	         for (const CrossQueryStateMatchEntry& e : g.entries) {
+	            assert(e.query >= 0 && static_cast<size_t>(e.query) < queries.size());
+	            unsigned slot = e.reuseSlot == std::numeric_limits<unsigned>::max()
+	                               ? static_cast<unsigned>(e.query)
+	                               : e.reuseSlot;
+	            uint64_t outputKey = splitMaterializeOutputCacheKey(g.cacheKey, slot);
+	            mlir::Value entryTarget = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
+	            assert(entryTarget && "split-aggregate entry target must resolve");
+	            llvm::SmallVector<CacheTarget, 1> filterTarget{CacheTarget{entryTarget, outputKey, false}};
+	            llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>> decodedByTarget =
+	               decodeFiltersByCacheTargets(filterTarget, reuseEarly[e.query]);
+	            if (auto itFilters = decodedByTarget.find(entryTarget); itFilters != decodedByTarget.end()) {
+	               decodedFiltersByEntryTarget[entryTarget] = itFilters->second;
+	               allBranchFilters.append(itFilters->second.begin(), itFilters->second.end());
+	            }
+	         }
+	         if (aggBuild.scan) {
+	            clearGetExternalFiltersForState(canonicalizeStateValueForReuse(aggBuild.scan.getState()));
+	         } else {
+	            clearGetExternalFiltersMatchingColumns(synthetic, allBranchFilters);
+	         }
+	         mlir::Value suffixStart = aggBuild.suffixStart;
 
-         for (const CrossQueryStateMatchEntry& e : g.entries) {
-            assert(e.query >= 0 && static_cast<size_t>(e.query) < queries.size());
+	         for (const CrossQueryStateMatchEntry& e : g.entries) {
+	            assert(e.query >= 0 && static_cast<size_t>(e.query) < queries.size());
             unsigned slot = e.reuseSlot == std::numeric_limits<unsigned>::max()
                                ? static_cast<unsigned>(e.query)
                                : e.reuseSlot;
@@ -2382,45 +2633,47 @@ static void expandSplitMaterializeTargetsInSynthetic(
 
             mlir::Value entryTarget = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
             assert(entryTarget && "split-aggregate entry target must resolve");
-            mlir::Value syntheticFinalState = donorMappings[e.query].lookupOrNull(entryTarget);
-            mlir::Value syntheticBuildState;
-            if (syntheticFinalState) {
-               syntheticBuildState = resolveSplitMaterializeBuildState(synthetic, syntheticFinalState, reuseSynthetic);
-            } else {
-               mlir::Value entryBuildState = entryTarget;
-               if (auto itShadow = findReuseMap(reuseEarly[e.query].mergedFromShadowState, entryTarget);
-                   itShadow != reuseEarly[e.query].mergedFromShadowState.end()) {
+	            mlir::Value syntheticFinalState = donorMappings[e.query].lookupOrNull(entryTarget);
+	            mlir::Value syntheticBuildState;
+	            if (syntheticFinalState) {
+	               syntheticBuildState = resolveSplitMaterializeBuildState(synthetic, syntheticFinalState, reuseSynthetic);
+	            } else {
+	               ExecutionStepOp aggregateTopStep = topLevelExecutionStepFor(aggBuild.step);
+	               mlir::Value entryBuildState = entryTarget;
+	               if (auto itShadow = findReuseMap(reuseEarly[e.query].mergedFromShadowState, entryTarget);
+	                   itShadow != reuseEarly[e.query].mergedFromShadowState.end()) {
                   entryBuildState = itShadow->second;
-               }
-               auto itCreate = findReuseMap(reuseEarly[e.query].createOnlyStepForState, entryBuildState);
-               assert(itCreate != reuseEarly[e.query].createOnlyStepForState.end() &&
-                      "split-aggregate peer build state needs a create-only step");
-               syntheticBuildState = cloneCreateOnlyStepBefore(aggBuild.step, itCreate->second, entryBuildState);
+	               }
+	               auto itCreate = findReuseMap(reuseEarly[e.query].createOnlyStepForState, entryBuildState);
+	               assert(itCreate != reuseEarly[e.query].createOnlyStepForState.end() &&
+	                      "split-aggregate peer build state needs a create-only step");
+	               syntheticBuildState = cloneCreateOnlyStepBefore(aggregateTopStep, itCreate->second, entryBuildState);
 
-               if (canonicalizeStateValueForReuse(entryBuildState) == canonicalizeStateValueForReuse(entryTarget)) {
-                  syntheticFinalState = syntheticBuildState;
-               } else {
+	               if (canonicalizeStateValueForReuse(entryBuildState) == canonicalizeStateValueForReuse(entryTarget)) {
+	                  syntheticFinalState = syntheticBuildState;
+	               } else {
                   auto itMerge = findReuseMap(reuseEarly[e.query].writerStepsByState, entryTarget);
-                  assert(itMerge != reuseEarly[e.query].writerStepsByState.end() && itMerge->second.size() == 1 &&
-                         "split-aggregate peer final state needs one merge writer");
-                  syntheticFinalState =
-                     cloneMergeStepAfter(aggBuild.step, itMerge->second.front(), entryBuildState,
-                                         syntheticBuildState, entryTarget);
-               }
-            }
+	                  assert(itMerge != reuseEarly[e.query].writerStepsByState.end() && itMerge->second.size() == 1 &&
+	                         "split-aggregate peer final state needs one merge writer");
+	                  syntheticFinalState =
+	                     cloneMergeStepAfter(aggregateTopStep, itMerge->second.front(), entryBuildState,
+	                                         syntheticBuildState, entryTarget);
+	               }
+	            }
 
-            mlir::Value stateArg = threadStateToNestedMaterializeStep(aggBuild.step, syntheticBuildState);
-            llvm::SmallVector<CacheTarget, 1> filterTarget{CacheTarget{entryTarget, outputKey, false}};
-            llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>> decodedByTarget =
-               decodeFiltersByCacheTargets(filterTarget, reuseEarly[e.query]);
-            mlir::Value branchStream = suffixStart;
-            if (auto itFilters = decodedByTarget.find(entryTarget);
-                itFilters != decodedByTarget.end() && !itFilters->second.empty()) {
-               auto [predStream, predRef] = materializeRuntimeFiltersAsPredicateColumnAfterScanRefs(
-                  aggBuild.scan, itFilters->second, "split_agg_pred", /*rewireDownstreamUses=*/false);
-               mlir::Operation* predAnchor = predStream.getDefiningOp();
-               assert(predAnchor && "split-aggregate predicate stream must be op-defined");
-               mlir::OpBuilder fb(predAnchor);
+	            mlir::Value stateArg = stateToNestedBuildStep(aggBuild.step, syntheticBuildState);
+	            llvm::ArrayRef<runtime::FilterDescription> filters;
+	            if (auto itFilters = decodedFiltersByEntryTarget.find(entryTarget);
+	                itFilters != decodedFiltersByEntryTarget.end()) {
+	               filters = itFilters->second;
+	            }
+	            mlir::Value branchStream = suffixStart;
+	            if (aggBuild.scan && !filters.empty()) {
+	               auto [predStream, predRef] = materializeRuntimeFiltersAsPredicateColumnAfterScanRefs(
+	                  aggBuild.scan, filters, "split_agg_pred", /*rewireDownstreamUses=*/false);
+	               mlir::Operation* predAnchor = predStream.getDefiningOp();
+	               assert(predAnchor && "split-aggregate predicate stream must be op-defined");
+	               mlir::OpBuilder fb(predAnchor);
                fb.setInsertionPointAfter(predAnchor);
                auto filter = fb.create<subop::FilterOp>(aggBuild.scan.getLoc(), predStream,
                                                         subop::FilterSemantic::all_true,
@@ -2428,11 +2681,13 @@ static void expandSplitMaterializeTargetsInSynthetic(
                branchStream = filter.getRes();
             }
 
-            mlir::OpBuilder b(aggBuild.lookup);
-            b.setInsertionPoint(aggBuild.lookup);
-            cloneAggregateSuffixToReduce(b, suffixStart, aggBuild.reduce, branchStream, stateArg);
-            expanded.push_back(CacheTarget{syntheticFinalState, outputKey, /*enableFilterPredReuse=*/false});
-         }
+	            mlir::OpBuilder b(aggBuild.lookup);
+	            b.setInsertionPoint(aggBuild.lookup);
+	            cloneAggregateSuffixToReduce(b, suffixStart, aggBuild.reduce, branchStream, stateArg,
+	                                         aggBuild.scan ? llvm::ArrayRef<runtime::FilterDescription>{}
+	                                                       : filters);
+	            expanded.push_back(CacheTarget{syntheticFinalState, outputKey, /*enableFilterPredReuse=*/false});
+	         }
          eraseOriginalAggregateSuffix(suffixStart, aggBuild.reduce);
          continue;
       }
@@ -2753,6 +3008,10 @@ BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
    BatchReusePlanRewriteResult total;
    total.numTargetsPerQuery.resize(queries.size(), 0);
    total.numTargetsNoTablePerQuery.resize(queries.size(), 0);
+   total.numUnionTargetsPerQuery.resize(queries.size(), 0);
+   total.numUnionTargetsNoTablePerQuery.resize(queries.size(), 0);
+   total.numBuildStepTargetsPerQuery.resize(queries.size(), 0);
+   total.numBuildStepTargetsNoTablePerQuery.resize(queries.size(), 0);
 
    llvm::SmallVector<CrossQueryStateMatchGroup, 64> currentGroups(groups.begin(), groups.end());
    constexpr unsigned maxFixedPointIterations = 8;
@@ -2767,9 +3026,21 @@ BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
          if (qi < one.numTargetsPerQuery.size()) total.numTargetsPerQuery[qi] += one.numTargetsPerQuery[qi];
          if (qi < one.numTargetsNoTablePerQuery.size())
             total.numTargetsNoTablePerQuery[qi] += one.numTargetsNoTablePerQuery[qi];
+         if (qi < one.numUnionTargetsPerQuery.size())
+            total.numUnionTargetsPerQuery[qi] += one.numUnionTargetsPerQuery[qi];
+         if (qi < one.numUnionTargetsNoTablePerQuery.size())
+            total.numUnionTargetsNoTablePerQuery[qi] += one.numUnionTargetsNoTablePerQuery[qi];
+         if (qi < one.numBuildStepTargetsPerQuery.size())
+            total.numBuildStepTargetsPerQuery[qi] += one.numBuildStepTargetsPerQuery[qi];
+         if (qi < one.numBuildStepTargetsNoTablePerQuery.size())
+            total.numBuildStepTargetsNoTablePerQuery[qi] += one.numBuildStepTargetsNoTablePerQuery[qi];
       }
       total.numTargetsSyntheticMapped += one.numTargetsSyntheticMapped;
       total.numTargetsSyntheticMappedNoTable += one.numTargetsSyntheticMappedNoTable;
+      total.numUnionTargetsSyntheticMapped += one.numUnionTargetsSyntheticMapped;
+      total.numUnionTargetsSyntheticMappedNoTable += one.numUnionTargetsSyntheticMappedNoTable;
+      total.numBuildStepTargetsSyntheticMapped += one.numBuildStepTargetsSyntheticMapped;
+      total.numBuildStepTargetsSyntheticMappedNoTable += one.numBuildStepTargetsSyntheticMappedNoTable;
 
       if (one.synthetic) {
          if (!total.synthetic) {

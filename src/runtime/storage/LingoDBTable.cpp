@@ -1,6 +1,7 @@
 #include "lingodb/runtime/storage/LingoDBTable.h"
 #include "lingodb/catalog/Defs.h"
 #include "lingodb/runtime/ArrowView.h"
+#include "lingodb/runtime/Tracing.h"
 #include "lingodb/runtime/storage/Restrictions.h"
 #include "lingodb/scheduler/Tasks.h"
 #include "lingodb/utility/Serialization.h"
@@ -384,6 +385,7 @@ class ScanBatchesTask : public lingodb::scheduler::TaskWithImplicitContext {
       if (unitId < 0) {
          return;
       }
+      lingodb::runtime::RuntimeScanCpuProfiler::Scope scanCpuScope;
       auto [selVec1, selVec2] = selVecs[lingodb::scheduler::currentWorkerId()];
       size_t begin = splitSize * unitId;
       size_t len = std::min(begin + splitSize, chunk.getNumRows()) - begin;
@@ -506,6 +508,7 @@ class ScanBatchesSingleThreadedTask : public lingodb::scheduler::TaskWithImplici
       uint16_t* selVec2 = new uint16_t[BatchView::maxBatchSize];
 
       for (auto& batch : batches) {
+         lingodb::runtime::RuntimeScanCpuProfiler::Scope scanCpuScope;
          utility::Tracer::Trace trace(processMorselSingle);
          for (size_t start = 0; start < batch.getNumRows(); start += BatchView::maxBatchSize) {
             size_t len = batch.getNumRows() - start;

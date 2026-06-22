@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import collections
 import json
 import os
+import selectors
 import statistics
 import subprocess
 import time
@@ -61,6 +63,16 @@ def build_summary(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             for r in ok_rows
             if isinstance(r.get("reuse_targets_no_table"), list)
         ]
+        reuse_union_counts = [
+            sum(r["reuse_targets_union_no_table"])
+            for r in ok_rows
+            if isinstance(r.get("reuse_targets_union_no_table"), list)
+        ]
+        reuse_build_step_counts = [
+            sum(r["reuse_targets_build_step_no_table"])
+            for r in ok_rows
+            if isinstance(r.get("reuse_targets_build_step_no_table"), list)
+        ]
         out.append(
             {
                 "db_label": db_label,
@@ -75,6 +87,10 @@ def build_summary(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "total_time_geo_mean_ms": geo_mean(times),
                 "total_time_median_ms": statistics.median(times) if times else None,
                 "reuse_count_no_table_median_sum": statistics.median(reuse_counts) if reuse_counts else None,
+                "reuse_count_union_no_table_median_sum":
+                    statistics.median(reuse_union_counts) if reuse_union_counts else None,
+                "reuse_count_build_step_no_table_median_sum":
+                    statistics.median(reuse_build_step_counts) if reuse_build_step_counts else None,
             }
         )
     return out
@@ -148,14 +164,41 @@ def run_batch_driver_for_mode(
     ]
     env = build_env()
     timeout = None if timeout_s <= 0 else timeout_s
-    proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=timeout)
-    stdout = proc.stdout.decode("utf-8", errors="replace")
-    stderr = proc.stderr.decode("utf-8", errors="replace")
-    if stderr:
-        print(stderr, end="", flush=True)
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    tail: collections.deque[str] = collections.deque(maxlen=80)
+    start = time.monotonic()
+    while True:
+        if timeout is not None and time.monotonic() - start > timeout:
+            proc.kill()
+            raise SystemExit(f"batch driver timed out for db={db} mode={mode} after {timeout_s}s")
+        for key, _ in sel.select(timeout=0.5):
+            line = key.fileobj.readline()
+            if not line:
+                continue
+            print(line, end="", flush=True)
+            tail.append(line.rstrip("\n"))
+        if proc.poll() is not None:
+            rest = proc.stdout.read()
+            if rest:
+                for line in rest.splitlines(True):
+                    print(line, end="", flush=True)
+                    tail.append(line.rstrip("\n"))
+            break
     if proc.returncode != 0:
-        if stdout:
-            print("\n".join(stdout.splitlines()[-80:]), flush=True)
+        if tail:
+            print("\n".join(tail), flush=True)
         raise SystemExit(f"batch driver failed for db={db} mode={mode} rc={proc.returncode}")
     with out_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -217,7 +260,7 @@ def run_batch_driver(args: argparse.Namespace) -> None:
             write_json(out_path, meta, records)
 
     write_json(out_path, meta, records)
-    print(f"wrote {out_path}")
+    print(f"wrote {out_path}", flush=True)
 
 
 def main() -> None:

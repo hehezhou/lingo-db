@@ -27,6 +27,20 @@ struct ReusePlanRewriteResult {
    size_t numTargetsQuery0NoTable = 0;
    size_t numTargetsQuery1NoTable = 0;
    size_t numTargetsQuery0MappedNoTable = 0;
+   // Union reuse means the consumer gets a shared identical/mixed state. Build-step reuse means
+   // construction is shared, but each consumer still gets a separate final state.
+   size_t numUnionTargetsQuery0 = 0;
+   size_t numUnionTargetsQuery1 = 0;
+   size_t numUnionTargetsQuery0Mapped = 0;
+   size_t numUnionTargetsQuery0NoTable = 0;
+   size_t numUnionTargetsQuery1NoTable = 0;
+   size_t numUnionTargetsQuery0MappedNoTable = 0;
+   size_t numBuildStepTargetsQuery0 = 0;
+   size_t numBuildStepTargetsQuery1 = 0;
+   size_t numBuildStepTargetsQuery0Mapped = 0;
+   size_t numBuildStepTargetsQuery0NoTable = 0;
+   size_t numBuildStepTargetsQuery1NoTable = 0;
+   size_t numBuildStepTargetsQuery0MappedNoTable = 0;
 };
 
 struct BatchReusePlanRewriteResult {
@@ -35,6 +49,14 @@ struct BatchReusePlanRewriteResult {
    llvm::SmallVector<size_t, 8> numTargetsNoTablePerQuery;
    size_t numTargetsSyntheticMapped = 0;
    size_t numTargetsSyntheticMappedNoTable = 0;
+   llvm::SmallVector<size_t, 8> numUnionTargetsPerQuery;
+   llvm::SmallVector<size_t, 8> numUnionTargetsNoTablePerQuery;
+   llvm::SmallVector<size_t, 8> numBuildStepTargetsPerQuery;
+   llvm::SmallVector<size_t, 8> numBuildStepTargetsNoTablePerQuery;
+   size_t numUnionTargetsSyntheticMapped = 0;
+   size_t numUnionTargetsSyntheticMappedNoTable = 0;
+   size_t numBuildStepTargetsSyntheticMapped = 0;
+   size_t numBuildStepTargetsSyntheticMappedNoTable = 0;
 };
 
 // Three-stage pipeline:

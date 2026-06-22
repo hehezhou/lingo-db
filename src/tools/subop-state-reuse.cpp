@@ -17,6 +17,7 @@
 #include "lingodb/runtime/ArrowTable.h"
 #include "lingodb/runtime/ExecutionContext.h"
 #include "lingodb/runtime/Session.h"
+#include "lingodb/runtime/Tracing.h"
 #include "lingodb/scheduler/Scheduler.h"
 #include "lingodb/scheduler/Tasks.h"
 
@@ -494,7 +495,27 @@ static SubOpExecuteTiming executeFromSubOpLayer(mlir::ModuleOp subopModule,
       // Does not affect `executionTime` (measured around `main()` only). Clear printed result
       // slot; do not tear down context between synthetic and consumers.
       lingodb::runtime::ExecutionContext::clearResult(0);
+      if (lingodb::runtime::RuntimeScanCpuProfiler::enabled()) {
+         lingodb::runtime::RuntimeScanCpuProfiler::reset();
+      }
+      uint64_t processCpuBegin = lingodb::runtime::RuntimeScanCpuProfiler::enabled()
+                                    ? lingodb::runtime::RuntimeScanCpuProfiler::processCpuNs()
+                                    : 0;
       backend->execute(subopModule, executionContext);
+      if (lingodb::runtime::RuntimeScanCpuProfiler::enabled()) {
+         uint64_t processCpuEnd = lingodb::runtime::RuntimeScanCpuProfiler::processCpuNs();
+         uint64_t totalCpuNs = processCpuEnd >= processCpuBegin ? processCpuEnd - processCpuBegin : 0;
+         uint64_t scanCpuNs = lingodb::runtime::RuntimeScanCpuProfiler::scanCpuNs();
+         double totalCpuMs = static_cast<double>(totalCpuNs) / 1000000.0;
+         double scanCpuMs = static_cast<double>(scanCpuNs) / 1000000.0;
+         double pct = totalCpuNs ? (static_cast<double>(scanCpuNs) * 100.0 / static_cast<double>(totalCpuNs)) : 0.0;
+         llvm::outs() << "// scan_cpu_profile: scan_cpu_ms=" << scanCpuMs
+                      << " total_cpu_ms=" << totalCpuMs
+                      << " percent=" << pct
+                      << " scan_calls=" << lingodb::runtime::RuntimeScanCpuProfiler::scanCalls()
+                      << "\n";
+         llvm::outs().flush();
+      }
       if (resultQueryIndex && !resultRowsetHashes) {
          std::cout << "// result_begin: query[" << *resultQueryIndex << "]\n";
          std::cout.flush();
@@ -537,8 +558,16 @@ struct SubOpStateReuseBatchResult {
    llvm::SmallVector<SubOpExecuteTiming, 8> timingPerRun;
    llvm::SmallVector<size_t, 8> numTargetsPerQuery;
    llvm::SmallVector<size_t, 8> numTargetsNoTablePerQuery;
+   llvm::SmallVector<size_t, 8> numUnionTargetsPerQuery;
+   llvm::SmallVector<size_t, 8> numUnionTargetsNoTablePerQuery;
+   llvm::SmallVector<size_t, 8> numBuildStepTargetsPerQuery;
+   llvm::SmallVector<size_t, 8> numBuildStepTargetsNoTablePerQuery;
    size_t numTargetsSyntheticMapped = 0;
    size_t numTargetsSyntheticMappedNoTable = 0;
+   size_t numUnionTargetsSyntheticMapped = 0;
+   size_t numUnionTargetsSyntheticMappedNoTable = 0;
+   size_t numBuildStepTargetsSyntheticMapped = 0;
+   size_t numBuildStepTargetsSyntheticMappedNoTable = 0;
    std::vector<std::string> resultRowsetBlockHashes;
    bool verifyFailed = false;
 };
@@ -638,11 +667,23 @@ static SubOpStateReuseBatchResult runSubOpStateReuseBatch(
    } else {
       rewriteRes.numTargetsPerQuery.resize(runs.size(), 0);
       rewriteRes.numTargetsNoTablePerQuery.resize(runs.size(), 0);
+      rewriteRes.numUnionTargetsPerQuery.resize(runs.size(), 0);
+      rewriteRes.numUnionTargetsNoTablePerQuery.resize(runs.size(), 0);
+      rewriteRes.numBuildStepTargetsPerQuery.resize(runs.size(), 0);
+      rewriteRes.numBuildStepTargetsNoTablePerQuery.resize(runs.size(), 0);
    }
    result.numTargetsPerQuery = rewriteRes.numTargetsPerQuery;
    result.numTargetsNoTablePerQuery = rewriteRes.numTargetsNoTablePerQuery;
+   result.numUnionTargetsPerQuery = rewriteRes.numUnionTargetsPerQuery;
+   result.numUnionTargetsNoTablePerQuery = rewriteRes.numUnionTargetsNoTablePerQuery;
+   result.numBuildStepTargetsPerQuery = rewriteRes.numBuildStepTargetsPerQuery;
+   result.numBuildStepTargetsNoTablePerQuery = rewriteRes.numBuildStepTargetsNoTablePerQuery;
    result.numTargetsSyntheticMapped = rewriteRes.numTargetsSyntheticMapped;
    result.numTargetsSyntheticMappedNoTable = rewriteRes.numTargetsSyntheticMappedNoTable;
+   result.numUnionTargetsSyntheticMapped = rewriteRes.numUnionTargetsSyntheticMapped;
+   result.numUnionTargetsSyntheticMappedNoTable = rewriteRes.numUnionTargetsSyntheticMappedNoTable;
+   result.numBuildStepTargetsSyntheticMapped = rewriteRes.numBuildStepTargetsSyntheticMapped;
+   result.numBuildStepTargetsSyntheticMappedNoTable = rewriteRes.numBuildStepTargetsSyntheticMappedNoTable;
    result.rewriteMs = opts.skipReuseRewrite ? 0.0 : millisSince(tRewrite);
    result.optimizationMs += result.rewriteMs;
    if (opts.skipReuseRewrite) {
@@ -658,9 +699,22 @@ static SubOpStateReuseBatchResult runSubOpStateReuseBatch(
    };
    printSizeArray(llvm::outs(), "reuse_targets", rewriteRes.numTargetsPerQuery);
    printSizeArray(llvm::outs(), "reuse_targets_no_table", rewriteRes.numTargetsNoTablePerQuery);
+   printSizeArray(llvm::outs(), "reuse_targets_union", rewriteRes.numUnionTargetsPerQuery);
+   printSizeArray(llvm::outs(), "reuse_targets_union_no_table", rewriteRes.numUnionTargetsNoTablePerQuery);
+   printSizeArray(llvm::outs(), "reuse_targets_build_step", rewriteRes.numBuildStepTargetsPerQuery);
+   printSizeArray(llvm::outs(), "reuse_targets_build_step_no_table",
+                  rewriteRes.numBuildStepTargetsNoTablePerQuery);
    llvm::outs() << "\n// reuse_targets_synthetic_mapped: " << rewriteRes.numTargetsSyntheticMapped << "\n";
    llvm::outs() << "\n// reuse_targets_synthetic_mapped_no_table: "
                 << rewriteRes.numTargetsSyntheticMappedNoTable << "\n";
+   llvm::outs() << "\n// reuse_targets_synthetic_mapped_union: "
+                << rewriteRes.numUnionTargetsSyntheticMapped << "\n";
+   llvm::outs() << "\n// reuse_targets_synthetic_mapped_union_no_table: "
+                << rewriteRes.numUnionTargetsSyntheticMappedNoTable << "\n";
+   llvm::outs() << "\n// reuse_targets_synthetic_mapped_build_step: "
+                << rewriteRes.numBuildStepTargetsSyntheticMapped << "\n";
+   llvm::outs() << "\n// reuse_targets_synthetic_mapped_build_step_no_table: "
+                << rewriteRes.numBuildStepTargetsSyntheticMappedNoTable << "\n";
    if (opts.printMatches && !opts.skipReuseRewrite) {
       llvm::SmallVector<std::pair<int, mlir::ModuleOp>, 8> postRewriteQmods;
       for (size_t i = 0; i < runs.size(); i++) {
@@ -898,7 +952,7 @@ static int runBatchNightlyMain(int argc, char** argv) {
    std::string templatesSpec = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22";
    std::string batchSizesSpec = "2,4,8,16,32,64,128";
    int repetitions = 5;
-   bool forceSequential = true;
+   bool forceSequential = false;
 
    for (int i = 3; i < argc; i++) {
       llvm::StringRef arg(argv[i]);
@@ -916,6 +970,8 @@ static int runBatchNightlyMain(int argc, char** argv) {
          bool bad = v.getAsInteger(10, repetitions);
          (void)bad;
          assert(!bad && "invalid repetitions");
+      } else if (arg == "--force-sequential") {
+         forceSequential = true;
       } else if (arg == "--no-force-sequential") {
          forceSequential = false;
       } else {
@@ -926,7 +982,10 @@ static int runBatchNightlyMain(int argc, char** argv) {
    assert(!outPath.empty() && "--out is required");
    BatchNightlyMode parsedMode = parseBatchNightlyMode(mode);
 
-   if (forceSequential) setenv("LINGODB_SUBOP_FORCE_SEQUENTIAL", "1", /*overwrite=*/0);
+   if (forceSequential)
+      setenv("LINGODB_SUBOP_FORCE_SEQUENTIAL", "1", /*overwrite=*/1);
+   else
+      unsetenv("LINGODB_SUBOP_FORCE_SEQUENTIAL");
    if (parsedMode == BatchNightlyMode::ReuseOnBloomOff)
       setenv("LINGODB_DISABLE_FILTER_PRED_BLOOM_ADAPTATION", "1", /*overwrite=*/1);
    else
@@ -985,9 +1044,21 @@ static int runBatchNightlyMain(int argc, char** argv) {
             record["execution_time_ms_total"] = res.totalExec.executionTime;
             record["reuse_targets"] = jsonSizeArray(res.numTargetsPerQuery);
             record["reuse_targets_no_table"] = jsonSizeArray(res.numTargetsNoTablePerQuery);
+            record["reuse_targets_union"] = jsonSizeArray(res.numUnionTargetsPerQuery);
+            record["reuse_targets_union_no_table"] = jsonSizeArray(res.numUnionTargetsNoTablePerQuery);
+            record["reuse_targets_build_step"] = jsonSizeArray(res.numBuildStepTargetsPerQuery);
+            record["reuse_targets_build_step_no_table"] = jsonSizeArray(res.numBuildStepTargetsNoTablePerQuery);
             record["reuse_targets_synthetic_mapped"] = static_cast<int64_t>(res.numTargetsSyntheticMapped);
             record["reuse_targets_synthetic_mapped_no_table"] =
                static_cast<int64_t>(res.numTargetsSyntheticMappedNoTable);
+            record["reuse_targets_synthetic_mapped_union"] =
+               static_cast<int64_t>(res.numUnionTargetsSyntheticMapped);
+            record["reuse_targets_synthetic_mapped_union_no_table"] =
+               static_cast<int64_t>(res.numUnionTargetsSyntheticMappedNoTable);
+            record["reuse_targets_synthetic_mapped_build_step"] =
+               static_cast<int64_t>(res.numBuildStepTargetsSyntheticMapped);
+            record["reuse_targets_synthetic_mapped_build_step_no_table"] =
+               static_cast<int64_t>(res.numBuildStepTargetsSyntheticMappedNoTable);
             record["result_block_count"] = static_cast<int64_t>(res.resultRowsetBlockHashes.size());
             record["result_rowset_block_hashes"] = jsonStringArray(res.resultRowsetBlockHashes);
             record["result_rowset_hash"] = hashStrings(res.resultRowsetBlockHashes);
@@ -999,6 +1070,7 @@ static int runBatchNightlyMain(int argc, char** argv) {
                          << " rep=" << rep << " rc=" << res.exitCode
                          << " time_ms=" << res.totalExec.executionTime
                          << " elapsed_s=" << (millisSince(allStart) / 1000.0) << "\n";
+            llvm::errs().flush();
          }
       }
    }
@@ -1016,6 +1088,8 @@ static int runBatchNightlyMain(int argc, char** argv) {
    root["meta"] = std::move(meta);
    root["records"] = std::move(records);
    writeJsonFile(outPath, llvm::json::Value(std::move(root)));
+   llvm::errs() << "wrote " << outPath << "\n";
+   llvm::errs().flush();
    return 0;
 }
 
