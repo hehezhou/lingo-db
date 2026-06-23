@@ -101,7 +101,7 @@ struct RuntimeFilterIdClause {
 /// because callers use this for disjoint clauses, the first matching id is the row source id.
 std::pair<mlir::Value, tuples::ColumnRefAttr> materializeRuntimeFilterClausesAsIdColumnAfterScanRefs(
    subop::ScanRefsOp scanOp, llvm::ArrayRef<RuntimeFilterIdClause> clauses,
-   unsigned fallbackId, llvm::StringRef idLeafName, bool rewireDownstreamUses);
+   unsigned defaultId, llvm::StringRef idLeafName, bool rewireDownstreamUses);
 
 /// Decode external-table filters for each cache target (including paired `thread_local` writers).
 llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>>

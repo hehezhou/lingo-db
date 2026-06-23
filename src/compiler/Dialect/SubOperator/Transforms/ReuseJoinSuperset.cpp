@@ -5508,17 +5508,17 @@ static void syncAggregateEntryRefAttrs(mlir::ModuleOp module, const llvm::DenseS
 }
 
 static tuples::ColumnRefAttr insertSyntheticAggregateQueryIdColumn(
-   subop::ExecutionStepOp buildStep, llvm::ArrayRef<RuntimeFilterIdClause> clauses, unsigned fallbackId) {
+   subop::ExecutionStepOp buildStep, llvm::ArrayRef<RuntimeFilterIdClause> clauses, unsigned defaultId) {
    assert(!clauses.empty() && "aggregate mixed reuse requires query id filter clauses");
    subop::ScanRefsOp scan = findAggregateTableScanInStep(buildStep);
    auto [qidStream, qidRef] = materializeRuntimeFilterClausesAsIdColumnAfterScanRefs(
-      scan, clauses, fallbackId, "query_id", /*rewireDownstreamUses=*/true);
+      scan, clauses, defaultId, "query_id", /*rewireDownstreamUses=*/true);
    (void)qidStream;
    return qidRef;
 }
 
 static std::optional<tuples::ColumnRefAttr> insertSyntheticAggregateQueryIdFromMixedPreds(
-   subop::ExecutionStepOp buildStep, llvm::ArrayRef<unsigned> filterSlots, unsigned fallbackId) {
+   subop::ExecutionStepOp buildStep, llvm::ArrayRef<unsigned> filterSlots, unsigned defaultId) {
    if (filterSlots.empty()) return std::nullopt;
    subop::LookupOrInsertOp lookup = findAggregateLookupInStep(buildStep);
    if (!lookup) return std::nullopt;
@@ -5587,7 +5587,7 @@ static std::optional<tuples::ColumnRefAttr> insertSyntheticAggregateQueryIdFromM
    mlir::OpBuilder rb(ctx);
    rb.setInsertionPointToStart(block);
    mlir::Value qid = rb.create<db::ConstantOp>(loc, qidDef.getColumn().type,
-                                               rb.getI64IntegerAttr(static_cast<int64_t>(fallbackId)));
+                                               rb.getI64IntegerAttr(static_cast<int64_t>(defaultId)));
    unsigned argIdx = 0;
    for (unsigned slot : slots) {
       mlir::Value pred;
@@ -6306,7 +6306,8 @@ static bool scanListReachedFromCacheGetHivTraverse(subop::ScanListOp scan, subop
    const bool inClosure = opaqueClosureContains(probe.ssaClosure, scan.getList());
    const bool seenOnTraverse = llvm::is_contained(probe.scanListsFromTraverse, scan);
    if (listEmbeds && inClosure && seenOnTraverse) return true;
-   // Q1 may still carry pre-align embedded HIV (e.g. filter_pred$0) on the list operand while cache_get is $1.
+   // The list operand may still carry a pre-align embedded HIV predicate slot while cache_get has already
+   // been retagged to the consumer slot. Key-layout equality is enough to keep the probed stream in scope.
    if (seenOnTraverse && inClosure && scanListListCarrierSharesAlignedHivKeyLayout(scan, alignedHiv)) return true;
 
    if (listEmbeds && (inClosure || seenOnTraverse)) {

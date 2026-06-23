@@ -1442,7 +1442,7 @@ static mlir::Operation* findFirstOpConsumingInBlock(mlir::Block& block, mlir::Va
    return nullptr;
 }
 
-// Join-style plans (e.g. TPCH Q2) thread merged state through `nested_execution_group` and inner
+// Some join-style plans thread merged state through `nested_execution_group` and inner
 // `execution_step` before `lookup` / `reduce`.
 // Follow that chain so delay_filter can still reach the TupleStream fed into those ops.
 mlir::Operation* drillToStateConsumerSkippingNestedScopes(mlir::Block& startBlock, mlir::Value startState) {
@@ -1831,7 +1831,7 @@ std::pair<mlir::Value, tuples::ColumnRefAttr> materializeRuntimeFiltersAsPredica
 
 std::pair<mlir::Value, tuples::ColumnRefAttr> materializeRuntimeFilterClausesAsIdColumnAfterScanRefs(
    subop::ScanRefsOp scanOp, llvm::ArrayRef<RuntimeFilterIdClause> clauses,
-   unsigned fallbackId, llvm::StringRef idLeafName, bool rewireDownstreamUses) {
+   unsigned defaultId, llvm::StringRef idLeafName, bool rewireDownstreamUses) {
    assert(scanOp && "id column insertion requires scan_refs");
    assert(!clauses.empty() && "id column insertion requires at least one clause");
 
@@ -1877,7 +1877,7 @@ std::pair<mlir::Value, tuples::ColumnRefAttr> materializeRuntimeFilterClausesAsI
    helper.buildBlock(b, [&](mlir::OpBuilder& rb) {
       mlir::Type idTy = idDef.getColumn().type;
       mlir::Value id =
-         rb.create<lingodb::compiler::dialect::db::ConstantOp>(loc, idTy, rb.getI64IntegerAttr(fallbackId));
+         rb.create<lingodb::compiler::dialect::db::ConstantOp>(loc, idTy, rb.getI64IntegerAttr(defaultId));
       for (auto it = restrictedClauses.rbegin(); it != restrictedClauses.rend(); ++it) {
          mlir::Value pred;
          for (const runtime::FilterDescription& f : it->filters) {
