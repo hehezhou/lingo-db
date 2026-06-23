@@ -51,7 +51,8 @@ void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
 
 /// Like \c insertWriteSidePredIntoBufferConstructionStep but targets \p predMemberName (e.g. \c filter_pred$1).
 void insertWriteSidePredIntoBufferConstructionStepForPredMember(
-   ExecutionStepOp step, llvm::ArrayRef<runtime::FilterDescription> filters, llvm::StringRef predMemberName);
+   ExecutionStepOp step, llvm::ArrayRef<runtime::FilterDescription> filters, llvm::StringRef predMemberName,
+   bool allowSharedScanPredicate = true);
 
 void materializeConstantTruePredMemberOnBufferMaterialize(subop::MaterializeOp matOp, llvm::StringRef predMemberName,
                                                            bool updateStreamOperand);

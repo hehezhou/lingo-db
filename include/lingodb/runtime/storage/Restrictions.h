@@ -21,6 +21,11 @@ class Restrictions {
 
    public:
    std::pair<size_t, uint16_t*> applyFilters(size_t offset, size_t length, uint16_t* selVec1, uint16_t* selVec2, std::function<const ArrayView*(size_t)> getArrayView);
+   std::pair<size_t, uint16_t*> applyFiltersWithClauseResults(
+      size_t offset, size_t length, uint16_t* selVec1, uint16_t* selVec2,
+      std::function<const ArrayView*(size_t)> getArrayView,
+      const std::vector<size_t>& predicateClauseIds,
+      const std::vector<uint16_t*>& predicateColumns);
    static std::unique_ptr<Restrictions> create(std::vector<FilterDescription> filterDescs, const arrow::Schema& schema);
    /// `clauses[0]` is the conjunctive `filterDescriptions` group; further entries are `orFilterClauses`.
    static std::unique_ptr<Restrictions> createFromFilterClauses(

@@ -112,7 +112,8 @@ void extendSyntheticJoinBuffersToColumnUnionForGroups(
 void extendSyntheticJoinBuffersWithInheritedMixedPreds(
    mlir::ModuleOp synthetic, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
    CachedJoinBufferLayoutsByKey* outLayouts = nullptr,
-   llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t, 4>>* outInheritedDepsByCacheKey = nullptr);
+   llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t, 4>>* outInheritedDepsByCacheKey = nullptr,
+   llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>>* consumerSlotByCacheKeyAndQuery = nullptr);
 
 void extendSyntheticAggregateHashTablesToPayloadUnion(mlir::ModuleOp synthetic, mlir::ModuleOp query0,
                                                       mlir::ModuleOp query1,

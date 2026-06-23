@@ -1414,6 +1414,10 @@ void subop::ScanRefsOp::updateStateType(subop::SubOpStateUsageTransformer& trans
 }
 mlir::Operation* subop::ScanRefsOp::cloneSubOp(mlir::OpBuilder& builder, mlir::IRMapping& mapping, subop::ColumnMapping& columnMapping) {
    auto newOp = builder.create<ScanRefsOp>(this->getLoc(), mapping.lookupOrDefault(getState()), columnMapping.clone(getRef()));
+   for (mlir::NamedAttribute attr : this->getOperation()->getAttrs()) {
+      if (attr.getName() == getRefAttrName()) continue;
+      newOp->setAttr(attr.getName(), attr.getValue());
+   }
    mapResults(mapping, this->getOperation(), newOp.getOperation());
 
    return newOp;

@@ -30,6 +30,9 @@ struct ExternalDatasourceProperty {
    /// Disjunctive AND-clauses: overall predicate is
    /// `(filterDescriptions...) OR (orFilterClauses[0]...) OR (orFilterClauses[1]...) OR ...`
    std::vector<std::vector<runtime::FilterDescription>> orFilterClauses{};
+   /// Shared-scan clauses are pushed down like OR clauses, and a scan_refs containing
+   /// `filter_pred$N` can read the Nth clause result directly from the scan.
+   std::vector<std::vector<runtime::FilterDescription>> sharedPredicateClauses{};
    std::string index;
    std::string indexType;
 
@@ -40,10 +43,12 @@ struct ExternalDatasourceProperty {
       serializer.writeProperty(3, index);
       serializer.writeProperty(4, indexType);
       serializer.writeProperty(5, orFilterClauses);
+      serializer.writeProperty(6, sharedPredicateClauses);
    }
    bool operator==(const ExternalDatasourceProperty& other) const {
       return other.index == index && other.indexType == indexType && other.mapping == mapping && other.tableName == tableName &&
-         other.filterDescriptions == filterDescriptions && other.orFilterClauses == orFilterClauses;
+         other.filterDescriptions == filterDescriptions && other.orFilterClauses == orFilterClauses &&
+         other.sharedPredicateClauses == sharedPredicateClauses;
    }
 
    static ExternalDatasourceProperty deserialize(lingodb::utility::Deserializer& deserializer) {
@@ -59,6 +64,14 @@ struct ExternalDatasourceProperty {
             deserializer.readSerializedPayload<std::vector<std::vector<runtime::FilterDescription>>>();
          utility::marker_t end = deserializer.readMarker();
          assert(end == 5 && "Expected orFilterClauses property end marker");
+         (void)end;
+         next = deserializer.readMarker();
+      }
+      if (next == 6) {
+         prop.sharedPredicateClauses =
+            deserializer.readSerializedPayload<std::vector<std::vector<runtime::FilterDescription>>>();
+         utility::marker_t end = deserializer.readMarker();
+         assert(end == 6 && "Expected sharedPredicateClauses property end marker");
          (void)end;
       } else {
          deserializer.pushBackMarker(next);

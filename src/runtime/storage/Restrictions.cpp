@@ -513,6 +513,39 @@ std::pair<size_t, uint16_t*> lingodb::runtime::Restrictions::applyFilters(size_t
    return {unionLen, selVec1};
 }
 
+std::pair<size_t, uint16_t*> lingodb::runtime::Restrictions::applyFiltersWithClauseResults(
+   size_t offset, size_t length, uint16_t* selVec1, uint16_t* selVec2,
+   std::function<const ArrayView*(size_t)> getArrayView,
+   const std::vector<size_t>& predicateClauseIds,
+   const std::vector<uint16_t*>& predicateColumns) {
+   if (predicateColumns.empty()) return applyFilters(offset, length, selVec1, selVec2, getArrayView);
+   assert(predicateColumns.size() == predicateClauseIds.size());
+   assert(length <= BatchView::maxBatchSize);
+   utility::Tracer::Trace trace(applyFilter);
+   std::array<bool, BatchView::maxBatchSize> selected{};
+   std::vector<std::array<uint16_t, BatchView::maxBatchSize>> predByOutput(predicateColumns.size());
+   for (size_t clauseIdx = 0; clauseIdx < andClauses.size(); ++clauseIdx) {
+      auto [clauseLen, clauseSel] = applyAndClause(offset, length, selVec1, selVec2, andClauses[clauseIdx], getArrayView);
+      for (size_t i = 0; i < clauseLen; i++) {
+         uint16_t row = clauseSel[i];
+         selected[row] = true;
+         for (size_t outIdx = 0; outIdx < predicateClauseIds.size(); ++outIdx) {
+            if (predicateClauseIds[outIdx] == clauseIdx) predByOutput[outIdx][row] = 1;
+         }
+      }
+   }
+   size_t unionLen = 0;
+   for (size_t i = 0; i < length; i++) {
+      if (!selected[i]) continue;
+      selVec1[unionLen] = static_cast<uint16_t>(i);
+      for (size_t outIdx = 0; outIdx < predicateColumns.size(); ++outIdx) {
+         predicateColumns[outIdx][unionLen] = predByOutput[outIdx][i];
+      }
+      unionLen++;
+   }
+   return {unionLen, selVec1};
+}
+
 std::unique_ptr<lingodb::runtime::Restrictions> lingodb::runtime::Restrictions::create(
    std::vector<lingodb::runtime::FilterDescription> filterDescs, const arrow::Schema& schema) {
    std::vector<std::vector<FilterDescription>> clauses;

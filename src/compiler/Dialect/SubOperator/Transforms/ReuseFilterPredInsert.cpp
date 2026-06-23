@@ -1122,7 +1122,7 @@ decodeFiltersFromTableScanInExecutionStep(ExecutionStepOp step) {
    for (mlir::Operation& op : body.without_terminator()) {
       auto s = mlir::dyn_cast<subop::ScanRefsOp>(&op);
       if (!s) continue;
-      if (mlir::isa<subop::TableType>(s.getState().getType())) {
+      if (mlir::isa<subop::TableType, subop::SharedTableType>(s.getState().getType())) {
          scanOp = s;
          break;
       }
@@ -1385,7 +1385,7 @@ llvm::SmallVector<runtime::FilterDescription, 8> decodeFiltersForStateFromWriter
       const ModuleReuseInfo::StepRW* rw = rwByStepOp->lookup(ws.getOperation());
       if (!rw) continue;
       for (mlir::Value r : rw->reads) {
-         if (!mlir::isa<subop::TableType>(r.getType())) continue;
+         if (!mlir::isa<subop::TableType, subop::SharedTableType>(r.getType())) continue;
          mlir::Value tableV = r;
          if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(r)) {
             if (ba.getOwner() == &ws.getSubOps().front()) {
@@ -1451,9 +1451,37 @@ static subop::ScanRefsOp findTableScanRefsInStep(subop::ExecutionStepOp step) {
    for (mlir::Operation& op : body.without_terminator()) {
       auto s = mlir::dyn_cast<subop::ScanRefsOp>(&op);
       if (!s) continue;
-      if (mlir::isa<subop::TableType>(s.getState().getType())) return s;
+      if (mlir::isa<subop::TableType, subop::SharedTableType>(s.getState().getType())) return s;
    }
    return {};
+}
+
+static subop::StateMembersAttr tableScanDataMembers(mlir::Type type) {
+   if (auto tableTy = mlir::dyn_cast<subop::TableType>(type)) return tableTy.getMembers();
+   if (auto sharedTy = mlir::dyn_cast<subop::SharedTableType>(type)) return sharedTy.getTableMembers();
+   return {};
+}
+
+static subop::StateMembersAttr tableScanPredicateMembers(mlir::Type type) {
+   if (auto sharedTy = mlir::dyn_cast<subop::SharedTableType>(type)) return sharedTy.getPredicateMembers();
+   return subop::StateMembersAttr::get(type.getContext(), {});
+}
+
+static bool tableScanFiltered(mlir::Type type) {
+   if (auto tableTy = mlir::dyn_cast<subop::TableType>(type)) return tableTy.getFiltered();
+   if (auto sharedTy = mlir::dyn_cast<subop::SharedTableType>(type)) return sharedTy.getFiltered();
+   llvm_unreachable("expected table-like scan state");
+}
+
+static subop::StateMembersAttr tableEntryDataMembers(mlir::Type type) {
+   if (auto refTy = mlir::dyn_cast<subop::TableEntryRefType>(type)) return refTy.getTableColumns();
+   if (auto refTy = mlir::dyn_cast<subop::SharedTableEntryRefType>(type)) return refTy.getTableColumns();
+   return {};
+}
+
+static subop::StateMembersAttr tableEntryPredicateMembers(mlir::Type type) {
+   if (auto refTy = mlir::dyn_cast<subop::SharedTableEntryRefType>(type)) return refTy.getPredicateColumns();
+   return subop::StateMembersAttr::get(type.getContext(), {});
 }
 
 llvm::SmallVector<runtime::FilterDescription, 8>
@@ -1462,7 +1490,7 @@ restrictFiltersToTableScanInExecutionStep(ExecutionStepOp step,
    subop::ScanRefsOp scanOp = findTableScanRefsInStep(step);
    if (!scanOp || filters.empty()) return {};
 
-   auto tableTy = mlir::cast<subop::TableType>(scanOp.getState().getType());
+   auto tableMembers = tableScanDataMembers(scanOp.getState().getType());
    auto& mm = step.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    auto stripSuffix = [](llvm::StringRef s) -> llvm::StringRef {
       size_t pos = s.find('$');
@@ -1473,7 +1501,7 @@ restrictFiltersToTableScanInExecutionStep(ExecutionStepOp step,
    llvm::SmallVector<runtime::FilterDescription, 8> out;
    for (const auto& f : filters) {
       bool onTable = false;
-      for (auto m : tableTy.getMembers().getMembers()) {
+      for (auto m : tableMembers.getMembers()) {
          if (stripSuffix(mm.getName(m)) == f.columnName) {
             onTable = true;
             break;
@@ -1500,23 +1528,22 @@ static subop::MaterializeOp findBufferMaterializeForPredMember(subop::ExecutionS
 
 static void extendTableScanRefTypesForFilters(subop::ScanRefsOp scanOp,
                                               llvm::ArrayRef<runtime::FilterDescription> filters) {
-   auto tableTy = mlir::cast<subop::TableType>(scanOp.getState().getType());
+   auto tableMembers = tableScanDataMembers(scanOp.getState().getType());
    auto stripSuffix = [](llvm::StringRef s) -> llvm::StringRef {
       size_t pos = s.find('$');
       if (pos == llvm::StringRef::npos) return s;
       return s.take_front(pos);
    };
    auto refDef = scanOp.getRef();
-   auto refTy = mlir::dyn_cast<subop::TableEntryRefType>(refDef.getColumn().type);
-   assert(refTy && "write_pred: expected scan_refs ref to be table_entry_ref");
-   llvm::SmallVector<subop::Member> cols = refTy.getTableColumns().getMembers();
+   llvm::SmallVector<subop::Member> cols =
+      tableEntryDataMembers(refDef.getColumn().type).getMembers();
    llvm::DenseSet<subop::Member> have;
    for (auto m : cols) have.insert(m);
    auto& mm = scanOp->getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    for (auto& f : filters) {
       if (f.op == runtime::FilterOp::NOTNULL) continue;
       subop::Member mem;
-      for (auto m : tableTy.getMembers().getMembers()) {
+      for (auto m : tableMembers.getMembers()) {
          if (stripSuffix(mm.getName(m)) == f.columnName) {
             mem = m;
             break;
@@ -1526,8 +1553,124 @@ static void extendTableScanRefTypesForFilters(subop::ScanRefsOp scanOp,
       if (have.insert(mem).second) cols.push_back(mem);
    }
    auto newCols = subop::StateMembersAttr::get(scanOp.getContext(), cols);
-   refDef.getColumn().type = subop::TableEntryRefType::get(scanOp.getContext(), newCols);
+   auto predCols = tableEntryPredicateMembers(refDef.getColumn().type);
+   refDef.getColumn().type = predCols.getMembers().empty()
+                                ? mlir::Type(subop::TableEntryRefType::get(scanOp.getContext(), newCols))
+                                : mlir::Type(subop::SharedTableEntryRefType::get(scanOp.getContext(), newCols,
+                                                                                 predCols));
    scanOp.setRefAttr(refDef);
+}
+
+static subop::GetExternalOp resolveGetExternalForScanRefs(subop::ScanRefsOp scanOp);
+
+static subop::Member getOrCreatePredicateMember(mlir::MLIRContext* ctx, llvm::StringRef predMemberName) {
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   return mm.getOrCreateMemberDirect(predMemberName.str(), mlir::IntegerType::get(ctx, 1),
+                                     /*allowTypeUpdate=*/false);
+}
+
+static void upgradeScanToSharedTableWithPredMember(subop::ScanRefsOp scanOp,
+                                                   llvm::StringRef predMemberName) {
+   auto* ctx = scanOp.getContext();
+   subop::Member predMember = getOrCreatePredicateMember(ctx, predMemberName);
+   llvm::SmallVector<subop::Member> tableMembers =
+      tableScanDataMembers(scanOp.getState().getType()).getMembers();
+   llvm::SmallVector<subop::Member> predMembers =
+      tableScanPredicateMembers(scanOp.getState().getType()).getMembers();
+   if (!llvm::is_contained(predMembers, predMember)) predMembers.push_back(predMember);
+   auto newStateTy = subop::SharedTableType::get(ctx, subop::StateMembersAttr::get(ctx, tableMembers),
+                                                 subop::StateMembersAttr::get(ctx, predMembers),
+                                                 tableScanFiltered(scanOp.getState().getType()));
+
+   subop::GetExternalOp ge = resolveGetExternalForScanRefs(scanOp);
+   ge.getResult().setType(newStateTy);
+   scanOp.getState().setType(newStateTy);
+   if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(scanOp.getState())) {
+      mlir::Operation* parent = arg.getOwner()->getParentOp();
+      if (auto step = mlir::dyn_cast_or_null<ExecutionStepOp>(parent)) {
+         assert(arg.getArgNumber() < step.getNumOperands());
+         step.getOperand(arg.getArgNumber()).setType(newStateTy);
+      }
+   }
+
+   auto refDef = scanOp.getRef();
+   llvm::SmallVector<subop::Member> refTableMembers =
+      tableEntryDataMembers(refDef.getColumn().type).getMembers();
+   if (refTableMembers.empty()) refTableMembers = tableMembers;
+   llvm::SmallVector<subop::Member> refPredMembers =
+      tableEntryPredicateMembers(refDef.getColumn().type).getMembers();
+   if (!llvm::is_contained(refPredMembers, predMember)) refPredMembers.push_back(predMember);
+   refDef.getColumn().type = subop::SharedTableEntryRefType::get(
+      ctx, subop::StateMembersAttr::get(ctx, refTableMembers),
+      subop::StateMembersAttr::get(ctx, refPredMembers));
+   scanOp.setRefAttr(refDef);
+
+   synchronizeExecutionStepPortTypes(scanOp->getParentOfType<mlir::ModuleOp>(), nullptr);
+}
+
+static void extendTableScanRefTypeWithPredMember(subop::ScanRefsOp scanOp,
+                                                 llvm::StringRef predMemberName) {
+   upgradeScanToSharedTableWithPredMember(scanOp, predMemberName);
+}
+
+static subop::GetExternalOp resolveGetExternalForScanRefs(subop::ScanRefsOp scanOp) {
+   mlir::Value tableState = scanOp.getState();
+   for (;;) {
+      if (auto ge = mlir::dyn_cast_or_null<subop::GetExternalOp>(tableState.getDefiningOp())) return ge;
+      if (auto tableStep = mlir::dyn_cast_or_null<ExecutionStepOp>(tableState.getDefiningOp())) {
+         return findUniqueGetExternalInTableRefStep(tableStep);
+      }
+      mlir::Value peeled = peelBlockArgsToEnclosingOperands(tableState);
+      assert(peeled != tableState && "shared_scan: table state must resolve to get_external");
+      tableState = peeled;
+   }
+}
+
+static void addSharedPredicateClauseForScan(subop::ScanRefsOp scanOp, llvm::StringRef predMemberName,
+                                            llvm::ArrayRef<runtime::FilterDescription> filters) {
+   upgradeScanToSharedTableWithPredMember(scanOp, predMemberName);
+   auto predMembers = tableScanPredicateMembers(scanOp.getState().getType());
+   subop::Member predMember = getOrCreatePredicateMember(scanOp.getContext(), predMemberName);
+   std::optional<unsigned> localSlot;
+   for (auto indexedMember : llvm::enumerate(predMembers.getMembers())) {
+      if (indexedMember.value() != predMember) continue;
+      localSlot = indexedMember.index();
+      break;
+   }
+   assert(localSlot && "shared_scan: predicate member must be part of shared table type");
+
+   subop::GetExternalOp ge = resolveGetExternalForScanRefs(scanOp);
+   auto ds = lingodb::utility::deserializeFromHexString<runtime::ExternalDatasourceProperty>(ge.getDescr());
+   ds.filterDescriptions.clear();
+   ds.orFilterClauses.clear();
+   if (ds.sharedPredicateClauses.size() < predMembers.getMembers().size())
+      ds.sharedPredicateClauses.resize(predMembers.getMembers().size());
+   std::vector<runtime::FilterDescription> filterVec(filters.begin(), filters.end());
+   if (ds.sharedPredicateClauses[*localSlot].empty()) {
+      ds.sharedPredicateClauses[*localSlot] = std::move(filterVec);
+   } else {
+      assert(ds.sharedPredicateClauses[*localSlot] == filterVec &&
+             "shared_scan: duplicate predicate slot must use identical filters");
+   }
+   ge.setDescrAttr(mlir::StringAttr::get(ge.getContext(), lingodb::utility::serializeToHexString(ds)));
+}
+
+static std::pair<mlir::Value, tuples::ColumnDefAttr> gatherSharedPredicateColumnAfterScan(
+   subop::ScanRefsOp scanOp, llvm::StringRef predMemberName) {
+   extendTableScanRefTypeWithPredMember(scanOp, predMemberName);
+   auto* ctx = scanOp.getContext();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   subop::Member predMember =
+      mm.getOrCreateMemberDirect(predMemberName.str(), mlir::IntegerType::get(ctx, 1), /*allowTypeUpdate=*/false);
+   tuples::ColumnDefAttr predDef = cm.createDef(cm.getUniqueScope(predMemberName), "filter_pred");
+   predDef.getColumn().type = mlir::IntegerType::get(ctx, 1);
+   mlir::OpBuilder gb(scanOp);
+   gb.setInsertionPointAfter(scanOp);
+   auto gather = gb.create<subop::GatherOp>(
+      scanOp.getLoc(), scanOp.getRes(), cm.createRef(&scanOp.getRef().getColumn()),
+      subop::ColumnDefMemberMappingAttr::get(ctx, {{predMember, predDef}}));
+   return {gather.getRes(), predDef};
 }
 
 static llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>
@@ -1553,7 +1696,7 @@ static subop::GatherOp insertFilterColumnGatherRightAfterScan(
    auto* ctx = scanOp.getContext();
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   auto tableTy = mlir::cast<subop::TableType>(scanOp.getState().getType());
+   auto tableMembers = tableScanDataMembers(scanOp.getState().getType());
    auto stripSuffix = [](llvm::StringRef s) -> llvm::StringRef {
       size_t pos = s.find('$');
       if (pos == llvm::StringRef::npos) return s;
@@ -1567,7 +1710,7 @@ static subop::GatherOp insertFilterColumnGatherRightAfterScan(
       if (seenCols.contains(f.columnName)) continue;
       seenCols[f.columnName] = true;
       subop::Member mem;
-      for (auto m : tableTy.getMembers().getMembers()) {
+      for (auto m : tableMembers.getMembers()) {
          if (stripSuffix(mm.getName(m)) == f.columnName) {
             mem = m;
             break;
@@ -1761,7 +1904,6 @@ void insertWriteSidePredIntoHashMapConstructionStep(ExecutionStepOp step,
 
    subop::ScanRefsOp scanOp = findTableScanRefsInStep(step);
    assert(scanOp && "write_pred: expected a scan_refs over table");
-   extendTableScanRefTypesForFilters(scanOp, filters);
 
    mlir::Value predStream;
    tuples::ColumnDefAttr predDef;
@@ -1776,14 +1918,9 @@ void insertWriteSidePredIntoHashMapConstructionStep(ExecutionStepOp step,
       std::tie(predStream, predDef) =
          materializeConstantTruePredColumnOnStream(pb, scanOp.getLoc(), scanOp.getRes(), "filter_pred");
    } else {
-      subop::GatherOp filterGather = insertFilterColumnGatherRightAfterScan(scanOp, filters);
-      assert(filterGather && "write_pred: expected filter-column gather after scan");
-      auto colByName = buildFilterColByNameFromGather(filterGather);
-      mlir::OpBuilder pb(filterGather);
-      pb.setInsertionPointAfter(filterGather);
-      std::tie(predStream, predDef) = materializeRuntimeFiltersAsPredicateColumn(
-         pb, filterGather.getLoc(), filterGather.getRes(), colByName, filters, "filter_pred");
-      excludeOps.push_back(filterGather.getOperation());
+      addSharedPredicateClauseForScan(scanOp, "filter_pred$0", filters);
+      std::tie(predStream, predDef) = gatherSharedPredicateColumnAfterScan(scanOp, "filter_pred$0");
+      if (mlir::Operation* predGather = predStream.getDefiningOp()) excludeOps.push_back(predGather);
    }
    auto& cm = scanOp.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    if (mlir::Operation* predMap = predStream.getDefiningOp()) excludeOps.push_back(predMap);
@@ -1924,7 +2061,8 @@ void materializeConstantTruePredMemberOnBufferMaterialize(subop::MaterializeOp m
 }
 
 void insertWriteSidePredIntoBufferConstructionStepForPredMember(
-   ExecutionStepOp step, llvm::ArrayRef<runtime::FilterDescription> filters, llvm::StringRef predMemberName) {
+   ExecutionStepOp step, llvm::ArrayRef<runtime::FilterDescription> filters, llvm::StringRef predMemberName,
+   bool allowSharedScanPredicate) {
    llvm::SmallVector<runtime::FilterDescription, 8> restricted =
       restrictFiltersToTableScanInExecutionStep(step, filters);
    filters = restricted;
@@ -1947,12 +2085,12 @@ void insertWriteSidePredIntoBufferConstructionStepForPredMember(
       assert(predMember && "write_pred_buf: filter_pred member missing on buffer type");
    }
 
-   if (!filters.empty()) extendTableScanRefTypesForFilters(scanOp, filters);
-
    mlir::Value predStream;
    tuples::ColumnDefAttr predDef;
+   tuples::ColumnRefAttr predRef;
    llvm::SmallVector<mlir::Operation*> excludeOps;
    excludeOps.push_back(scanOp.getOperation());
+   bool rewiredByHelper = false;
 
    if (filters.empty()) {
       mlir::OpBuilder pb(scanOp);
@@ -1968,23 +2106,32 @@ void insertWriteSidePredIntoBufferConstructionStepForPredMember(
          std::tie(predStream, predDef) =
             materializeConstantTruePredColumnOnStream(pb, scanOp.getLoc(), scanOp.getRes(), predMemberName);
       } else {
-         subop::GatherOp filterGather = insertFilterColumnGatherRightAfterScan(scanOp, filters);
-         assert(filterGather &&
-                "write_pred_buf: filter-column gather required for table-scan pushdown value filters");
-         excludeOps.push_back(filterGather.getOperation());
-         auto colByName = buildFilterColByNameFromGather(filterGather);
-         assert(!colByName.empty() &&
-                "write_pred_buf: gathered filter columns must cover pushdown filter identifiers");
-         mlir::OpBuilder pb(filterGather);
-         pb.setInsertionPointAfter(filterGather);
-         std::tie(predStream, predDef) = materializeRuntimeFiltersAsPredicateColumn(
-            pb, filterGather.getLoc(), filterGather.getRes(), colByName, filters, predMemberName);
+         if (allowSharedScanPredicate) {
+            addSharedPredicateClauseForScan(scanOp, predMemberName, filters);
+            std::tie(predStream, predDef) = gatherSharedPredicateColumnAfterScan(scanOp, predMemberName);
+            if (mlir::Operation* predGather = predStream.getDefiningOp()) excludeOps.push_back(predGather);
+         } else {
+            std::tie(predStream, predRef) =
+               materializeRuntimeFiltersAsPredicateColumnAfterScanRefs(scanOp, filters, predMemberName,
+                                                                       /*rewireDownstreamUses=*/true);
+            rewiredByHelper = true;
+         }
       }
    }
    if (mlir::Operation* predMap = predStream.getDefiningOp()) excludeOps.push_back(predMap);
 
-   rewireStreamUsesAfterAnchorInBlock(scanOp.getRes(), predStream, scanOp, excludeOps);
-   appendPredMemberToBufferMaterialize(matOp, predMember, predDef);
+   if (!rewiredByHelper) rewireStreamUsesAfterAnchorInBlock(scanOp.getRes(), predStream, scanOp, excludeOps);
+   if (predDef) {
+      appendPredMemberToBufferMaterialize(matOp, predMember, predDef);
+   } else {
+      assert(predRef && "write_pred_buf: predicate column must be materialized");
+      llvm::SmallVector<subop::RefMappingPairT> pairs;
+      for (auto& pr : matOp.getMapping().getMapping()) {
+         if (pr.first != predMember) pairs.push_back(pr);
+      }
+      pairs.push_back({predMember, predRef});
+      matOp.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(matOp.getContext(), pairs));
+   }
 }
 
 void insertWriteSidePredIntoBufferConstructionStep(ExecutionStepOp step,
@@ -2454,12 +2601,12 @@ void materializeRuntimeFiltersAtCacheGetUses(mlir::Value cached,
          for (mlir::Operation& op : gBlock->without_terminator()) {
             if (&op == gatherOp.getOperation()) break;
             if (auto s = mlir::dyn_cast<subop::ScanRefsOp>(&op)) {
-               if (mlir::isa<subop::TableType>(s.getState().getType())) scanOp = s;
+               if (mlir::isa<subop::TableType, subop::SharedTableType>(s.getState().getType())) scanOp = s;
             }
          }
          assert(scanOp && "delay_filter: missing filter columns but could not find scan_refs before gather");
-         auto tableTy = mlir::dyn_cast<subop::TableType>(scanOp.getState().getType());
-         assert(tableTy && "delay_filter: scan_refs state must be a subop.table");
+         auto tableMembers = tableScanDataMembers(scanOp.getState().getType());
+         assert(tableMembers && "delay_filter: scan_refs state must be table-like");
 
          llvm::StringRef reusedScope = "delay_filter";
          if (!gatherOp.getMapping().getMapping().empty()) {
@@ -2481,7 +2628,7 @@ void materializeRuntimeFiltersAtCacheGetUses(mlir::Value cached,
             if (colByName.contains(f.columnName)) continue;
 
             subop::Member mem;
-            for (auto m : tableTy.getMembers().getMembers()) {
+            for (auto m : tableMembers.getMembers()) {
                if (stripSuffix(mm.getName(m)) == f.columnName) {
                   mem = m;
                   break;

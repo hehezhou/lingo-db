@@ -358,16 +358,27 @@ class ScanBatchesTask : public lingodb::scheduler::TaskWithImplicitContext {
    std::vector<lingodb::runtime::LingoDBTable::TableChunk>& batches;
    std::vector<size_t> colIds;
    std::unique_ptr<Restrictions> restrictions;
+   bool exportPredicateResults;
+   size_t numPredicateColumns;
+   std::vector<size_t> predicateClauseIds;
    std::function<void(lingodb::runtime::BatchView*)> cb;
    std::vector<lingodb::runtime::BatchView> batchInfos;
    std::vector<std::vector<const ArrayView*>> arrayViewPtrs;
+   std::vector<std::vector<std::vector<uint16_t>>> predicateBuffers;
+   std::vector<std::vector<const uint16_t*>> predicatePtrs;
    std::atomic<size_t> startIndex{0};
    size_t splitSize{20000};
    std::vector<std::unique_ptr<BatchesWorkerResvState>> workerResvs;
    std::vector<std::pair<uint16_t*, uint16_t*>> selVecs;
 
    public:
-   ScanBatchesTask(LingoDBTable& table, std::vector<lingodb::runtime::LingoDBTable::TableChunk>& batches, std::vector<size_t> colIds, std::unique_ptr<Restrictions> restrictions, const std::function<void(lingodb::runtime::BatchView*)>& cb) : batches(batches), colIds(colIds), restrictions(std::move(restrictions)), cb(cb) {
+   ScanBatchesTask(LingoDBTable& table, std::vector<lingodb::runtime::LingoDBTable::TableChunk>& batches, std::vector<size_t> colIds, std::unique_ptr<Restrictions> restrictions,
+                   bool exportPredicateResults, size_t numPredicateColumns,
+                   std::vector<size_t> predicateClauseIds,
+                   const std::function<void(lingodb::runtime::BatchView*)>& cb)
+      : batches(batches), colIds(colIds), restrictions(std::move(restrictions)),
+        exportPredicateResults(exportPredicateResults), numPredicateColumns(numPredicateColumns),
+        predicateClauseIds(std::move(predicateClauseIds)), cb(cb) {
       size_t smallerSplitSize = std::max(1000ul, table.getNumRows() / (lingodb::scheduler::getNumWorkers() * 2));
       if (smallerSplitSize < splitSize) {
          splitSize = smallerSplitSize;
@@ -376,6 +387,12 @@ class ScanBatchesTask : public lingodb::scheduler::TaskWithImplicitContext {
          batchInfos.emplace_back(lingodb::runtime::BatchView());
          arrayViewPtrs.emplace_back(std::vector<const ArrayView*>(colIds.size()));
          batchInfos[i].arrays = arrayViewPtrs[i].data();
+         predicateBuffers.emplace_back(std::vector<std::vector<uint16_t>>(numPredicateColumns));
+         predicatePtrs.emplace_back(std::vector<const uint16_t*>(numPredicateColumns));
+         for (size_t predIdx = 0; predIdx < numPredicateColumns; ++predIdx) {
+            predicateBuffers.back()[predIdx].resize(splitSize);
+            predicatePtrs.back()[predIdx] = predicateBuffers.back()[predIdx].data();
+         }
          selVecs.emplace_back(std::make_pair(new uint16_t[splitSize], new uint16_t[splitSize]));
          workerResvs.emplace_back(std::make_unique<BatchesWorkerResvState>());
       }
@@ -397,11 +414,28 @@ class ScanBatchesTask : public lingodb::scheduler::TaskWithImplicitContext {
       for (size_t i = 0; i < colIds.size(); i++) {
          batchView.arrays[i] = chunk.getArrayView(colIds[i]);
       }
-      auto [newLen, selVec] = restrictions->applyFilters(begin, batchView.length, selVec1, selVec2, [&](size_t colId) {
-         return chunk.getArrayView(colId);
-      });
-      batchView.length = newLen;
-      batchView.selectionVector = selVec;
+      if (exportPredicateResults) {
+         auto& predBuffers = predicateBuffers[lingodb::scheduler::currentWorkerId()];
+         std::vector<uint16_t*> predCols;
+         predCols.reserve(predBuffers.size());
+         for (auto& buf : predBuffers) predCols.push_back(buf.data());
+         auto [newLen, selVec] = restrictions->applyFiltersWithClauseResults(begin, batchView.length, selVec1, selVec2,
+                                                                              [&](size_t colId) { return chunk.getArrayView(colId); },
+                                                                              predicateClauseIds,
+                                                                              predCols);
+         batchView.length = newLen;
+         batchView.selectionVector = selVec;
+         batchView.predicateColumns = predicatePtrs[lingodb::scheduler::currentWorkerId()].data();
+         batchView.numPredicateColumns = numPredicateColumns;
+      } else {
+         auto [newLen, selVec] = restrictions->applyFilters(begin, batchView.length, selVec1, selVec2, [&](size_t colId) {
+            return chunk.getArrayView(colId);
+         });
+         batchView.length = newLen;
+         batchView.selectionVector = selVec;
+         batchView.predicateColumns = nullptr;
+         batchView.numPredicateColumns = 0;
+      }
       if (batchView.length > 0) {
          utility::Tracer::Trace trace(processMorsel);
          cb(&batchView);
@@ -486,10 +520,20 @@ class ScanBatchesSingleThreadedTask : public lingodb::scheduler::TaskWithImplici
    std::vector<lingodb::runtime::LingoDBTable::TableChunk>& batches;
    std::vector<size_t> colIds;
    std::unique_ptr<Restrictions> restrictions;
+   bool exportPredicateResults;
+   size_t numPredicateColumns;
+   std::vector<size_t> predicateClauseIds;
    std::function<void(lingodb::runtime::BatchView*)> cb;
 
    public:
-   ScanBatchesSingleThreadedTask(std::vector<lingodb::runtime::LingoDBTable::TableChunk>& batches, std::vector<size_t> colIds, std::unique_ptr<Restrictions> restrictions, const std::function<void(lingodb::runtime::BatchView*)>& cb) : batches(batches), colIds(colIds), restrictions(std::move(restrictions)), cb(cb) {
+   ScanBatchesSingleThreadedTask(std::vector<lingodb::runtime::LingoDBTable::TableChunk>& batches, std::vector<size_t> colIds,
+                                 std::unique_ptr<Restrictions> restrictions, bool exportPredicateResults,
+                                 size_t numPredicateColumns,
+                                 std::vector<size_t> predicateClauseIds,
+                                 const std::function<void(lingodb::runtime::BatchView*)>& cb)
+      : batches(batches), colIds(colIds), restrictions(std::move(restrictions)),
+        exportPredicateResults(exportPredicateResults), numPredicateColumns(numPredicateColumns),
+        predicateClauseIds(std::move(predicateClauseIds)), cb(cb) {
    }
 
    bool allocateWork() override {
@@ -501,6 +545,12 @@ class ScanBatchesSingleThreadedTask : public lingodb::scheduler::TaskWithImplici
    void performWork() override {
       BatchView batchView;
       std::vector<const ArrayView*> arrayViewPtrs(colIds.size());
+      std::vector<std::vector<uint16_t>> predicateBuffers(numPredicateColumns);
+      std::vector<const uint16_t*> predicatePtrs(numPredicateColumns);
+      for (size_t predIdx = 0; predIdx < numPredicateColumns; ++predIdx) {
+         predicateBuffers[predIdx].resize(BatchView::maxBatchSize);
+         predicatePtrs[predIdx] = predicateBuffers[predIdx].data();
+      }
       batchView.arrays = arrayViewPtrs.data();
       batchView.offset = 0;
       batchView.length = 0;
@@ -518,9 +568,24 @@ class ScanBatchesSingleThreadedTask : public lingodb::scheduler::TaskWithImplici
                batchView.arrays[i] = batch.getArrayView(colIds[i]);
             }
             // apply restrictions
-            auto [newLen, selVec] = restrictions->applyFilters(start, len, selVec1, selVec2, [&](size_t colId) { return batch.getArrayView(colId); });
-            batchView.length = newLen;
-            batchView.selectionVector = selVec;
+            if (exportPredicateResults) {
+               std::vector<uint16_t*> predCols;
+               predCols.reserve(predicateBuffers.size());
+               for (auto& buf : predicateBuffers) predCols.push_back(buf.data());
+               auto [newLen, selVec] = restrictions->applyFiltersWithClauseResults(
+                  start, len, selVec1, selVec2, [&](size_t colId) { return batch.getArrayView(colId); },
+                  predicateClauseIds, predCols);
+               batchView.length = newLen;
+               batchView.selectionVector = selVec;
+               batchView.predicateColumns = predicatePtrs.data();
+               batchView.numPredicateColumns = numPredicateColumns;
+            } else {
+               auto [newLen, selVec] = restrictions->applyFilters(start, len, selVec1, selVec2, [&](size_t colId) { return batch.getArrayView(colId); });
+               batchView.length = newLen;
+               batchView.selectionVector = selVec;
+               batchView.predicateColumns = nullptr;
+               batchView.numPredicateColumns = 0;
+            }
             if (batchView.length > 0) {
                cb(&batchView);
             }
@@ -545,11 +610,25 @@ std::unique_ptr<scheduler::Task> LingoDBTable::createScanTask(const ScanConfig& 
    std::vector<std::vector<lingodb::runtime::FilterDescription>> clauses;
    clauses.push_back(scanConfig.filters);
    clauses.insert(clauses.end(), scanConfig.orFilterClauses.begin(), scanConfig.orFilterClauses.end());
+   std::vector<size_t> predicateClauseIds = scanConfig.exportPredicateResults
+                                               ? scanConfig.predicateClauseIds
+                                               : std::vector<size_t>{};
+   for (size_t clauseId : predicateClauseIds) {
+      (void)clauseId;
+      assert(clauseId < clauses.size());
+   }
+   size_t numPredicateColumns = predicateClauseIds.size();
    auto restrictions = lingodb::runtime::Restrictions::createFromFilterClauses(std::move(clauses), *schema);
    if (scanConfig.parallel) {
-      return std::make_unique<ScanBatchesTask>(*this, tableData, colIds, std::move(restrictions), scanConfig.cb);
+      return std::make_unique<ScanBatchesTask>(*this, tableData, colIds, std::move(restrictions),
+                                               scanConfig.exportPredicateResults, numPredicateColumns,
+                                               std::move(predicateClauseIds),
+                                               scanConfig.cb);
    } else {
-      return std::make_unique<ScanBatchesSingleThreadedTask>(tableData, colIds, std::move(restrictions), scanConfig.cb);
+      return std::make_unique<ScanBatchesSingleThreadedTask>(tableData, colIds, std::move(restrictions),
+                                                             scanConfig.exportPredicateResults, numPredicateColumns,
+                                                             std::move(predicateClauseIds),
+                                                             scanConfig.cb);
    }
 }
 

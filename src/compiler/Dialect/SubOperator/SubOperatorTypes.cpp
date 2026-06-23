@@ -70,6 +70,9 @@ llvm::SmallVector<subop::Member> combineMembers(
 subop::StateMembersAttr subop::HashMapType::getMembers() {
    return subop::StateMembersAttr::get(this->getContext(), combineMembers(getKeyMembers(), getValueMembers()));
 }
+subop::StateMembersAttr subop::SharedTableType::getMembers() {
+   return subop::StateMembersAttr::get(this->getContext(), combineMembers(getTableMembers(), getPredicateMembers()));
+}
 subop::StateMembersAttr subop::PreAggrHtFragmentType::getMembers() {
    return subop::StateMembersAttr::get(this->getContext(), combineMembers(getKeyMembers(), getValueMembers()));
 }
@@ -96,6 +99,9 @@ subop::StateMembersAttr subop::MixedHashIndexedViewType::getMembers() {
 }
 subop::StateMembersAttr subop::SegmentTreeViewType::getMembers() {
    return subop::StateMembersAttr::get(this->getContext(), combineMembers(getKeyMembers(), getValueMembers()));
+}
+subop::StateMembersAttr subop::SharedTableEntryRefType::getMembers() {
+   return subop::StateMembersAttr::get(this->getContext(), combineMembers(getTableColumns(), getPredicateColumns()));
 }
 subop::StateMembersAttr subop::SimpleStateType::getValueMembers() {
    return getMembers();

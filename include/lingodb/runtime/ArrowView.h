@@ -26,6 +26,8 @@ struct BatchView {
    int64_t offset;
    uint16_t* selectionVector;
    const ArrayView** arrays;
+   const uint16_t** predicateColumns = nullptr;
+   size_t numPredicateColumns = 0;
 };
 } // namespace lingodb::runtime
 #endif //LINGODB_RUNTIME_ARROWVIEW_H

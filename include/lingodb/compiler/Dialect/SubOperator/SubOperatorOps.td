@@ -186,6 +186,14 @@ def Table : SubOperator_Type<"Table", "table",[State]> {
     let parameters = (ins "StateMembersAttr":$members, "bool":$filtered);
     let assemblyFormat = "`<` custom<StateMembers>($members) `,` $filtered `>`";
 }
+def SharedTable : SubOperator_Type<"SharedTable", "shared_table",[State]> {
+    let summary = "external table variant that exports per-clause predicate columns";
+    let parameters = (ins "StateMembersAttr":$tableMembers, "StateMembersAttr":$predicateMembers, "bool":$filtered);
+    let assemblyFormat = "`<` custom<StateMembers>($tableMembers) `,` custom<StateMembers>($predicateMembers) `,` $filtered `>`";
+    let extraClassDeclaration = [{
+        StateMembersAttr getMembers();
+    }];
+}
 def LocalTable : SubOperator_Type<"LocalTable", "local_table",[State]> {
     let summary = "local table";
     let parameters = (ins "StateMembersAttr":$members, "mlir::ArrayAttr": $columnNames);
@@ -354,6 +362,19 @@ def TableEntryRef : SubOperator_Type<"TableEntryRef", "table_entry_ref",[StateEn
         bool canBeOffset(){return false;}
         bool hasLock(){return false;}
         StateMembersAttr getMembers() { return getTableColumns(); }
+    }];
+}
+def SharedTableEntryRef : SubOperator_Type<"SharedTableEntryRef", "shared_table_entry_ref",[StateEntryReference]> {
+    let summary = "reference to entry of shared table scan";
+    let parameters = (ins "StateMembersAttr": $tableColumns, "StateMembersAttr": $predicateColumns);
+    let assemblyFormat = "`<` custom<StateMembers>($tableColumns) `,` custom<StateMembers>($predicateColumns) `>`";
+    let extraClassDeclaration = [{
+        bool isReadable(){return true;}
+        bool isWriteable(){return false;}
+        bool isStable(){return false;}
+        bool canBeOffset(){return false;}
+        bool hasLock(){return false;}
+        StateMembersAttr getMembers();
     }];
 }
 def GenericLookupEntryRef : SubOperator_Type<"LookupEntryRef", "lookup_entry_ref",[StateEntryReference]> {

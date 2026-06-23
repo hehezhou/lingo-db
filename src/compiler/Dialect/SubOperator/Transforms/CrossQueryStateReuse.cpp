@@ -44,37 +44,69 @@ static std::optional<unsigned> parseFilterPredMemberSlot(llvm::StringRef memberN
 
 static void inheritConsumerSlotsFromDeps(
    uint64_t targetKey, llvm::ArrayRef<uint64_t> deps,
-   llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>>& consumerSlotByCacheKeyAndQuery) {
+   llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>>& consumerSlotByCacheKeyAndQuery,
+   bool includeTargetSlotInSignature) {
    if (deps.empty()) return;
-   llvm::DenseMap<unsigned, unsigned> mergedSlots;
-   if (auto itTarget = consumerSlotByCacheKeyAndQuery.find(targetKey);
-       itTarget != consumerSlotByCacheKeyAndQuery.end())
-      mergedSlots = itTarget->second;
-   bool foundMappedSlot = !mergedSlots.empty();
+   llvm::SmallVector<unsigned, 8> queries;
+   llvm::DenseSet<unsigned> seenQueries;
+   auto addQueries = [&](const llvm::DenseMap<unsigned, unsigned>& slots) {
+      for (const auto& [queryIdx, slot] : slots) {
+         (void)slot;
+         if (seenQueries.insert(queryIdx).second) queries.push_back(queryIdx);
+      }
+   };
+   auto itTarget = consumerSlotByCacheKeyAndQuery.find(targetKey);
+   if (includeTargetSlotInSignature && itTarget != consumerSlotByCacheKeyAndQuery.end())
+      addQueries(itTarget->second);
    for (uint64_t depKey : deps) {
       auto itSlots = consumerSlotByCacheKeyAndQuery.find(depKey);
       if (itSlots == consumerSlotByCacheKeyAndQuery.end()) continue;
-      for (const auto& [queryIdx, slot] : itSlots->second) {
-         foundMappedSlot = true;
-         mergedSlots.try_emplace(queryIdx, slot);
-      }
+      addQueries(itSlots->second);
    }
-   if (!foundMappedSlot) return;
-   consumerSlotByCacheKeyAndQuery[targetKey] = std::move(mergedSlots);
+   if (queries.empty()) return;
+   llvm::sort(queries);
+
+   llvm::StringMap<unsigned> slotBySignature;
+   llvm::DenseMap<unsigned, unsigned> mergedSlots;
+   unsigned nextSlot = 0;
+   for (unsigned queryIdx : queries) {
+      std::string sig;
+      llvm::raw_string_ostream os(sig);
+      if (includeTargetSlotInSignature && itTarget != consumerSlotByCacheKeyAndQuery.end()) {
+         if (auto itSlot = itTarget->second.find(queryIdx); itSlot != itTarget->second.end())
+            os << "self:" << itSlot->second << '|';
+      }
+      for (uint64_t depKey : deps) {
+         auto itSlots = consumerSlotByCacheKeyAndQuery.find(depKey);
+         if (itSlots == consumerSlotByCacheKeyAndQuery.end()) continue;
+         auto itSlot = itSlots->second.find(queryIdx);
+         if (itSlot == itSlots->second.end()) continue;
+         os << "dep:" << depKey << ':' << itSlot->second << '|';
+      }
+      os.flush();
+      if (sig.empty()) continue;
+      auto itSlot = slotBySignature.find(sig);
+      if (itSlot == slotBySignature.end())
+         itSlot = slotBySignature.try_emplace(sig, nextSlot++).first;
+      mergedSlots[queryIdx] = itSlot->second;
+   }
+   if (!mergedSlots.empty()) consumerSlotByCacheKeyAndQuery[targetKey] = std::move(mergedSlots);
 }
 
 static void inheritConsumerSlotsFromSingleMixedDep(
    const llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t, 4>>& inheritedDepsByCacheKey,
    llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>>& consumerSlotByCacheKeyAndQuery) {
    for (const auto& [targetKey, deps] : inheritedDepsByCacheKey)
-      inheritConsumerSlotsFromDeps(targetKey, deps, consumerSlotByCacheKeyAndQuery);
+      inheritConsumerSlotsFromDeps(targetKey, deps, consumerSlotByCacheKeyAndQuery,
+                                   /*includeTargetSlotInSignature=*/false);
 }
 
 static void inheritConsumerSlotsFromGroupDeps(
    llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
    llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>>& consumerSlotByCacheKeyAndQuery) {
    for (const CrossQueryStateMatchGroup& group : groups)
-      inheritConsumerSlotsFromDeps(group.cacheKey, group.cacheDeps, consumerSlotByCacheKeyAndQuery);
+      inheritConsumerSlotsFromDeps(group.cacheKey, group.cacheDeps, consumerSlotByCacheKeyAndQuery,
+                                   /*includeTargetSlotInSignature=*/true);
 }
 
 static void recordConsumerMixedCacheGetSlots(
@@ -218,31 +250,6 @@ static void clearGetExternalFiltersForState(mlir::Value tableState) {
    ds.filterDescriptions.clear();
    ds.orFilterClauses.clear();
    ge.setDescrAttr(mlir::StringAttr::get(ge.getContext(), lingodb::utility::serializeToHexString(ds)));
-}
-
-static void clearGetExternalFiltersMatchingColumns(
-   mlir::ModuleOp module,
-   llvm::ArrayRef<runtime::FilterDescription> filters) {
-   llvm::StringSet<> columns;
-   for (const runtime::FilterDescription& f : filters) {
-      if (f.op == runtime::FilterOp::NOTNULL) continue;
-      columns.insert(f.columnName);
-   }
-   if (columns.empty()) return;
-   module.walk([&](subop::GetExternalOp ge) {
-      auto ds = lingodb::utility::deserializeFromHexString<runtime::ExternalDatasourceProperty>(ge.getDescr());
-      bool touchesColumn = false;
-      for (const runtime::FilterDescription& f : ds.filterDescriptions) {
-         if (columns.contains(f.columnName)) {
-            touchesColumn = true;
-            break;
-         }
-      }
-      if (!touchesColumn) return;
-      ds.filterDescriptions.clear();
-      ds.orFilterClauses.clear();
-      ge.setDescrAttr(mlir::StringAttr::get(ge.getContext(), lingodb::utility::serializeToHexString(ds)));
-   });
 }
 
 static subop::ScanRefsOp findFirstScanRefsInStep(ExecutionStepOp step) {
@@ -875,19 +882,23 @@ static std::string residualFilterSemanticFingerprint(SplitResidualFilter residua
 }
 
 static mlir::Value streamInputOfLinearSuffixOp(mlir::Operation* op) {
+   if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(op)) return scanList.getList();
    if (auto gather = mlir::dyn_cast<subop::GatherOp>(op)) return gather.getStream();
    if (auto map = mlir::dyn_cast<subop::MapOp>(op)) return map.getStream();
    if (auto filter = mlir::dyn_cast<subop::FilterOp>(op)) return filter.getStream();
    if (auto rename = mlir::dyn_cast<subop::RenamingOp>(op)) return rename.getStream();
+   if (auto lookup = mlir::dyn_cast<subop::LookupOp>(op)) return lookup.getStream();
    if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(op)) return lookup.getStream();
    llvm_unreachable("split-materialize residual suffix contains unsupported stream op");
 }
 
 static mlir::Value streamResultOfLinearSuffixOp(mlir::Operation* op) {
+   if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(op)) return scanList.getRes();
    if (auto gather = mlir::dyn_cast<subop::GatherOp>(op)) return gather.getResult();
    if (auto map = mlir::dyn_cast<subop::MapOp>(op)) return map.getResult();
    if (auto filter = mlir::dyn_cast<subop::FilterOp>(op)) return filter.getRes();
    if (auto rename = mlir::dyn_cast<subop::RenamingOp>(op)) return rename.getResult();
+   if (auto lookup = mlir::dyn_cast<subop::LookupOp>(op)) return lookup.getRes();
    if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(op)) return lookup.getRes();
    llvm_unreachable("split-materialize residual suffix contains unsupported stream op");
 }
@@ -928,6 +939,7 @@ struct SplitAggregateBuild {
    subop::ScanRefsOp scan;
    mlir::Value suffixStart;
    subop::LookupOrInsertOp lookup;
+   subop::LookupOp plainLookup;
    subop::ReduceOp reduce;
 };
 
@@ -955,7 +967,6 @@ static std::optional<SplitAggregateBuild> tryFindUniqueAggregateBuildWritingStat
       assert(found.step && "split-aggregate lookup_or_insert must be inside an execution_step");
    });
    if (!found.lookup) return std::nullopt;
-
    tuples::Column* lookupRefColumn = &found.lookup.getRef().getColumn();
    found.step.walk([&](subop::ReduceOp reduce) {
       if (&reduce.getRef().getColumn() != lookupRefColumn) return;
@@ -969,9 +980,38 @@ static std::optional<SplitAggregateBuild> tryFindUniqueAggregateBuildWritingStat
    return found;
 }
 
+static std::optional<SplitAggregateBuild> tryFindUniquePlainReduceBuildWritingState(mlir::ModuleOp module,
+                                                                                    mlir::Value state) {
+   state = canonicalizeStateValueForReuse(state);
+   SplitAggregateBuild found;
+   module.walk([&](subop::LookupOp lookup) {
+      mlir::Value lookupState = canonicalizeStateValueForReuse(
+         executionStepOperandForBlockArgument(lookup.getState()));
+      if (lookupState != state) return;
+      assert(!found.plainLookup && "split-reduce reuse expects one lookup writer");
+      found.plainLookup = lookup;
+      found.step = lookup->getParentOfType<ExecutionStepOp>();
+      assert(found.step && "split-reduce lookup must be inside an execution_step");
+   });
+   if (!found.plainLookup) return std::nullopt;
+
+   tuples::Column* lookupRefColumn = &found.plainLookup.getRef().getColumn();
+   found.step.walk([&](subop::ReduceOp reduce) {
+      if (&reduce.getRef().getColumn() != lookupRefColumn) return;
+      assert(!found.reduce && "split-reduce reuse expects one reduce for lookup");
+      found.reduce = reduce;
+   });
+   if (!found.reduce) return std::nullopt;
+   found.scan = tryFindFirstScanRefsInStep(found.step);
+   found.suffixStart = found.scan ? found.scan.getRes() : findAggregateSuffixStart(found.reduce);
+   if (!found.suffixStart) return std::nullopt;
+   return found;
+}
+
 static SplitAggregateBuild findUniqueAggregateBuildWritingState(mlir::ModuleOp module, mlir::Value state) {
    std::optional<SplitAggregateBuild> found = tryFindUniqueAggregateBuildWritingState(module, state);
-   assert(found && "split-aggregate reuse requires a lookup_or_insert/reduce writer");
+   if (!found) found = tryFindUniquePlainReduceBuildWritingState(module, state);
+   assert(found && "split-aggregate reuse requires a lookup_or_insert/reduce or lookup/reduce writer");
    return *found;
 }
 
@@ -1013,6 +1053,29 @@ static void alignClonedAggregateRefAndReduceMembers(subop::LookupOrInsertOp look
       members.push_back(subop::MemberAttr::get(ctx, member));
    assert(members.size() == reduce.getMembers().size() &&
           "split-aggregate reduce member layout must align by ordinal");
+   reduce.setMembersAttr(mlir::ArrayAttr::get(ctx, members));
+}
+
+static void alignClonedPlainLookupRefAndReduceMembers(subop::LookupOp lookup,
+                                                      subop::ReduceOp reduce,
+                                                      mlir::Value targetState) {
+   auto state = mlir::dyn_cast<subop::State>(targetState.getType());
+   assert(state && "split-reduce target must be a state");
+   auto lookupState = mlir::dyn_cast<subop::LookupAbleState>(targetState.getType());
+   assert(lookupState && "split-reduce target must be lookup-able");
+   auto* ctx = lookup.getContext();
+   auto refDef = lookup.getRef();
+   refDef.getColumn().type = subop::LookupEntryRefType::get(ctx, lookupState);
+   lookup.setRefAttr(refDef);
+   auto ref = reduce.getRef();
+   ref.getColumn().type = refDef.getColumn().type;
+   reduce.setRefAttr(ref);
+
+   llvm::SmallVector<mlir::Attribute, 16> members;
+   for (subop::Member member : state.getMembers().getMembers())
+      members.push_back(subop::MemberAttr::get(ctx, member));
+   assert(members.size() == reduce.getMembers().size() &&
+          "split-reduce member layout must align by ordinal");
    reduce.setMembersAttr(mlir::ArrayAttr::get(ctx, members));
 }
 
@@ -1126,18 +1189,23 @@ static void cloneAggregateSuffixToReduce(mlir::OpBuilder& b,
                                          subop::ReduceOp reduce,
                                          mlir::Value newStart,
                                          mlir::Value newState,
-                                         llvm::ArrayRef<runtime::FilterDescription> filters = {}) {
+                                         llvm::ArrayRef<runtime::FilterDescription> filters = {},
+                                         llvm::StringRef mixedPredMemberName = {}) {
    llvm::SmallVector<mlir::Operation*, 8> ops = linearStreamOpsBeforeReduce(suffixStart, reduce);
    mlir::IRMapping mapping;
    subop::ColumnMapping columnMapping;
-   mapping.map(suffixStart, newStart);
    mlir::Value current = newStart;
+   if (!mixedPredMemberName.empty()) {
+      current = filterSplitBranchByMixedPredMember(b, reduce.getLoc(), current, mixedPredMemberName);
+   }
+   mapping.map(suffixStart, current);
    llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr> colByName;
    tuples::ColumnRefAttr tableEntryRef;
    bool filtersInserted = filters.empty();
    subop::LookupOrInsertOp clonedLookup;
+   subop::LookupOp clonedPlainLookup;
    for (mlir::Operation* op : ops) {
-      if (!filtersInserted && mlir::isa<subop::LookupOrInsertOp>(op)) {
+      if (!filtersInserted && mlir::isa<subop::LookupOrInsertOp, subop::LookupOp>(op)) {
          current = materializeAggregateBranchFiltersBeforeLookup(b, op->getLoc(), current, tableEntryRef,
                                                                  colByName, filters);
          filtersInserted = true;
@@ -1145,10 +1213,17 @@ static void cloneAggregateSuffixToReduce(mlir::OpBuilder& b,
       mapping.map(streamInputOfLinearSuffixOp(op), current);
       if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(op))
          mapping.map(lookup.getState(), newState);
+      if (auto lookup = mlir::dyn_cast<subop::LookupOp>(op))
+         mapping.map(lookup.getState(), newState);
       auto sub = mlir::cast<subop::SubOperator>(op);
       mlir::Operation* cloned = sub.cloneSubOp(b, mapping, columnMapping);
       if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(cloned)) clonedLookup = lookup;
+      if (auto lookup = mlir::dyn_cast<subop::LookupOp>(cloned)) clonedPlainLookup = lookup;
       current = streamResultOfLinearSuffixOp(cloned);
+      if (mlir::isa<subop::ScanListOp>(cloned) && !mixedPredMemberName.empty()) {
+         b.setInsertionPointAfter(cloned);
+         current = filterSplitBranchByMixedPredMember(b, cloned->getLoc(), current, mixedPredMemberName);
+      }
       if (auto gather = mlir::dyn_cast<subop::GatherOp>(cloned)) {
          rememberAggregateBranchGatherColumns(gather, colByName);
       } else if (auto map = mlir::dyn_cast<subop::MapOp>(cloned)) {
@@ -1160,8 +1235,12 @@ static void cloneAggregateSuffixToReduce(mlir::OpBuilder& b,
    auto* clonedReduceOp =
       mlir::cast<subop::SubOperator>(reduce.getOperation()).cloneSubOp(b, mapping, columnMapping);
    auto clonedReduce = mlir::cast<subop::ReduceOp>(clonedReduceOp);
-   assert(clonedLookup && "split-aggregate suffix must clone lookup_or_insert");
-   alignClonedAggregateRefAndReduceMembers(clonedLookup, clonedReduce, newState);
+   if (clonedLookup) {
+      alignClonedAggregateRefAndReduceMembers(clonedLookup, clonedReduce, newState);
+   } else {
+      assert(clonedPlainLookup && "split-reduce suffix must clone lookup");
+      alignClonedPlainLookupRefAndReduceMembers(clonedPlainLookup, clonedReduce, newState);
+   }
 }
 
 static void eraseOriginalAggregateSuffix(mlir::Value suffixStart, subop::ReduceOp reduce) {
@@ -1622,6 +1701,63 @@ decodeFiltersForPotentialReuseState(mlir::Value state, const ModuleReuseInfo& re
          filters = decodeFiltersForStateFromWriterSteps(shadow, reuse);
       });
    }
+   return filters;
+}
+
+static void appendSplitBranchFiltersFromWriterSteps(
+   llvm::SmallVectorImpl<runtime::FilterDescription>& out,
+   mlir::Value state, const ModuleReuseInfo& reuse, unsigned slot,
+   const llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*>& rwByStepOp) {
+   auto itW = findReuseMap(reuse.writerStepsByState, canonicalizeStateValueForReuse(state));
+   if (itW == reuse.writerStepsByState.end()) itW = findReuseMap(reuse.writerStepsByState, state);
+   if (itW == reuse.writerStepsByState.end()) return;
+   for (ExecutionStepOp ws : itW->second) {
+      const ModuleReuseInfo::StepRW* rw = rwByStepOp.lookup(ws.getOperation());
+      if (!rw) continue;
+      for (mlir::Value r : rw->reads) {
+         if (!mlir::isa<subop::TableType, subop::SharedTableType>(r.getType())) continue;
+         mlir::Value tableV = r;
+         if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(r)) {
+            if (ba.getOwner() == &ws.getSubOps().front()) {
+               auto inputs = ws.getInputs();
+               assert(static_cast<unsigned>(ba.getArgNumber()) < inputs.size());
+               tableV = inputs[ba.getArgNumber()];
+            }
+         }
+         mlir::Value key = canonicalizeStateValueForReuse(tableV);
+         auto it = reuse.externalDatasourceByTableState.find(key);
+         if (it == reuse.externalDatasourceByTableState.end()) it = reuse.externalDatasourceByTableState.find(tableV);
+         if (it == reuse.externalDatasourceByTableState.end()) continue;
+         const runtime::ExternalDatasourceProperty& ds = it->second;
+         if (!ds.sharedPredicateClauses.empty()) {
+            assert(slot < ds.sharedPredicateClauses.size() &&
+                   "split branch must use an existing shared predicate slot");
+            out.append(ds.sharedPredicateClauses[slot].begin(), ds.sharedPredicateClauses[slot].end());
+            continue;
+         }
+         assert(ds.orFilterClauses.empty() &&
+                "split branch filter extraction only supports one conjunctive source clause");
+         out.append(ds.filterDescriptions.begin(), ds.filterDescriptions.end());
+      }
+   }
+}
+
+static llvm::SmallVector<runtime::FilterDescription, 8>
+decodeSplitBranchFiltersForState(mlir::Value state, const ModuleReuseInfo& reuse, unsigned slot) {
+   llvm::DenseMap<mlir::Operation*, const ModuleReuseInfo::StepRW*> rwByStepOp = buildRwByStepOpMap(reuse);
+   llvm::SmallVector<runtime::FilterDescription, 8> filters;
+   mlir::Value seed = state;
+   if (auto itShadow = findReuseMap(reuse.mergedFromShadowState, state);
+       itShadow != reuse.mergedFromShadowState.end()) {
+      seed = itShadow->second;
+   }
+   appendSplitBranchFiltersFromWriterSteps(filters, seed, reuse, slot, rwByStepOp);
+   if (auto itTL = findReuseMap(reuse.mergedFromShadowState, seed);
+       itTL != reuse.mergedFromShadowState.end()) {
+      appendSplitBranchFiltersFromWriterSteps(filters, itTL->second, reuse, slot, rwByStepOp);
+   }
+   if (filters.empty() && seed != state)
+      appendSplitBranchFiltersFromWriterSteps(filters, state, reuse, slot, rwByStepOp);
    return filters;
 }
 
@@ -2293,6 +2429,8 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
    llvm::SmallVector<DonorGroup, 32> donorGroups;
    llvm::SmallVector<CrossQueryStateMatchGroup, 64> activeRewriteGroups;
    llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>> consumerSlotByCacheKeyAndQuery;
+   for (size_t qi = 0; qi < queries.size(); ++qi)
+      recordConsumerMixedCacheGetSlots(queries[qi], static_cast<unsigned>(qi), consumerSlotByCacheKeyAndQuery);
 
    auto countNoTable = [](llvm::ArrayRef<CacheTarget> targets) -> size_t {
       size_t n = 0;
@@ -2300,6 +2438,29 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
          if (!mlir::isa<TableType>(t.state.getType())) n++;
       }
       return n;
+   };
+
+   auto reuseSlotSignatureForEntryInGroup = [&](
+                                                 const CrossQueryStateMatchGroup& g,
+                                                 const CrossQueryStateMatchEntry& e) -> std::string {
+      assert(e.query >= 0 && "reuse group entry must have a query id");
+      std::string sig;
+      llvm::raw_string_ostream os(sig);
+      os << "self:";
+      if (e.reuseSlot != std::numeric_limits<unsigned>::max()) {
+         os << e.reuseSlot;
+      } else {
+         os << static_cast<unsigned>(e.query);
+      }
+      for (uint64_t depKey : g.cacheDeps) {
+         auto itByQuery = consumerSlotByCacheKeyAndQuery.find(depKey);
+         if (itByQuery == consumerSlotByCacheKeyAndQuery.end()) continue;
+         auto itSlot = itByQuery->second.find(static_cast<unsigned>(e.query));
+         if (itSlot == itByQuery->second.end()) continue;
+         os << "|dep:" << depKey << ':' << itSlot->second;
+      }
+      os.flush();
+      return sig;
    };
 
    for (const CrossQueryStateMatchGroup& g : rewriteGroups) {
@@ -2336,11 +2497,29 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
              "batch reuse must never target thread_local-wrapped states");
 
       EffectiveGroupRewriteFlags flags = flagsByCacheKey.lookup(g.cacheKey);
+      llvm::StringMap<unsigned> slotBySignature;
+      llvm::DenseMap<unsigned, unsigned> slotByQuery;
+      unsigned nextReuseSlot = 0;
+      for (const CrossQueryStateMatchEntry& e : g.entries) {
+         if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
+         std::string sig = reuseSlotSignatureForEntryInGroup(g, e);
+         auto itSlot = slotBySignature.find(sig);
+         if (itSlot == slotBySignature.end()) {
+            itSlot = slotBySignature.try_emplace(sig, nextReuseSlot++).first;
+         }
+         slotByQuery[static_cast<unsigned>(e.query)] = itSlot->second;
+      }
+
+      CrossQueryStateMatchGroup groupForRewrite = g;
+      for (CrossQueryStateMatchEntry& e : groupForRewrite.entries) {
+         if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
+         e.reuseSlot = slotByQuery.lookup(static_cast<unsigned>(e.query));
+      }
+      activeRewriteGroups.push_back(groupForRewrite);
       donorGroups.push_back(DonorGroup{
-         &g, donor->query, donor->state,
+         &activeRewriteGroups.back(), donor->query, donor->state,
          CacheTarget{donorTargetState, g.cacheKey, flags.enableFilterPredReuse},
          g.requiresSplitMaterialize});
-      activeRewriteGroups.push_back(g);
 
       for (const CrossQueryStateMatchEntry& e : g.entries) {
          if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
@@ -2348,9 +2527,7 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
          assert(targetState && "batch reuse consumer target must resolve");
          assert(!mlir::isa<ThreadLocalType>(targetState.getType()) &&
                 "batch reuse must never target thread_local-wrapped states");
-         unsigned splitSlot = e.reuseSlot == std::numeric_limits<unsigned>::max()
-                                 ? static_cast<unsigned>(e.query)
-                                 : e.reuseSlot;
+         unsigned splitSlot = slotByQuery.lookup(static_cast<unsigned>(e.query));
          uint64_t targetCacheKey = g.requiresSplitMaterialize
                                       ? splitMaterializeOutputCacheKey(g.cacheKey, splitSlot)
                                       : g.cacheKey;
@@ -2362,10 +2539,8 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
                                        : res.numUnionTargetsNoTablePerQuery;
          categoryTargets[e.query]++;
          if (!mlir::isa<TableType>(targetState.getType())) categoryTargetsNoTable[e.query]++;
-         consumerSlotByCacheKeyAndQuery[g.cacheKey][static_cast<unsigned>(e.query)] =
-            mlir::isa<subop::PreAggrHtType>(targetState.getType())
-               ? splitSlot
-               : static_cast<unsigned>(e.query);
+         consumerSlotByCacheKeyAndQuery[g.cacheKey][static_cast<unsigned>(e.query)] = splitSlot;
+         consumerSlotByCacheKeyAndQuery[targetCacheKey][static_cast<unsigned>(e.query)] = splitSlot;
       }
    }
    rewriteGroups = std::move(activeRewriteGroups);
@@ -2471,7 +2646,8 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
       }
       insertCachePutsForTargets(*res.synthetic, cachePutTargets, &reuseSyntheticAfterLayout);
       extendSyntheticJoinBuffersWithInheritedMixedPreds(*res.synthetic, cachePutTargets, &producerLayoutsByKey,
-                                                        &inheritedMixedDepsByCacheKey);
+                                                        &inheritedMixedDepsByCacheKey,
+                                                        &consumerSlotByCacheKeyAndQuery);
       inheritConsumerSlotsFromSingleMixedDep(inheritedMixedDepsByCacheKey, consumerSlotByCacheKeyAndQuery);
       inheritConsumerSlotsFromGroupDeps(rewriteGroups, consumerSlotByCacheKeyAndQuery);
       refreshCachedJoinLayoutsFromSyntheticCachePuts(*res.synthetic, targetsSynthetic, producerLayoutsByKey);
@@ -2599,81 +2775,77 @@ static void expandSplitMaterializeTargetsInSynthetic(
 	      if (!tryFindUniqueMaterializeStepWritingState(synthetic, donorSyntheticBuildState)) {
 	         SplitAggregateBuild aggBuild =
 	            findUniqueAggregateBuildWritingState(synthetic, donorSyntheticBuildState);
-	         llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>> decodedFiltersByEntryTarget;
-	         llvm::SmallVector<runtime::FilterDescription, 32> allBranchFilters;
-	         for (const CrossQueryStateMatchEntry& e : g.entries) {
-	            assert(e.query >= 0 && static_cast<size_t>(e.query) < queries.size());
-	            unsigned slot = e.reuseSlot == std::numeric_limits<unsigned>::max()
-	                               ? static_cast<unsigned>(e.query)
-	                               : e.reuseSlot;
-	            uint64_t outputKey = splitMaterializeOutputCacheKey(g.cacheKey, slot);
-	            mlir::Value entryTarget = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
-	            assert(entryTarget && "split-aggregate entry target must resolve");
-	            llvm::SmallVector<CacheTarget, 1> filterTarget{CacheTarget{entryTarget, outputKey, false}};
-	            llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>> decodedByTarget =
-	               decodeFiltersByCacheTargets(filterTarget, reuseEarly[e.query]);
-	            if (auto itFilters = decodedByTarget.find(entryTarget); itFilters != decodedByTarget.end()) {
-	               decodedFiltersByEntryTarget[entryTarget] = itFilters->second;
-	               allBranchFilters.append(itFilters->second.begin(), itFilters->second.end());
-	            }
-	         }
-	         if (aggBuild.scan) {
-	            clearGetExternalFiltersForState(canonicalizeStateValueForReuse(aggBuild.scan.getState()));
-	         } else {
-	            clearGetExternalFiltersMatchingColumns(synthetic, allBranchFilters);
-	         }
+         llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>> decodedFiltersByEntryTarget;
+         if (aggBuild.scan) {
+            for (const CrossQueryStateMatchEntry& e : g.entries) {
+               assert(e.query >= 0 && static_cast<size_t>(e.query) < queries.size());
+               unsigned slot = consumerSlotForCacheKeyQuery(consumerSlotByCacheKeyAndQuery, g.cacheKey,
+                                                            static_cast<unsigned>(e.query));
+               uint64_t outputKey = splitMaterializeOutputCacheKey(g.cacheKey, slot);
+               mlir::Value entryTarget = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
+               assert(entryTarget && "split-aggregate entry target must resolve");
+               (void)outputKey;
+               llvm::SmallVector<runtime::FilterDescription, 8> filters =
+                  decodeSplitBranchFiltersForState(entryTarget, reuseEarly[e.query], slot);
+               if (!filters.empty()) decodedFiltersByEntryTarget[entryTarget] = std::move(filters);
+            }
+         }
+         if (aggBuild.scan) {
+            clearGetExternalFiltersForState(canonicalizeStateValueForReuse(aggBuild.scan.getState()));
+         }
 	         mlir::Value suffixStart = aggBuild.suffixStart;
+         llvm::DenseSet<uint64_t> emittedOutputKeys;
 
-	         for (const CrossQueryStateMatchEntry& e : g.entries) {
-	            assert(e.query >= 0 && static_cast<size_t>(e.query) < queries.size());
-            unsigned slot = e.reuseSlot == std::numeric_limits<unsigned>::max()
-                               ? static_cast<unsigned>(e.query)
-                               : e.reuseSlot;
+         for (const CrossQueryStateMatchEntry& e : g.entries) {
+            assert(e.query >= 0 && static_cast<size_t>(e.query) < queries.size());
+            unsigned slot = consumerSlotForCacheKeyQuery(consumerSlotByCacheKeyAndQuery, g.cacheKey,
+                                                         static_cast<unsigned>(e.query));
             uint64_t outputKey = splitMaterializeOutputCacheKey(g.cacheKey, slot);
+            if (!emittedOutputKeys.insert(outputKey).second) continue;
 
             mlir::Value entryTarget = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
             assert(entryTarget && "split-aggregate entry target must resolve");
-	            mlir::Value syntheticFinalState = donorMappings[e.query].lookupOrNull(entryTarget);
-	            mlir::Value syntheticBuildState;
-	            if (syntheticFinalState) {
-	               syntheticBuildState = resolveSplitMaterializeBuildState(synthetic, syntheticFinalState, reuseSynthetic);
-	            } else {
-	               ExecutionStepOp aggregateTopStep = topLevelExecutionStepFor(aggBuild.step);
-	               mlir::Value entryBuildState = entryTarget;
-	               if (auto itShadow = findReuseMap(reuseEarly[e.query].mergedFromShadowState, entryTarget);
-	                   itShadow != reuseEarly[e.query].mergedFromShadowState.end()) {
+            mlir::Value syntheticFinalState = donorMappings[e.query].lookupOrNull(entryTarget);
+            mlir::Value syntheticBuildState;
+            if (syntheticFinalState) {
+               syntheticBuildState = resolveSplitMaterializeBuildState(synthetic, syntheticFinalState, reuseSynthetic);
+            } else {
+               ExecutionStepOp aggregateTopStep = topLevelExecutionStepFor(aggBuild.step);
+               mlir::Value entryBuildState = entryTarget;
+               if (auto itShadow = findReuseMap(reuseEarly[e.query].mergedFromShadowState, entryTarget);
+                   itShadow != reuseEarly[e.query].mergedFromShadowState.end()) {
                   entryBuildState = itShadow->second;
-	               }
-	               auto itCreate = findReuseMap(reuseEarly[e.query].createOnlyStepForState, entryBuildState);
-	               assert(itCreate != reuseEarly[e.query].createOnlyStepForState.end() &&
-	                      "split-aggregate peer build state needs a create-only step");
-	               syntheticBuildState = cloneCreateOnlyStepBefore(aggregateTopStep, itCreate->second, entryBuildState);
+               }
+               auto itCreate = findReuseMap(reuseEarly[e.query].createOnlyStepForState, entryBuildState);
+               assert(itCreate != reuseEarly[e.query].createOnlyStepForState.end() &&
+                      "split-aggregate peer build state needs a create-only step");
+               syntheticBuildState = cloneCreateOnlyStepBefore(aggregateTopStep, itCreate->second, entryBuildState);
 
-	               if (canonicalizeStateValueForReuse(entryBuildState) == canonicalizeStateValueForReuse(entryTarget)) {
-	                  syntheticFinalState = syntheticBuildState;
-	               } else {
+               if (canonicalizeStateValueForReuse(entryBuildState) == canonicalizeStateValueForReuse(entryTarget)) {
+                  syntheticFinalState = syntheticBuildState;
+               } else {
                   auto itMerge = findReuseMap(reuseEarly[e.query].writerStepsByState, entryTarget);
-	                  assert(itMerge != reuseEarly[e.query].writerStepsByState.end() && itMerge->second.size() == 1 &&
-	                         "split-aggregate peer final state needs one merge writer");
-	                  syntheticFinalState =
-	                     cloneMergeStepAfter(aggregateTopStep, itMerge->second.front(), entryBuildState,
-	                                         syntheticBuildState, entryTarget);
-	               }
-	            }
+                  assert(itMerge != reuseEarly[e.query].writerStepsByState.end() && itMerge->second.size() == 1 &&
+                         "split-aggregate peer final state needs one merge writer");
+                  syntheticFinalState =
+                     cloneMergeStepAfter(aggregateTopStep, itMerge->second.front(), entryBuildState,
+                                         syntheticBuildState, entryTarget);
+               }
+            }
 
-	            mlir::Value stateArg = stateToNestedBuildStep(aggBuild.step, syntheticBuildState);
-	            llvm::ArrayRef<runtime::FilterDescription> filters;
-	            if (auto itFilters = decodedFiltersByEntryTarget.find(entryTarget);
-	                itFilters != decodedFiltersByEntryTarget.end()) {
-	               filters = itFilters->second;
-	            }
-	            mlir::Value branchStream = suffixStart;
-	            if (aggBuild.scan && !filters.empty()) {
-	               auto [predStream, predRef] = materializeRuntimeFiltersAsPredicateColumnAfterScanRefs(
-	                  aggBuild.scan, filters, "split_agg_pred", /*rewireDownstreamUses=*/false);
-	               mlir::Operation* predAnchor = predStream.getDefiningOp();
-	               assert(predAnchor && "split-aggregate predicate stream must be op-defined");
-	               mlir::OpBuilder fb(predAnchor);
+            mlir::Value stateArg = stateToNestedBuildStep(aggBuild.step, syntheticBuildState);
+            llvm::ArrayRef<runtime::FilterDescription> filters;
+            if (auto itFilters = decodedFiltersByEntryTarget.find(entryTarget);
+                itFilters != decodedFiltersByEntryTarget.end()) {
+               filters = itFilters->second;
+            }
+            mlir::Value branchStream = suffixStart;
+            if (aggBuild.scan && !filters.empty()) {
+               auto [predStream, predRef] = materializeRuntimeFiltersAsPredicateColumnAfterScanRefs(
+                  aggBuild.scan, filters, "split_agg_pred", /*rewireDownstreamUses=*/false);
+               mlir::Operation* predAnchor = predStream.getDefiningOp();
+               assert(predAnchor && "split-aggregate predicate stream must be op-defined");
+               mlir::OpBuilder fb(predAnchor);
                fb.setInsertionPointAfter(predAnchor);
                auto filter = fb.create<subop::FilterOp>(aggBuild.scan.getLoc(), predStream,
                                                         subop::FilterSemantic::all_true,
@@ -2681,13 +2853,28 @@ static void expandSplitMaterializeTargetsInSynthetic(
                branchStream = filter.getRes();
             }
 
-	            mlir::OpBuilder b(aggBuild.lookup);
-	            b.setInsertionPoint(aggBuild.lookup);
-	            cloneAggregateSuffixToReduce(b, suffixStart, aggBuild.reduce, branchStream, stateArg,
-	                                         aggBuild.scan ? llvm::ArrayRef<runtime::FilterDescription>{}
-	                                                       : filters);
-	            expanded.push_back(CacheTarget{syntheticFinalState, outputKey, /*enableFilterPredReuse=*/false});
-	         }
+            mlir::Operation* lookupAnchor = aggBuild.lookup ? aggBuild.lookup.getOperation()
+                                                            : aggBuild.plainLookup.getOperation();
+            assert(lookupAnchor && "split reduce build must have a lookup insertion anchor");
+            mlir::OpBuilder b(lookupAnchor);
+            b.setInsertionPoint(lookupAnchor);
+            std::optional<unsigned> inheritedPredSlot;
+            for (uint64_t depKey : g.cacheDeps) {
+               auto itByQuery = consumerSlotByCacheKeyAndQuery.find(depKey);
+               if (itByQuery == consumerSlotByCacheKeyAndQuery.end()) continue;
+               auto itSlot = itByQuery->second.find(static_cast<unsigned>(e.query));
+               if (itSlot == itByQuery->second.end()) continue;
+               if (inheritedPredSlot) continue;
+               inheritedPredSlot = itSlot->second;
+            }
+            unsigned branchPredSlot = inheritedPredSlot.value_or(slot);
+            std::string slotPredName = ("filter_pred$" + llvm::Twine(branchPredSlot)).str();
+            cloneAggregateSuffixToReduce(b, suffixStart, aggBuild.reduce, branchStream, stateArg,
+                                         aggBuild.scan ? llvm::ArrayRef<runtime::FilterDescription>{}
+                                                       : filters,
+                                         slotPredName);
+            expanded.push_back(CacheTarget{syntheticFinalState, outputKey, /*enableFilterPredReuse=*/false});
+         }
          eraseOriginalAggregateSuffix(suffixStart, aggBuild.reduce);
          continue;
       }
@@ -2738,14 +2925,15 @@ static void expandSplitMaterializeTargetsInSynthetic(
       }
       ensureSplitMaterializeMixedPredCarriers(synthetic, requiredBranchPredSlots);
       auto colByName = materializeStreamColumnsByFilterName(matStep, donorMat);
+      llvm::DenseSet<uint64_t> emittedOutputKeys;
 
       for (const CrossQueryStateMatchEntry& e : g.entries) {
          assert(e.query >= 0 && static_cast<size_t>(e.query) < queries.size());
-         unsigned slot = e.reuseSlot == std::numeric_limits<unsigned>::max()
-                            ? static_cast<unsigned>(e.query)
-                            : e.reuseSlot;
+         unsigned slot = consumerSlotForCacheKeyQuery(consumerSlotByCacheKeyAndQuery, g.cacheKey,
+                                                      static_cast<unsigned>(e.query));
          unsigned branchPredSlot = branchPredSlotByQuery.lookup(e.query);
          uint64_t outputKey = splitMaterializeOutputCacheKey(g.cacheKey, slot);
+         if (!emittedOutputKeys.insert(outputKey).second) continue;
 
          mlir::Value entryTarget = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
          assert(entryTarget && "split-materialize entry target must resolve");
@@ -2777,12 +2965,10 @@ static void expandSplitMaterializeTargetsInSynthetic(
 
          mlir::Value stateArg = threadStateToNestedMaterializeStep(donorMaterializeOwnerStep, syntheticBuildState);
          llvm::SmallVector<CacheTarget, 1> filterTarget{CacheTarget{entryTarget, outputKey, false}};
-         llvm::DenseMap<mlir::Value, llvm::SmallVector<runtime::FilterDescription, 8>> decodedByTarget =
-            decodeFiltersByCacheTargets(filterTarget, reuseEarly[e.query]);
-         llvm::ArrayRef<runtime::FilterDescription> filters;
-         if (auto itFilters = decodedByTarget.find(entryTarget); itFilters != decodedByTarget.end()) {
-            filters = itFilters->second;
-         }
+         (void)filterTarget;
+         llvm::SmallVector<runtime::FilterDescription, 8> decodedFilters =
+            decodeSplitBranchFiltersForState(entryTarget, reuseEarly[e.query], slot);
+         llvm::ArrayRef<runtime::FilterDescription> filters(decodedFilters);
          llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr> branchColByName = colByName;
          for (const runtime::FilterDescription& f : filters) {
             if (branchColByName.contains(f.columnName)) continue;

@@ -66,6 +66,39 @@ namespace {
 using namespace lingodb::compiler::dialect;
 namespace rt = lingodb::compiler::runtime;
 using Member = subop::Member;
+
+static bool memberListContains(subop::StateMembersAttr members, subop::Member member) {
+   return llvm::is_contained(members.getMembers(), member);
+}
+
+static subop::StateMembersAttr tableScanDataMembers(mlir::Type type) {
+   if (auto table = mlir::dyn_cast<subop::TableType>(type)) return table.getMembers();
+   if (auto shared = mlir::dyn_cast<subop::SharedTableType>(type)) return shared.getTableMembers();
+   return {};
+}
+
+static subop::StateMembersAttr tableScanPredicateMembers(mlir::Type type) {
+   if (auto shared = mlir::dyn_cast<subop::SharedTableType>(type)) return shared.getPredicateMembers();
+   return subop::StateMembersAttr::get(type.getContext(), {});
+}
+
+static bool tableScanIsFiltered(mlir::Type type) {
+   if (auto table = mlir::dyn_cast<subop::TableType>(type)) return table.getFiltered();
+   if (auto shared = mlir::dyn_cast<subop::SharedTableType>(type)) return shared.getFiltered();
+   llvm_unreachable("expected external table scan state type");
+}
+
+static subop::StateMembersAttr tableEntryDataMembers(mlir::Type type) {
+   if (auto ref = mlir::dyn_cast<subop::TableEntryRefType>(type)) return ref.getTableColumns();
+   if (auto ref = mlir::dyn_cast<subop::SharedTableEntryRefType>(type)) return ref.getTableColumns();
+   return {};
+}
+
+static subop::StateMembersAttr tableEntryPredicateMembers(mlir::Type type) {
+   if (auto ref = mlir::dyn_cast<subop::SharedTableEntryRefType>(type)) return ref.getPredicateColumns();
+   return subop::StateMembersAttr::get(type.getContext(), {});
+}
+
 struct SubOpToControlFlowLoweringPass
    : public mlir::PassWrapper<SubOpToControlFlowLoweringPass, OperationPass<mlir::ModuleOp>> {
    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SubOpToControlFlowLoweringPass)
@@ -990,28 +1023,51 @@ class TableRefGatherOpLowering : public SubOpTupleStreamConsumerConversionPatter
 
    LogicalResult match(subop::GatherOp gatherOp) const override {
       auto refType = gatherOp.getRef().getColumn().type;
-      if (!mlir::isa<subop::TableEntryRefType>(refType)) { return failure(); }
+      if (!mlir::isa<subop::TableEntryRefType, subop::SharedTableEntryRefType>(refType)) { return failure(); }
       return success();
    }
 
    void rewrite(subop::GatherOp gatherOp, OpAdaptor adaptor, SubOpRewriter& rewriter, ColumnMapping& mapping) const override {
       auto refType = gatherOp.getRef().getColumn().type;
-      auto columns = mlir::cast<subop::TableEntryRefType>(refType).getMembers();
+      auto dataMembers = tableEntryDataMembers(refType);
+      auto predicateMembers = tableEntryPredicateMembers(refType);
+      llvm::SmallVector<subop::Member> allMembers(dataMembers.getMembers().begin(), dataMembers.getMembers().end());
+      allMembers.append(predicateMembers.getMembers().begin(), predicateMembers.getMembers().end());
+      auto columns = subop::StateMembersAttr::get(getContext(), allMembers);
       auto tableRefVal = mapping.resolve(gatherOp, gatherOp.getRef());
       llvm::SmallVector<mlir::Value> unpacked;
       rewriter.createOrFold<util::UnPackOp>(unpacked, gatherOp->getLoc(), tableRefVal);
       auto currRow = unpacked[0];
       llvm::SmallVector<mlir::Value> unPackedColumns;
       rewriter.createOrFold<util::UnPackOp>(unPackedColumns, gatherOp->getLoc(), unpacked[1]);
+      llvm::SmallVector<mlir::Value> unPackedPredicates;
+      if (!predicateMembers.getMembers().empty()) {
+         assert(unpacked.size() > 2 && "shared table ref must carry predicate values");
+         rewriter.createOrFold<util::UnPackOp>(unPackedPredicates, gatherOp->getLoc(), unpacked[2]);
+      }
+      size_t dataColumnIdx = 0;
+      size_t predicateColumnIdx = 0;
       for (size_t i = 0; i < columns.getMembers().size(); i++) {
          auto c = columns.getMembers()[i];
          if (gatherOp.getMapping().hasMember(c)) {
             auto columnDefAttr = gatherOp.getMapping().getColumnDef(c);
-            auto colArray = unPackedColumns[i];
-            auto type = columnDefAttr.getColumn().type;
-            //todo: use MLIR interfaces to get the "right" operation for loading a certain type from an arrow array?
-            mlir::Value loaded = rewriter.create<db::LoadArrowOp>(gatherOp->getLoc(), type, colArray, currRow);
+            mlir::Value loaded;
+            if (memberListContains(predicateMembers, c)) {
+               assert(predicateColumnIdx < unPackedPredicates.size() &&
+                      "shared scan must provide every requested filter_pred member");
+               loaded = unPackedPredicates[predicateColumnIdx];
+            } else {
+               auto colArray = unPackedColumns[dataColumnIdx];
+               auto type = columnDefAttr.getColumn().type;
+               //todo: use MLIR interfaces to get the "right" operation for loading a certain type from an arrow array?
+               loaded = rewriter.create<db::LoadArrowOp>(gatherOp->getLoc(), type, colArray, currRow);
+            }
             mapping.define(columnDefAttr, loaded);
+         }
+         if (memberListContains(predicateMembers, c)) {
+            predicateColumnIdx++;
+         } else {
+            dataColumnIdx++;
          }
       }
       rewriter.replaceTupleStream(gatherOp, mapping);
@@ -1174,18 +1230,26 @@ class ScanRefsTableLowering : public SubOpConversionPattern<subop::ScanRefsOp> {
    using SubOpConversionPattern<subop::ScanRefsOp>::SubOpConversionPattern;
 
    LogicalResult matchAndRewrite(subop::ScanRefsOp scanOp, OpAdaptor adaptor, SubOpRewriter& rewriter) const override {
-      auto tableType = mlir::dyn_cast_or_null<subop::TableType>(scanOp.getState().getType());
-      if (!tableType) return failure();
+      auto dataMembers = tableScanDataMembers(scanOp.getState().getType());
+      if (!dataMembers) return failure();
+      auto statePredicateMembers = tableScanPredicateMembers(scanOp.getState().getType());
+      bool sharedScan = !statePredicateMembers.getMembers().empty();
       auto& memberManager = getContext()->getOrLoadDialect<subop::SubOperatorDialect>()->getMemberManager();
       auto loc = scanOp->getLoc();
-      auto refType = mlir::cast<subop::TableEntryRefType>(scanOp.getRef().getColumn().type);
+      auto refType = scanOp.getRef().getColumn().type;
+      auto refDataMembers = tableEntryDataMembers(refType);
+      auto refPredicateMembers = tableEntryPredicateMembers(refType);
       std::string memberMapping = "[";
       llvm::SmallVector<mlir::Type> accessedColumnTypes;
-      auto members = refType.getMembers();
-      for (auto m : members.getMembers()) {
+      llvm::SmallVector<subop::Member> requestedMembers(refDataMembers.getMembers().begin(),
+                                                        refDataMembers.getMembers().end());
+      requestedMembers.append(refPredicateMembers.getMembers().begin(), refPredicateMembers.getMembers().end());
+      for (auto m : requestedMembers) {
          auto type = memberManager.getType(m);
          auto name = memberManager.getName(m);
-         accessedColumnTypes.push_back(type);
+         if (!memberListContains(refPredicateMembers, m)) {
+            accessedColumnTypes.push_back(type);
+         }
          if (memberMapping.length() > 1) {
             memberMapping += ",";
          }
@@ -1193,12 +1257,19 @@ class ScanRefsTableLowering : public SubOpConversionPattern<subop::ScanRefsOp> {
       }
       memberMapping += "]";
       mlir::Value memberMappingValue = rewriter.create<util::CreateConstVarLen>(scanOp->getLoc(), util::VarLen32Type::get(rewriter.getContext()), memberMapping);
-      mlir::Value iterator = rt::DataSourceIteration::init(rewriter, scanOp->getLoc())({adaptor.getState(), memberMappingValue})[0];
+      size_t numPredicateMembers = refPredicateMembers.getMembers().size();
+      mlir::Value iterator = sharedScan
+                                 ? rt::DataSourceIteration::initShared(rewriter, scanOp->getLoc())({adaptor.getState(), memberMappingValue})[0]
+                                 : rt::DataSourceIteration::init(rewriter, scanOp->getLoc())({adaptor.getState(), memberMappingValue})[0];
       ColumnMapping mapping;
 
       auto* ctxt = rewriter.getContext();
       auto i16T = mlir::IntegerType::get(rewriter.getContext(), 16);
-      auto recordBatchInfoRepr = mlir::TupleType::get(ctxt, {rewriter.getIndexType(), rewriter.getIndexType(), util::RefType::get(i16T), util::RefType::get(arrow::ArrayType::get(ctxt))});
+      auto predPtrT = util::RefType::get(i16T);
+      auto recordBatchInfoRepr = mlir::TupleType::get(ctxt, {
+         rewriter.getIndexType(), rewriter.getIndexType(), util::RefType::get(i16T),
+         util::RefType::get(arrow::ArrayType::get(ctxt)), util::RefType::get(predPtrT),
+         rewriter.getIndexType()});
       ModuleOp parentModule = scanOp->getParentOfType<ModuleOp>();
       mlir::func::FuncOp funcOp;
       static size_t funcIds;
@@ -1217,7 +1288,7 @@ class ScanRefsTableLowering : public SubOpConversionPattern<subop::ScanRefsOp> {
          mlir::Value end = rewriter.create<util::LoadElementOp>(loc, rewriter.getIndexType(), recordBatchPointer, 0);
          mlir::Value globalOffset = rewriter.create<util::LoadElementOp>(loc, rewriter.getIndexType(), recordBatchPointer, 1);
          mlir::Value selVecPtr;
-         if (tableType.getFiltered()) {
+         if (tableScanIsFiltered(scanOp.getState().getType())) {
             selVecPtr = rewriter.create<util::LoadElementOp>(loc, util::RefType::get(i16T), recordBatchPointer, 2);
          }
          mlir::Value ptrToColumns = rewriter.create<util::LoadElementOp>(loc, util::RefType::get(arrow::ArrayType::get(ctxt)), recordBatchPointer, 3);
@@ -1228,17 +1299,41 @@ class ScanRefsTableLowering : public SubOpConversionPattern<subop::ScanRefsOp> {
             arrays.push_back(array);
          }
          auto arraysVal = rewriter.create<util::PackOp>(loc, arrays);
+         llvm::SmallVector<mlir::Value> predArrays;
+         if (numPredicateMembers) {
+            mlir::Value ptrToPredColumns =
+               rewriter.create<util::LoadElementOp>(loc, util::RefType::get(predPtrT), recordBatchPointer, 4);
+            for (size_t i = 0; i < numPredicateMembers; i++) {
+               auto ci = rewriter.create<mlir::arith::ConstantIndexOp>(loc, i);
+               predArrays.push_back(rewriter.create<util::LoadOp>(loc, ptrToPredColumns, ci));
+            }
+         }
          auto start = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
          auto c1 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
          auto forOp2 = rewriter.create<mlir::scf::ForOp>(loc, start, end, c1, mlir::ValueRange{});
          rewriter.atStartOf(forOp2.getBody(), [&](SubOpRewriter& rewriter) {
-            mlir::Value index = forOp2.getInductionVar();
-            if (tableType.getFiltered()) {
+            mlir::Value outputIndex = forOp2.getInductionVar();
+            mlir::Value index = outputIndex;
+            if (tableScanIsFiltered(scanOp.getState().getType())) {
                auto idx = rewriter.create<util::LoadOp>(loc, selVecPtr, index);
                index = rewriter.create<mlir::arith::IndexCastOp>(loc, rewriter.getIndexType(), idx);
             }
             auto withOffset = rewriter.create<mlir::arith::AddIOp>(loc, index, globalOffset);
-            auto currentRecord = rewriter.create<util::PackOp>(loc, mlir::ValueRange{withOffset, arraysVal});
+            mlir::Value currentRecord;
+            if (numPredicateMembers) {
+               llvm::SmallVector<mlir::Value> predValues;
+               predValues.reserve(predArrays.size());
+               for (mlir::Value predArray : predArrays) {
+                  auto predValue = rewriter.create<util::LoadOp>(loc, predArray, outputIndex);
+                  auto zero = rewriter.create<mlir::arith::ConstantIntOp>(loc, 0, 16);
+                  predValues.push_back(rewriter.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne,
+                                                                            predValue, zero));
+               }
+               auto predValuesVal = rewriter.create<util::PackOp>(loc, predValues);
+               currentRecord = rewriter.create<util::PackOp>(loc, mlir::ValueRange{withOffset, arraysVal, predValuesVal});
+            } else {
+               currentRecord = rewriter.create<util::PackOp>(loc, mlir::ValueRange{withOffset, arraysVal});
+            }
             mapping.define(scanOp.getRef(), currentRecord);
             rewriter.replaceTupleStream(scanOp, mapping);
          });
@@ -1386,7 +1481,7 @@ class GetExternalTableLowering : public SubOpConversionPattern<subop::GetExterna
    using SubOpConversionPattern<subop::GetExternalOp>::SubOpConversionPattern;
 
    LogicalResult matchAndRewrite(subop::GetExternalOp op, OpAdaptor adaptor, SubOpRewriter& rewriter) const override {
-      if (!mlir::isa<subop::TableType>(op.getType())) return failure();
+      if (!mlir::isa<subop::TableType, subop::SharedTableType>(op.getType())) return failure();
       mlir::Value description = rewriter.create<util::CreateConstVarLen>(op->getLoc(), util::VarLen32Type::get(rewriter.getContext()), op.getDescrAttr());
       rewriter.replaceOp(op, rt::DataSource::get(rewriter, op->getLoc())({description})[0]);
       return mlir::success();
@@ -4689,6 +4784,9 @@ void SubOpToControlFlowLoweringPass::runOnOperation() {
       return convertTuple(tupleType, typeConverter);
    });
    typeConverter.addConversion([&](subop::TableType t) -> Type {
+      return util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8));
+   });
+   typeConverter.addConversion([&](subop::SharedTableType t) -> Type {
       return util::RefType::get(t.getContext(), mlir::IntegerType::get(ctxt, 8));
    });
    typeConverter.addConversion([&](subop::LocalTableType t) -> Type {

@@ -85,6 +85,8 @@ struct ScanConfig {
    std::vector<FilterDescription> filters;
    /// Further disjuncts: each inner vector is ANDed; combined with `filters` via OR.
    std::vector<std::vector<FilterDescription>> orFilterClauses;
+   bool exportPredicateResults = false;
+   std::vector<size_t> predicateClauseIds;
    std::function<void(lingodb::runtime::BatchView*)> cb;
 };
 class TableStorage {
