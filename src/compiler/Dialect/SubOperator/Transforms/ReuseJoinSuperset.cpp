@@ -2062,6 +2062,7 @@ static void inheritSlotMapForSyntheticTarget(
    uint64_t targetKey, llvm::ArrayRef<uint64_t> deps,
    llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>>& consumerSlotByCacheKeyAndQuery) {
    if (deps.empty()) return;
+   if (consumerSlotByCacheKeyAndQuery.contains(targetKey)) return;
    llvm::SmallVector<unsigned, 8> queries;
    llvm::DenseSet<unsigned> seenQueries;
    auto addQueries = [&](const llvm::DenseMap<unsigned, unsigned>& slots) {
@@ -3025,6 +3026,10 @@ static void mergeExternalFiltersForOrReuse(ExternalDatasourceProperty& merged,
    merged.orFilterClauses.clear();
    merged.sharedPredicateClauses.clear();
    if (uniqueClauses.empty()) return;
+   merged.filterDescriptions.assign(uniqueClauses.front().begin(), uniqueClauses.front().end());
+   for (const auto& clause : llvm::drop_begin(uniqueClauses)) {
+      merged.orFilterClauses.emplace_back(clause.begin(), clause.end());
+   }
    for (const auto& clause : uniqueClauses) {
       merged.sharedPredicateClauses.emplace_back(clause.begin(), clause.end());
    }
@@ -4116,27 +4121,40 @@ static bool typeEmbedsHashIndexedViewState(mlir::Type t, subop::HashIndexedViewT
    return false;
 }
 
-static mlir::Type replaceEmbeddedHivInType(mlir::MLIRContext* ctx, mlir::Type t,
-                                           subop::HashIndexedViewType producerHiv,
-                                           subop::HashIndexedViewType consumerHivBeforeAlign) {
+static mlir::Type replaceEmbeddedHivStateInType(mlir::MLIRContext* ctx, mlir::Type t,
+                                                mlir::Type replacementHiv,
+                                                subop::HashIndexedViewType consumerHivBeforeAlign) {
    if (!t) return t;
-   if (mlir::isa<subop::HashIndexedViewType>(t)) {
-      if (t == producerHiv) return t;
-      if (consumerHivBeforeAlign && t != consumerHivBeforeAlign) return t;
-      return producerHiv;
+   auto replacementLayout = asHashIndexedViewLayoutType(replacementHiv);
+   assert(replacementLayout && "replacement must be an HIV-like state");
+   if (asHashIndexedViewLayoutType(t)) {
+      if (t == replacementHiv) return t;
+      auto currentLayout = asHashIndexedViewLayoutType(t);
+      if (sameHashIndexedViewLayout(currentLayout, replacementLayout)) return replacementHiv;
+      if (consumerHivBeforeAlign && !sameHashIndexedViewLayout(currentLayout, consumerHivBeforeAlign)) return t;
+      return replacementHiv;
    }
    if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(t)) {
       if (!lookupEntryRefEmbedsHashIndexedView(ler)) return t;
-      if (ler.getState() == producerHiv) return t;
-      if (consumerHivBeforeAlign && ler.getState() != consumerHivBeforeAlign) return t;
-      return subop::LookupEntryRefType::get(ctx, producerHiv);
+      if (ler.getState() == replacementHiv) return t;
+      auto currentLayout = asHashIndexedViewLayoutType(ler.getState());
+      if (sameHashIndexedViewLayout(currentLayout, replacementLayout))
+         return subop::LookupEntryRefType::get(ctx, mlir::cast<subop::LookupAbleState>(replacementHiv));
+      if (consumerHivBeforeAlign && !sameHashIndexedViewLayout(currentLayout, consumerHivBeforeAlign)) return t;
+      return subop::LookupEntryRefType::get(ctx, mlir::cast<subop::LookupAbleState>(replacementHiv));
    }
    if (auto list = mlir::dyn_cast<subop::ListType>(t)) {
-      mlir::Type nt = replaceEmbeddedHivInType(ctx, list.getT(), producerHiv, consumerHivBeforeAlign);
+      mlir::Type nt = replaceEmbeddedHivStateInType(ctx, list.getT(), replacementHiv, consumerHivBeforeAlign);
       if (nt == list.getT()) return t;
       return subop::ListType::get(ctx, mlir::cast<subop::StateEntryReference>(nt));
    }
    return t;
+}
+
+static mlir::Type replaceEmbeddedHivInType(mlir::MLIRContext* ctx, mlir::Type t,
+                                           subop::HashIndexedViewType producerHiv,
+                                           subop::HashIndexedViewType consumerHivBeforeAlign) {
+   return replaceEmbeddedHivStateInType(ctx, t, producerHiv, consumerHivBeforeAlign);
 }
 
 struct ProbeAlignDebugCtx;
@@ -4218,6 +4236,21 @@ static void setValueCarrierType(mlir::Value v, subop::HashIndexedViewType produc
       debugProbeAlign(dbg, [&](llvm::raw_ostream& os) {
          os << "setValueCarrierType value=" << v << " old_type=" << mlirTypeToString(oldTy)
             << " new_type=" << mlirTypeToString(nt) << " aligned_hiv=" << mlirTypeToString(producerHiv);
+      });
+      v.setType(nt);
+   }
+}
+
+static void setValueCarrierHivStateType(mlir::Value v, mlir::Type replacementHiv,
+                                        subop::HashIndexedViewType consumerHivBeforeAlign,
+                                        const ProbeAlignDebugCtx* dbg = nullptr) {
+   mlir::MLIRContext* ctx = v.getContext();
+   mlir::Type oldTy = v.getType();
+   if (mlir::Type nt = replaceEmbeddedHivStateInType(ctx, oldTy, replacementHiv, consumerHivBeforeAlign);
+       nt != oldTy) {
+      debugProbeAlign(dbg, [&](llvm::raw_ostream& os) {
+         os << "setValueCarrierHivStateType value=" << v << " old_type=" << mlirTypeToString(oldTy)
+            << " new_type=" << mlirTypeToString(nt) << " replacement_hiv=" << mlirTypeToString(replacementHiv);
       });
       v.setType(nt);
    }
@@ -6949,7 +6982,11 @@ void insertSyntheticFilterPredsAfterColumnUnion(
             unionPredMembers.push_back(layout.payloadMembers[i]);
             continue;
          }
-         if (!parseReuseFilterPredSemanticKey(layout.payloadSemanticKeys[i], qIdx)) continue;
+         if (auto slot = parseFilterPredMemberSlot(mm.getName(layout.payloadMembers[i]))) {
+            qIdx = *slot;
+         } else if (!parseReuseFilterPredSemanticKey(layout.payloadSemanticKeys[i], qIdx)) {
+            continue;
+         }
          auto itH = hivByQuery.find(qIdx);
          auto itR = reuseByQuery.find(qIdx);
          auto itMod = modByQuery.find(qIdx);
@@ -7096,9 +7133,11 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
             continue;
          }
          if (!parseReuseFilterPredSemanticKey(semantic, qIdx)) {
-            auto slot = parseFilterPredMemberSlot(mm.getName(layout.payloadMembers[i]));
-            if (!slot) continue;
-            qIdx = *slot;
+            if (auto slot = parseFilterPredMemberSlot(mm.getName(layout.payloadMembers[i]))) {
+               qIdx = *slot;
+            } else {
+               continue;
+            }
          }
          auto itH = hivBySlot.find(qIdx);
          auto itR = reuseInfoBySlot.find(qIdx);
@@ -7270,28 +7309,42 @@ static std::optional<subop::HashIndexedViewType> hashIndexedViewFromScanListCarr
    subop::ScanListOp scanList) {
    if (auto listTy = mlir::dyn_cast<subop::ListType>(scanList.getList().getType())) {
       if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(listTy.getT())) {
-         if (auto st = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState())) return st;
+         if (auto st = asHashIndexedViewLayoutType(ler.getState())) return st;
       }
    }
    if (auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(scanList.getElem().getColumn().type)) {
-      if (auto st = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState())) return st;
+      if (auto st = asHashIndexedViewLayoutType(ler.getState())) return st;
    }
    return std::nullopt;
+}
+
+static subop::MixedHashIndexedViewType mixedHivTypeForPredMember(mlir::MLIRContext* ctx,
+                                                                 subop::HashIndexedViewType hiv,
+                                                                 subop::Member predMember) {
+   assert(hiv && "probe predicate retag requires an HIV-like layout");
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   assert(valueMembersContainMemberNamed(ctx, hiv.getValueMembers(), mm.getName(predMember)) &&
+          "probe predicate retag requires the predicate member in the cached HIV layout");
+   return subop::MixedHashIndexedViewType::get(ctx, hiv.getKeyMembers(), hiv.getValueMembers(),
+                                              hiv.getCompareHashForLookup(),
+                                              mlir::StringAttr::get(ctx, mm.getName(predMember)));
 }
 
 static bool scanListTargetsAlignedHivPredSlot(mlir::MLIRContext* ctx, subop::ScanListOp scanList,
                                                subop::HashIndexedViewType alignedHiv, subop::Member predMember,
                                                subop::HashIndexedViewType consumerHivBeforeAlign) {
-   setValueCarrierType(scanList.getList(), alignedHiv, consumerHivBeforeAlign);
+   mlir::Type predAlignedHiv = mixedHivTypeForPredMember(ctx, alignedHiv, predMember);
+   setValueCarrierHivStateType(scanList.getList(), predAlignedHiv, consumerHivBeforeAlign);
    std::optional<subop::HashIndexedViewType> stOpt = hashIndexedViewFromScanListCarrier(scanList);
    if (!stOpt) return false;
    subop::HashIndexedViewType st = *stOpt;
-   if (st.getCompareHashForLookup() != alignedHiv.getCompareHashForLookup()) return false;
-   if (st.getKeyMembers().getMembers().size() != alignedHiv.getKeyMembers().getMembers().size()) return false;
+   subop::HashIndexedViewType predLayout = asHashIndexedViewLayoutType(predAlignedHiv);
+   if (st.getCompareHashForLookup() != predLayout.getCompareHashForLookup()) return false;
+   if (st.getKeyMembers().getMembers().size() != predLayout.getKeyMembers().getMembers().size()) return false;
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    llvm::StringRef predName = mm.getName(predMember);
    return valueMembersContainMemberNamed(ctx, st.getValueMembers(), predName) &&
-          valueMembersContainMemberNamed(ctx, alignedHiv.getValueMembers(), predName);
+          valueMembersContainMemberNamed(ctx, predLayout.getValueMembers(), predName);
 }
 
 static void ensureReuseFilterPredColumn(JoinBufferUnionPlan& plan, unsigned queryIndex, mlir::MLIRContext* ctx) {
@@ -7605,6 +7658,42 @@ static JoinBufferUnionPlan buildInheritedMixedPredPlan(mlir::ModuleOp synthetic,
    return plan;
 }
 
+static void sortUniqueSlots(llvm::SmallVectorImpl<unsigned>& slots) {
+   llvm::sort(slots);
+   slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+}
+
+static llvm::SmallVector<unsigned, 8> consumerSlotsForCacheKey(
+   uint64_t cacheKey,
+   const llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>>* consumerSlotByCacheKeyAndQuery) {
+   llvm::SmallVector<unsigned, 8> slots;
+   if (!consumerSlotByCacheKeyAndQuery) return slots;
+   auto itSlotsByQuery = consumerSlotByCacheKeyAndQuery->find(cacheKey);
+   if (itSlotsByQuery == consumerSlotByCacheKeyAndQuery->end()) return slots;
+   for (const auto& [queryIdx, slot] : itSlotsByQuery->second) {
+      (void)queryIdx;
+      slots.push_back(slot);
+   }
+   sortUniqueSlots(slots);
+   return slots;
+}
+
+static llvm::DenseSet<unsigned> filterPredSlotsInMembers(mlir::MLIRContext* ctx,
+                                                         subop::StateMembersAttr members) {
+   llvm::DenseSet<unsigned> slots;
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (subop::Member member : members.getMembers()) {
+      if (auto slot = parseFilterPredMemberSlot(mm.getName(member))) slots.insert(*slot);
+   }
+   return slots;
+}
+
+static llvm::DenseSet<unsigned> filterPredSlotsInHivLikeType(mlir::Type type) {
+   if (auto hiv = asHashIndexedViewLayoutType(type))
+      return filterPredSlotsInMembers(type.getContext(), hiv.getValueMembers());
+   return {};
+}
+
 void extendSyntheticJoinBuffersWithInheritedMixedPreds(
    mlir::ModuleOp synthetic, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
    CachedJoinBufferLayoutsByKey* outLayouts,
@@ -7640,21 +7729,27 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
       subop::ExecutionStepOp buildStep = findStrictJoinBufferBuildStepForHiv(synthetic, targetState, reuseSynthetic);
       if (!buildStep) continue;
       llvm::SmallVector<unsigned, 8> predSlots = inheritedMixedPredSlotsInBuildStep(buildStep);
-      if (auto mixedTarget = mlir::dyn_cast<subop::MixedHashIndexedViewType>(targetState.getType())) {
-         llvm::DenseSet<unsigned> targetSlots;
-         std::optional<unsigned> unionSlot;
-         for (subop::Member member : mixedTarget.getValueMembers().getMembers()) {
-            auto slot = parseFilterPredMemberSlot(mm.getName(member));
-            if (!slot) continue;
-            targetSlots.insert(*slot);
-            if (!unionSlot || *slot > *unionSlot) unionSlot = *slot;
-         }
-         assert(unionSlot && "mixed target must have a union predicate slot");
-         llvm::erase_if(predSlots, [&](unsigned slot) {
-            return slot == *unionSlot || !targetSlots.contains(slot);
-         });
+      llvm::SmallVector<unsigned, 8> consumerSlots =
+         consumerSlotsForCacheKey(target.cacheKey, consumerSlotByCacheKeyAndQuery);
+      if (!consumerSlots.empty()) {
+         predSlots = std::move(consumerSlots);
+      } else if (auto mixedTarget = mlir::dyn_cast<subop::MixedHashIndexedViewType>(targetState.getType())) {
+            llvm::SmallVector<unsigned, 8> targetSlots;
+            std::optional<unsigned> unionSlot;
+            for (subop::Member member : mixedTarget.getValueMembers().getMembers()) {
+               auto slot = parseFilterPredMemberSlot(mm.getName(member));
+               if (!slot) continue;
+               targetSlots.push_back(*slot);
+               if (!unionSlot || *slot > *unionSlot) unionSlot = *slot;
+            }
+            assert(unionSlot && "mixed target must have a union predicate slot");
+            llvm::erase_if(targetSlots, [&](unsigned slot) { return slot == *unionSlot; });
+            sortUniqueSlots(targetSlots);
+            if (!targetSlots.empty()) predSlots = std::move(targetSlots);
       }
       if (predSlots.empty()) continue;
+      sortUniqueSlots(predSlots);
+      unsigned unionSlot = filterPredUnionSlotForQueryIndices(predSlots);
       llvm::SmallVector<uint64_t, 4> inheritedDeps;
       if (auto itDeps = inheritedDepsByTargetKey.find(target.cacheKey); itDeps != inheritedDepsByTargetKey.end())
          inheritedDeps = itDeps->second;
@@ -7666,6 +7761,7 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
       subop::MaterializeOp mat = findJoinBufferMaterializeInStep(buildStep);
       assert(mat && "inherited mixed pred target must materialize a join buffer");
       bool layoutAlreadyHasPreds = false;
+      bool layoutContainsRequiredPreds = false;
       if (outLayouts) {
          auto itExistingLayout = outLayouts->find(target.cacheKey);
          layoutAlreadyHasPreds =
@@ -7673,12 +7769,27 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
             llvm::any_of(itExistingLayout->second.payloadMembers, [&](subop::Member member) {
                return parseFilterPredMemberSlot(mm.getName(member)).has_value();
             });
+         if (itExistingLayout != outLayouts->end()) {
+            llvm::DenseSet<unsigned> layoutSlots;
+            for (subop::Member member : itExistingLayout->second.payloadMembers) {
+               if (auto slot = parseFilterPredMemberSlot(mm.getName(member))) layoutSlots.insert(*slot);
+            }
+            layoutContainsRequiredPreds = layoutSlots.contains(unionSlot);
+            for (unsigned slot : predSlots)
+               layoutContainsRequiredPreds = layoutContainsRequiredPreds && layoutSlots.contains(slot);
+         }
+      }
+      if (!layoutContainsRequiredPreds) {
+         llvm::DenseSet<unsigned> typeSlots = filterPredSlotsInHivLikeType(targetState.getType());
+         layoutContainsRequiredPreds = typeSlots.contains(unionSlot);
+         for (unsigned slot : predSlots)
+            layoutContainsRequiredPreds = layoutContainsRequiredPreds && typeSlots.contains(slot);
       }
 
       JoinBufferUnionPlan plan;
       CachedJoinBufferLayout planLayout;
       bool hasPlanLayout = false;
-      if (!layoutAlreadyHasPreds) {
+      if (!layoutAlreadyHasPreds || !layoutContainsRequiredPreds) {
          plan = buildInheritedMixedPredPlan(synthetic, targetState, buildStep, mat, predSlots, reuseSynthetic);
          applyUnionPlanToSyntheticHiv(synthetic, targetState, plan, reuseSynthetic,
                                       synthetic, targetState, reuseSynthetic,
@@ -7721,7 +7832,6 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
       }
       if (!inheritedPredRefs.empty())
          insertResidualFilterUnionAfterPredicates(mat.getStream(), inheritedPredRefs);
-      unsigned unionSlot = filterPredUnionSlotForQueryIndices(predSlots);
       std::string unionPredName = ("filter_pred$" + llvm::Twine(unionSlot)).str();
       materializeConstantTruePredMemberOnBufferMaterialize(mat, unionPredName, /*updateStreamOperand=*/true);
 
@@ -7967,19 +8077,20 @@ void applyProbePredFiltersForConsumerClosures(mlir::ModuleOp consumer,
    auto* ctx = consumer.getContext();
    for (ConsumerCacheGetProbeClosure& probe : probeClosures) {
       if (!probe.alignedHiv) continue;
-      refreshProbeClosureFromCacheGetRoot(consumer, probe);
-      alignScanListForProbeClosure(consumer, probe, "probe_pred_align");
-
       subop::Member predMember;
       if (probe.consumerReuseQueryIndex) {
          assert(probe.cacheKey && "mixed HIV probe predicate slot rewrite requires a cache_get key");
          setMixedLookupPredSlotForCacheGet(consumer, *probe.cacheKey, *probe.consumerReuseQueryIndex);
          predMember = makeOrGetPredMemberForSlot(ctx, *probe.consumerReuseQueryIndex);
+         probe.cacheGetRoot.setType(mixedHivTypeForPredMember(ctx, probe.alignedHiv, predMember));
       } else if (auto found = findFilterPredMemberOnHashIndexedView(probe.alignedHiv)) {
          predMember = *found;
       } else {
          continue;
       }
+
+      refreshProbeClosureFromCacheGetRoot(consumer, probe);
+      alignScanListForProbeClosure(consumer, probe, "probe_pred_align");
 
       ProbeAlignDebugCtx dbg;
       dbg.cacheKey = probe.cacheKey;

@@ -1266,10 +1266,14 @@ class ScanRefsTableLowering : public SubOpConversionPattern<subop::ScanRefsOp> {
       auto* ctxt = rewriter.getContext();
       auto i16T = mlir::IntegerType::get(rewriter.getContext(), 16);
       auto predPtrT = util::RefType::get(i16T);
-      auto recordBatchInfoRepr = mlir::TupleType::get(ctxt, {
+      auto batchViewRepr = mlir::TupleType::get(ctxt, {
+         rewriter.getIndexType(), rewriter.getIndexType(), util::RefType::get(i16T),
+         util::RefType::get(arrow::ArrayType::get(ctxt))});
+      auto sharedBatchViewRepr = mlir::TupleType::get(ctxt, {
          rewriter.getIndexType(), rewriter.getIndexType(), util::RefType::get(i16T),
          util::RefType::get(arrow::ArrayType::get(ctxt)), util::RefType::get(predPtrT),
          rewriter.getIndexType()});
+      auto recordBatchInfoRepr = sharedScan ? sharedBatchViewRepr : batchViewRepr;
       ModuleOp parentModule = scanOp->getParentOfType<ModuleOp>();
       mlir::func::FuncOp funcOp;
       static size_t funcIds;

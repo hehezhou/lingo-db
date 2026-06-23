@@ -1261,6 +1261,35 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
    llvm_unreachable("runtime filter IR: unsupported filter literal type (expected int64, double, or string)");
 }
 
+static std::string normalizeRuntimeFilterColumnName(llvm::StringRef name) {
+   size_t dollar = name.find('$');
+   if (dollar != llvm::StringRef::npos) name = name.take_front(dollar);
+   std::string out = name.str();
+   size_t pos = out.rfind("_u_");
+   if (pos == std::string::npos || pos + 3 >= out.size()) return out;
+   bool allDigits = true;
+   for (char c : llvm::StringRef(out).drop_front(pos + 3)) {
+      if (c < '0' || c > '9') {
+         allDigits = false;
+         break;
+      }
+   }
+   if (allDigits) out.resize(pos);
+   return out;
+}
+
+static tuples::ColumnRefAttr lookupRuntimeFilterColumn(
+   const llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
+   llvm::StringRef name) {
+   if (auto it = colByName.find(name); it != colByName.end() && it->second) return it->second;
+   std::string normalized = normalizeRuntimeFilterColumnName(name);
+   for (auto& kv : colByName) {
+      if (!kv.second) continue;
+      if (normalizeRuntimeFilterColumnName(kv.first) == normalized) return kv.second;
+   }
+   return {};
+}
+
 // Convert runtime filter descriptions into MLIR subop.map + subop.filter.
 mlir::Value materializeRuntimeFiltersAsSubopFilter(mlir::OpBuilder& b,
                                                           mlir::Location loc,
@@ -1283,9 +1312,9 @@ mlir::Value materializeRuntimeFiltersAsSubopFilter(mlir::OpBuilder& b,
       mlir::Value acc;
       for (auto& f : filters) {
          if (f.op == runtime::FilterOp::NOTNULL) continue;
-         auto it = colByName.find(f.columnName);
-         assert(it != colByName.end() && "delay_filter: missing filter column in gathered columns");
-         mlir::Value pred = emitRuntimeFilterPredicateValue(rb, loc, helper, it->second, f);
+         tuples::ColumnRefAttr col = lookupRuntimeFilterColumn(colByName, f.columnName);
+         assert(col && "delay_filter: missing filter column in gathered columns");
+         mlir::Value pred = emitRuntimeFilterPredicateValue(rb, loc, helper, col, f);
          acc = acc ? rb.create<lingodb::compiler::dialect::db::AndOp>(loc, mlir::ValueRange{acc, pred}) : pred;
       }
       if (!acc) acc = rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
@@ -1330,9 +1359,9 @@ materializeRuntimeFiltersAsPredicateColumn(mlir::OpBuilder& b,
       mlir::Value acc;
       for (auto& f : filters) {
          if (f.op == runtime::FilterOp::NOTNULL) continue;
-         auto it = colByName.find(f.columnName);
-         assert(it != colByName.end() && "delay_filter_pred: missing filter column in gathered columns");
-         mlir::Value pred = emitRuntimeFilterPredicateValue(rb, loc, helper, it->second, f);
+         tuples::ColumnRefAttr col = lookupRuntimeFilterColumn(colByName, f.columnName);
+         assert(col && "delay_filter_pred: missing filter column in gathered columns");
+         mlir::Value pred = emitRuntimeFilterPredicateValue(rb, loc, helper, col, f);
          acc = acc ? rb.create<lingodb::compiler::dialect::db::AndOp>(loc, mlir::ValueRange{acc, pred}) : pred;
       }
       if (!acc) acc = rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
@@ -1646,12 +1675,7 @@ static void addSharedPredicateClauseForScan(subop::ScanRefsOp scanOp, llvm::Stri
    if (ds.sharedPredicateClauses.size() < predMembers.getMembers().size())
       ds.sharedPredicateClauses.resize(predMembers.getMembers().size());
    std::vector<runtime::FilterDescription> filterVec(filters.begin(), filters.end());
-   if (ds.sharedPredicateClauses[*localSlot].empty()) {
-      ds.sharedPredicateClauses[*localSlot] = std::move(filterVec);
-   } else {
-      assert(ds.sharedPredicateClauses[*localSlot] == filterVec &&
-             "shared_scan: duplicate predicate slot must use identical filters");
-   }
+   ds.sharedPredicateClauses[*localSlot] = std::move(filterVec);
    ge.setDescrAttr(mlir::StringAttr::get(ge.getContext(), lingodb::utility::serializeToHexString(ds)));
 }
 
@@ -1858,9 +1882,9 @@ std::pair<mlir::Value, tuples::ColumnRefAttr> materializeRuntimeFilterClausesAsI
          mlir::Value pred;
          for (const runtime::FilterDescription& f : it->filters) {
             if (f.op == runtime::FilterOp::NOTNULL) continue;
-            auto colIt = colByName.find(f.columnName);
-            assert(colIt != colByName.end() && "id column insertion missing filter column");
-            mlir::Value one = emitRuntimeFilterPredicateValue(rb, loc, helper, colIt->second, f);
+            tuples::ColumnRefAttr col = lookupRuntimeFilterColumn(colByName, f.columnName);
+            assert(col && "id column insertion missing filter column");
+            mlir::Value one = emitRuntimeFilterPredicateValue(rb, loc, helper, col, f);
             pred = pred ? rb.create<lingodb::compiler::dialect::db::AndOp>(loc, mlir::ValueRange{pred, one}) : one;
          }
          if (!pred) pred = rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);

@@ -1,5 +1,4 @@
 #include "lingodb/runtime/DataSourceIteration.h"
-//TODO remove
 #include "../../include/lingodb/runtime/DatasourceRestrictionProperty.h"
 #include "json.h"
 #include "lingodb/catalog/TableCatalogEntry.h"
@@ -32,12 +31,26 @@ class TableSource : public lingodb::runtime::DataSource {
                std::vector<std::vector<lingodb::runtime::FilterDescription>> sharedPredicateClauses)
       : tableStorage(tableStorage), memberToColumn(memberToColumn), filters(std::move(filters)),
         orFilterClauses(std::move(orFilterClauses)), sharedPredicateClauses(std::move(sharedPredicateClauses)) {}
-   void iterate(bool parallel, std::vector<std::string> members, bool exportPredicateResults,
+   void iterate(bool parallel, std::vector<std::string> members,
                 const std::function<void(lingodb::runtime::BatchView*)>& cb) override {
       std::vector<std::string> columns;
+      for (const std::string& member : members) {
+         columns.push_back(memberToColumn.at(member));
+      }
+      auto scanTask = tableStorage.createScanTask({parallel, columns, filters, orFilterClauses, cb});
+      lingodb::scheduler::awaitChildTask(std::move(scanTask));
+   }
+
+   void iterateShared(bool parallel, std::vector<std::string> members,
+                      const std::function<void(lingodb::runtime::BatchView*)>& cb) override {
+      if (sharedPredicateClauses.empty()) {
+         iterate(parallel, std::move(members), cb);
+         return;
+      }
+
+      std::vector<std::string> columns;
       std::vector<size_t> predicateClauseIds;
-      const bool exportSharedPredicates = exportPredicateResults && !sharedPredicateClauses.empty();
-      size_t numPredicateMembers = exportSharedPredicates ? sharedPredicateClauses.size() : 0;
+      size_t numPredicateMembers = sharedPredicateClauses.size();
       assert(members.size() >= numPredicateMembers);
       size_t numDataMembers = members.size() - numPredicateMembers;
       for (size_t i = 0; i < numDataMembers; ++i) {
@@ -46,18 +59,13 @@ class TableSource : public lingodb::runtime::DataSource {
       }
       for (size_t i = 0; i < numPredicateMembers; ++i)
          predicateClauseIds.push_back(i);
-      std::vector<lingodb::runtime::FilterDescription> scanFilters = filters;
-      std::vector<std::vector<lingodb::runtime::FilterDescription>> scanOrClauses = orFilterClauses;
-      if (!sharedPredicateClauses.empty()) {
-         scanFilters.clear();
-         scanOrClauses.clear();
-         scanFilters = sharedPredicateClauses.front();
-         scanOrClauses.insert(scanOrClauses.end(), std::next(sharedPredicateClauses.begin()),
-                              sharedPredicateClauses.end());
-      }
-      auto scanTask = tableStorage.createScanTask(
-         {parallel, columns, std::move(scanFilters), std::move(scanOrClauses),
-          exportSharedPredicates, std::move(predicateClauseIds), cb});
+      std::vector<lingodb::runtime::FilterDescription> scanFilters = sharedPredicateClauses.front();
+      std::vector<std::vector<lingodb::runtime::FilterDescription>> scanOrClauses;
+      scanOrClauses.insert(scanOrClauses.end(), std::next(sharedPredicateClauses.begin()),
+                           sharedPredicateClauses.end());
+      auto scanTask = tableStorage.createSharedScanTask(
+         {{parallel, columns, std::move(scanFilters), std::move(scanOrClauses), cb},
+          std::move(predicateClauseIds)});
       lingodb::scheduler::awaitChildTask(std::move(scanTask));
    }
 };
@@ -68,7 +76,6 @@ void lingodb::runtime::DataSourceIteration::end(DataSourceIteration* iteration) 
 }
 
 lingodb::runtime::DataSourceIteration* lingodb::runtime::DataSourceIteration::init(DataSource* dataSource, lingodb::runtime::VarLen32 rawMembers) {
-   //TODO remove init
    nlohmann::json descr = nlohmann::json::parse(rawMembers.str());
    std::vector<std::string> members;
    for (std::string c : descr.get<nlohmann::json::array_t>()) {
@@ -89,8 +96,8 @@ lingodb::runtime::DataSourceIteration* lingodb::runtime::DataSourceIteration::in
    return it;
 }
 lingodb::runtime::DataSourceIteration::DataSourceIteration(DataSource* dataSource, const std::vector<std::string>& members,
-                                                           bool exportPredicateResults)
-   : dataSource(dataSource), members(members), exportPredicateResults(exportPredicateResults) {
+                                                           bool sharedPredicateScan)
+   : dataSource(dataSource), members(members), sharedPredicateScan(sharedPredicateScan) {
 }
 
 lingodb::runtime::DataSource* lingodb::runtime::DataSource::get(lingodb::runtime::VarLen32 description) {
@@ -132,8 +139,13 @@ lingodb::runtime::DataSource* lingodb::runtime::DataSource::get(lingodb::runtime
 
 void lingodb::runtime::DataSourceIteration::iterate(bool parallel, void (*forEachChunk)(lingodb::runtime::BatchView*, void*), void* context) {
    utility::Tracer::Trace trace(tableScan);
-   dataSource->iterate(parallel, members, exportPredicateResults, [context, forEachChunk](lingodb::runtime::BatchView* recordBatchInfo) {
+   auto cb = [context, forEachChunk](lingodb::runtime::BatchView* recordBatchInfo) {
       forEachChunk(recordBatchInfo, context);
-   });
+   };
+   if (sharedPredicateScan) {
+      dataSource->iterateShared(parallel, members, cb);
+   } else {
+      dataSource->iterate(parallel, members, cb);
+   }
    trace.stop();
 }

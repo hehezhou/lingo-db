@@ -85,14 +85,16 @@ struct ScanConfig {
    std::vector<FilterDescription> filters;
    /// Further disjuncts: each inner vector is ANDed; combined with `filters` via OR.
    std::vector<std::vector<FilterDescription>> orFilterClauses;
-   bool exportPredicateResults = false;
-   std::vector<size_t> predicateClauseIds;
    std::function<void(lingodb::runtime::BatchView*)> cb;
+};
+struct SharedScanConfig : public ScanConfig {
+   std::vector<size_t> predicateClauseIds;
 };
 class TableStorage {
    public:
    virtual std::shared_ptr<arrow::DataType> getColumnStorageType(std::string_view columnName) const = 0;
    virtual std::unique_ptr<scheduler::Task> createScanTask(const ScanConfig& scanConfig) = 0;
+   virtual std::unique_ptr<scheduler::Task> createSharedScanTask(const SharedScanConfig& scanConfig) = 0;
    virtual void append(const std::vector<std::shared_ptr<arrow::RecordBatch>>& toAppend) = 0;
    virtual size_t nextRowId() = 0;
    virtual void append(const std::shared_ptr<arrow::Table>& toAppend) = 0;

@@ -524,6 +524,7 @@ std::pair<size_t, uint16_t*> lingodb::runtime::Restrictions::applyFiltersWithCla
    utility::Tracer::Trace trace(applyFilter);
    std::array<bool, BatchView::maxBatchSize> selected{};
    std::vector<std::array<uint16_t, BatchView::maxBatchSize>> predByOutput(predicateColumns.size());
+   for (auto& pred : predByOutput) pred.fill(0);
    for (size_t clauseIdx = 0; clauseIdx < andClauses.size(); ++clauseIdx) {
       auto [clauseLen, clauseSel] = applyAndClause(offset, length, selVec1, selVec2, andClauses[clauseIdx], getArrayView);
       for (size_t i = 0; i < clauseLen; i++) {

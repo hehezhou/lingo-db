@@ -63,6 +63,7 @@ class LingoDBTable : public TableStorage {
    }
    size_t getColIndex(std::string colName);
    std::unique_ptr<scheduler::Task> createScanTask(const ScanConfig& scanConfig) override;
+   std::unique_ptr<scheduler::Task> createSharedScanTask(const SharedScanConfig& scanConfig) override;
    const catalog::Sample& getSample() const {
       return sample;
    }

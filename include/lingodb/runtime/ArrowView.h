@@ -26,6 +26,9 @@ struct BatchView {
    int64_t offset;
    uint16_t* selectionVector;
    const ArrayView** arrays;
+};
+
+struct SharedBatchView : public BatchView {
    const uint16_t** predicateColumns = nullptr;
    size_t numPredicateColumns = 0;
 };
