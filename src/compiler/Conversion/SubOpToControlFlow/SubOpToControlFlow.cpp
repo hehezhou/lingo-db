@@ -683,6 +683,21 @@ class SubOpRewriter {
             return getMapped(it->lookup(v));
          }
       }
+      if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+         mlir::Operation* parent = arg.getOwner()->getParentOp();
+         if (auto step = mlir::dyn_cast_or_null<subop::ExecutionStepOp>(parent)) {
+            if (arg.getArgNumber() < step.getNumOperands()) {
+               mlir::Value input = step.getOperand(arg.getArgNumber());
+               mlir::IRMapping& outerMapping = executionStepContexts.top().outerMapping;
+               if (outerMapping.contains(input)) return getMapped(outerMapping.lookup(input));
+               return getMapped(input);
+            }
+         }
+         if (auto nestedGroup = mlir::dyn_cast_or_null<subop::NestedExecutionGroupOp>(parent)) {
+            if (arg.getArgNumber() < nestedGroup.getNumOperands())
+               return getMapped(nestedGroup.getOperand(arg.getArgNumber()));
+         }
+      }
       return v;
    }
    template <class Fn>

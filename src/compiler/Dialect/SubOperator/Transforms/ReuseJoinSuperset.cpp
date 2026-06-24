@@ -3219,8 +3219,10 @@ static void syncMapInputColsFromGather(subop::GatherOp gather, tuples::ColumnMan
    llvm::StringMap<tuples::ColumnRefAttr> outRefByKey;
    llvm::StringMap<tuples::ColumnRefAttr> outRefByNormLeaf;
    for (auto& pr : gather.getMapping().getMapping()) {
-      auto [scope, leaf] = cm.getName(&pr.second.getColumn());
-      tuples::ColumnRefAttr outRef = cm.createRef(&pr.second.getColumn());
+      auto defPtr = pr.second.getColumnPtr();
+      if (!defPtr) continue;
+      auto [scope, leaf] = cm.getName(defPtr.get());
+      tuples::ColumnRefAttr outRef = cm.createRef(defPtr.get());
       outRefByKey[columnSemanticKey(scope, leaf)] = outRef;
       outRefByNormLeaf[leaf] = outRef;
       outRefByNormLeaf[mm.getName(pr.first)] = outRef;
@@ -3237,7 +3239,16 @@ static void syncMapInputColsFromGather(subop::GatherOp gather, tuples::ColumnMan
       bool changed = false;
       llvm::SmallVector<mlir::Attribute> newInputs;
       for (auto attr : mapOp.getInputCols()) {
-         auto cref = mlir::cast<tuples::ColumnRefAttr>(attr);
+         auto cref = mlir::dyn_cast<tuples::ColumnRefAttr>(attr);
+         if (!cref) {
+            newInputs.push_back(attr);
+            continue;
+         }
+         auto crefPtr = cref.getColumnPtr();
+         if (!crefPtr) {
+            newInputs.push_back(cref);
+            continue;
+         }
          auto [scope, leaf] = cm.getName(&cref.getColumn());
          tuples::ColumnRefAttr replacement;
          if (auto it = outRefByKey.find(columnSemanticKey(scope, leaf)); it != outRefByKey.end()) {
@@ -3249,7 +3260,8 @@ static void syncMapInputColsFromGather(subop::GatherOp gather, tuples::ColumnMan
                replacement = it->second;
             }
          }
-         if (replacement && &cref.getColumn() != &replacement.getColumn()) {
+         auto replacementPtr = replacement ? replacement.getColumnPtr() : decltype(crefPtr){};
+         if (replacementPtr && crefPtr != replacementPtr) {
             newInputs.push_back(replacement);
             changed = true;
          } else {
@@ -3488,11 +3500,13 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
       module.walk([&](subop::GatherOp op) {
          if (!shouldUpdateOp(op.getOperation())) return;
          auto r = op.getRef();
+         bool relevantGather = lookupEntryRefStateHasLayout(r.getColumn().type, producerHiv);
          bool changed = syncLookupEntryRefToHiv(r);
          auto m = op.getMapping();
          llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> out;
          for (auto [mem, def] : m.getMapping()) {
             tuples::ColumnDefAttr d = def;
+            if (lookupEntryRefStateHasLayout(d.getColumn().type, producerHiv)) relevantGather = true;
             if (syncLookupEntryDefToHiv(d)) changed = true;
             out.push_back({mem, d});
          }
@@ -3500,7 +3514,7 @@ static void propagateJoinSupersetColumnAttrs(mlir::ModuleOp module,
             op.setRefAttr(r);
             op.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, out));
          }
-         syncMapInputColsFromGather(op, cm);
+         if (relevantGather || changed) syncMapInputColsFromGather(op, cm);
       });
    }
    module.walk([&](subop::MaterializeOp op) {

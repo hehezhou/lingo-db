@@ -224,13 +224,17 @@ static mlir::Value threadStateToNestedMaterializeStep(ExecutionStepOp materializ
    mlir::Value current = ensureExecutionStepInput(topStep, topLevelState);
    if (topStep == materializeStep) return current;
 
-   llvm::SmallVector<NestedExecutionGroupOp, 4> nestedGroups;
+   llvm::SmallVector<mlir::Operation*, 8> nestedPortOps;
    for (mlir::Operation* op = materializeStep->getParentOp(); op && op != topStep.getOperation();
         op = op->getParentOp()) {
-      if (auto neg = mlir::dyn_cast<NestedExecutionGroupOp>(op)) nestedGroups.push_back(neg);
+      if (mlir::isa<NestedExecutionGroupOp, ExecutionStepOp>(op)) nestedPortOps.push_back(op);
    }
-   for (NestedExecutionGroupOp neg : llvm::reverse(nestedGroups)) {
-      current = ensureNestedExecutionGroupInput(neg, current);
+   for (mlir::Operation* op : llvm::reverse(nestedPortOps)) {
+      if (auto neg = mlir::dyn_cast<NestedExecutionGroupOp>(op)) {
+         current = ensureNestedExecutionGroupInput(neg, current);
+      } else {
+         current = ensureExecutionStepInput(mlir::cast<ExecutionStepOp>(op), current);
+      }
    }
    return ensureExecutionStepInput(materializeStep, current);
 }
@@ -268,23 +272,6 @@ static llvm::SmallVector<subop::Member> stateMembersForType(mlir::Type type) {
    return {};
 }
 
-static subop::ColumnRefMemberMappingAttr remapResultMaterializeMappingToTargetLayout(
-   mlir::MLIRContext* ctx, subop::ColumnRefMemberMappingAttr sourceMapping, mlir::Type targetStateType) {
-   llvm::SmallVector<subop::Member> targetMembers = stateMembersForType(targetStateType);
-   assert(!targetMembers.empty() && "split-materialize target must have members");
-   assert(sourceMapping.getMapping().size() == targetMembers.size() &&
-          "split-materialize branch result layout must align by ordinal with donor mapping");
-   llvm::SmallVector<subop::RefMappingPairT> pairs;
-   unsigned ordinal = 0;
-   for (auto& [member, colRef] : sourceMapping.getMapping()) {
-      (void)member;
-      pairs.push_back({targetMembers[ordinal++], colRef});
-   }
-   llvm::SmallVector<subop::RefMappingPairT> attrPairs;
-   attrPairs.append(pairs.begin(), pairs.end());
-   return subop::ColumnRefMemberMappingAttr::get(ctx, attrPairs);
-}
-
 static void clearGetExternalFiltersForState(mlir::Value tableState) {
    auto tableStep = mlir::dyn_cast_or_null<ExecutionStepOp>(tableState.getDefiningOp());
    if (!tableStep) return;
@@ -317,9 +304,40 @@ static subop::ScanRefsOp tryFindFirstScanRefsInStep(ExecutionStepOp step) {
    return found;
 }
 
-static llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>
+static std::string stripColumnReuseSuffixToString(llvm::StringRef s) {
+   size_t dollar = s.find('$');
+   return (dollar == llvm::StringRef::npos ? s : s.take_front(dollar)).str();
+}
+
+static std::string scopedColumnName(llvm::StringRef scope, llvm::StringRef leaf) {
+   if (scope.empty()) return leaf.str();
+   std::string out = scope.str();
+   out += "::";
+   out += leaf.str();
+   return out;
+}
+
+static std::string fullNameForColumnRef(tuples::ColumnRefAttr ref) {
+   auto& cm = ref.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   auto [scope, leaf] = cm.getName(&ref.getColumn());
+   return scopedColumnName(scope, leaf);
+}
+
+static void addSplitColumnAliases(llvm::StringMap<tuples::ColumnRefAttr>& out,
+                                  llvm::StringRef scope,
+                                  llvm::StringRef leaf,
+                                  tuples::ColumnRefAttr ref) {
+   out[leaf] = ref;
+   out[stripColumnReuseSuffixToString(leaf)] = ref;
+   std::string full = scopedColumnName(scope, leaf);
+   out[full] = ref;
+   std::string strippedFull = scopedColumnName(scope, stripColumnReuseSuffixToString(leaf));
+   out[strippedFull] = ref;
+}
+
+static llvm::StringMap<tuples::ColumnRefAttr>
 materializeStreamColumnsByFilterName(ExecutionStepOp step, subop::MaterializeOp mat) {
-   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr> out;
+   llvm::StringMap<tuples::ColumnRefAttr> out;
    auto& cm = mat.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    auto& mm = mat.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    auto addName = [&](llvm::StringRef name, tuples::ColumnRefAttr ref) {
@@ -330,23 +348,23 @@ materializeStreamColumnsByFilterName(ExecutionStepOp step, subop::MaterializeOp 
    for (auto& [member, colRef] : mat.getMapping().getMapping()) {
       (void)member;
       auto [scope, leaf] = cm.getName(&colRef.getColumn());
-      (void)scope;
       addName(leaf, colRef);
+      addSplitColumnAliases(out, scope, leaf, colRef);
    }
    step.walk([&](subop::GatherOp gather) {
       for (auto& [member, colDef] : gather.getMapping().getMapping()) {
          tuples::ColumnRefAttr ref = cm.createRef(&colDef.getColumn());
          addName(mm.getName(member), ref);
          auto [scope, leaf] = cm.getName(&colDef.getColumn());
-         (void)scope;
          addName(leaf, ref);
+         addSplitColumnAliases(out, scope, leaf, ref);
       }
    });
    return out;
 }
 
 static void assertRuntimeFiltersAvailableOnStream(
-   const llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
+   const llvm::StringMap<tuples::ColumnRefAttr>& colByName,
    llvm::ArrayRef<runtime::FilterDescription> filters) {
    for (const runtime::FilterDescription& f : filters) {
       if (f.op == runtime::FilterOp::NOTNULL) continue;
@@ -532,13 +550,13 @@ static std::optional<SplitResidualFilter> findResidualFilterBeforeMaterialize(Ex
    }
 }
 
-static llvm::StringRef baseNameForColumnRef(tuples::ColumnRefAttr ref) {
+static std::string baseNameForColumnRef(tuples::ColumnRefAttr ref) {
    auto& cm = ref.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    auto [scope, leaf] = cm.getName(&ref.getColumn());
    (void)scope;
-   llvm::StringRef name = leaf;
+   llvm::StringRef name(leaf);
    size_t dollar = name.find('$');
-   return dollar == llvm::StringRef::npos ? name : name.take_front(dollar);
+   return (dollar == llvm::StringRef::npos ? name : name.take_front(dollar)).str();
 }
 
 static std::string normalizeSplitColumnName(llvm::StringRef name) {
@@ -560,14 +578,17 @@ static std::string normalizeSplitColumnName(llvm::StringRef name) {
 }
 
 static tuples::ColumnRefAttr lookupSplitColumnByName(
-   const llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
+   const llvm::StringMap<tuples::ColumnRefAttr>& colByName,
    llvm::StringRef name) {
    if (auto it = colByName.find(name); it != colByName.end()) return it->second;
    std::string norm = normalizeSplitColumnName(name);
+   tuples::ColumnRefAttr found;
    for (auto& kv : colByName) {
-      if (normalizeSplitColumnName(kv.first) == norm) return kv.second;
+      if (normalizeSplitColumnName(kv.getKey()) != norm) continue;
+      if (found && &found.getColumn() != &kv.second.getColumn()) return {};
+      found = kv.second;
    }
-   return {};
+   return found;
 }
 
 static llvm::SmallVector<tuples::ColumnDefAttr, 4>
@@ -596,14 +617,23 @@ static unsigned computedColumnIndex(subop::MapOp map, tuples::ColumnRefAttr ref)
 static mlir::Value cloneResidualFilterBranch(mlir::OpBuilder& b,
                                              mlir::Location loc,
                                              mlir::Value stream,
-                                             const llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
-                                             SplitResidualFilter residual) {
+                                             const llvm::StringMap<tuples::ColumnRefAttr>& colByName,
+                                             SplitResidualFilter residual,
+                                             llvm::ArrayRef<tuples::ColumnRefAttr> inputOverrides = {}) {
+   assert((inputOverrides.empty() ||
+           inputOverrides.size() == residual.predMap.getInputCols().size()) &&
+          "split-materialize residual input overrides must align with map inputs");
    llvm::SmallVector<mlir::Attribute, 8> inputRefs;
    inputRefs.reserve(residual.predMap.getInputCols().size());
-   for (auto attr : residual.predMap.getInputCols()) {
-      auto oldRef = mlir::cast<tuples::ColumnRefAttr>(attr);
-      llvm::StringRef name = baseNameForColumnRef(oldRef);
-      tuples::ColumnRefAttr ref = lookupSplitColumnByName(colByName, name);
+   for (auto [idx, attr] : llvm::enumerate(residual.predMap.getInputCols())) {
+      tuples::ColumnRefAttr ref;
+      if (!inputOverrides.empty()) {
+         ref = inputOverrides[idx];
+      } else {
+         auto oldRef = mlir::cast<tuples::ColumnRefAttr>(attr);
+         ref = lookupSplitColumnByName(colByName, fullNameForColumnRef(oldRef));
+         if (!ref) ref = lookupSplitColumnByName(colByName, baseNameForColumnRef(oldRef));
+      }
       assert(ref && "split-materialize residual input column must exist on shared stream");
       inputRefs.push_back(ref);
    }
@@ -635,6 +665,37 @@ static mlir::Value cloneResidualFilterBranch(mlir::OpBuilder& b,
                                            residual.filter.getFilterSemantic(),
                                            b.getArrayAttr(condRefs));
    return filter.getRes();
+}
+
+static subop::MapOp cloneBranchMapWithDonorColumns(mlir::OpBuilder& b,
+                                                   mlir::Value stream,
+                                                   subop::MapOp donorMap,
+                                                   subop::MapOp branchMap,
+                                                   subop::ColumnMapping& columnMapping) {
+   assert(donorMap.getInputCols().size() == branchMap.getInputCols().size() &&
+          "split aggregate branch map replacement requires ordinal-aligned inputs");
+   assert(donorMap.getComputedCols().size() == branchMap.getComputedCols().size() &&
+          "split aggregate branch map replacement requires ordinal-aligned outputs");
+   llvm::SmallVector<mlir::Attribute, 8> inputRefs;
+   inputRefs.reserve(donorMap.getInputCols().size());
+   for (mlir::Attribute attr : donorMap.getInputCols()) {
+      auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
+      inputRefs.push_back(columnMapping.remap(ref));
+   }
+
+   llvm::SmallVector<mlir::Attribute, 8> computedCols;
+   computedCols.reserve(donorMap.getComputedCols().size());
+   for (mlir::Attribute attr : donorMap.getComputedCols()) {
+      auto def = mlir::cast<tuples::ColumnDefAttr>(attr);
+      computedCols.push_back(columnMapping.clone(def));
+   }
+
+   auto clonedMap = b.create<subop::MapOp>(branchMap.getLoc(), stream,
+                                           b.getArrayAttr(computedCols),
+                                           b.getArrayAttr(inputRefs));
+   mlir::IRMapping regionMapping;
+   b.cloneRegionBefore(branchMap.getFn(), clonedMap.getFn(), clonedMap.getFn().begin(), regionMapping);
+   return clonedMap;
 }
 
 static mlir::Value filterSplitBranchByMixedPredMember(mlir::OpBuilder& b,
@@ -717,6 +778,327 @@ static mlir::Value filterSplitBranchByMixedPredMember(mlir::OpBuilder& b,
    auto filter = b.create<subop::FilterOp>(loc, gather.getRes(), subop::FilterSemantic::all_true,
                                            b.getArrayAttr({predRef}));
    return filter.getRes();
+}
+
+static mlir::Value filterScanListBranchByMixedPredMember(mlir::OpBuilder& b,
+                                                         mlir::Location loc,
+                                                         mlir::Value stream,
+                                                         llvm::StringRef predMemberName) {
+   if (predMemberName.empty()) return stream;
+   auto scan = mlir::dyn_cast_or_null<subop::ScanListOp>(stream.getDefiningOp());
+   if (!scan) {
+      return filterSplitBranchByMixedPredMember(b, loc, stream, predMemberName);
+   }
+
+   auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(scan.getElem().getColumn().type);
+   if (!ler) return stream;
+   subop::StateMembersAttr valueMembers;
+   if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(ler.getState())) {
+      valueMembers = mixed.getValueMembers();
+   } else if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState())) {
+      valueMembers = hiv.getValueMembers();
+   } else {
+      return stream;
+   }
+
+   auto* ctx = stream.getContext();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   subop::Member predMember;
+   for (subop::Member member : valueMembers.getMembers()) {
+      if (mm.getName(member) == predMemberName) {
+         predMember = member;
+         break;
+      }
+   }
+   if (!predMember) return stream;
+
+   tuples::ColumnDefAttr predDef = cm.createDef(cm.getUniqueScope("split_branch_pred"), "filter_pred");
+   predDef.getColumn().type = mlir::IntegerType::get(ctx, 1);
+   auto gather = b.create<subop::GatherOp>(
+      loc, stream.getType(), stream, cm.createRef(&scan.getElem().getColumn()),
+      subop::ColumnDefMemberMappingAttr::get(ctx, {{predMember, predDef}}));
+   tuples::ColumnRefAttr predRef = cm.createRef(&predDef.getColumn());
+   auto filter = b.create<subop::FilterOp>(loc, gather.getRes(), subop::FilterSemantic::all_true,
+                                           b.getArrayAttr({predRef}));
+   return filter.getRes();
+}
+
+static mlir::Type scanListLookupStateType(subop::ScanListOp scan) {
+   auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(scan.getElem().getColumn().type);
+   if (!ler) return {};
+   return ler.getState();
+}
+
+static bool sameAggregateSplitColumnIdentity(tuples::ColumnRefAttr a, tuples::ColumnRefAttr b,
+                                             tuples::ColumnManager& cm) {
+   auto [scopeA, nameA] = cm.getName(&a.getColumn());
+   auto [scopeB, nameB] = cm.getName(&b.getColumn());
+   return scopeA == scopeB && nameA == nameB && a.getColumn().type == b.getColumn().type;
+}
+
+static std::optional<unsigned> findAggregateNestedMapParameter(subop::NestedMapOp nested,
+                                                               tuples::ColumnRefAttr ref,
+                                                               tuples::ColumnManager& cm) {
+   for (unsigned i = 0; i < nested.getParameters().size(); ++i) {
+      auto existing = mlir::cast<tuples::ColumnRefAttr>(nested.getParameters()[i]);
+      if (sameAggregateSplitColumnIdentity(existing, ref, cm)) return i;
+   }
+   return std::nullopt;
+}
+
+static mlir::BlockArgument ensureAggregateNestedMapParameter(subop::NestedMapOp nested,
+                                                             tuples::ColumnRefAttr ref,
+                                                             tuples::ColumnManager& cm) {
+   if (auto idx = findAggregateNestedMapParameter(nested, ref, cm)) {
+      assert(nested.getRegion().front().getNumArguments() > *idx + 1 &&
+             "nested_map parameter must have a body argument");
+      return nested.getRegion().front().getArgument(*idx + 1);
+   }
+   llvm::SmallVector<mlir::Attribute, 8> params(nested.getParameters().begin(),
+                                                nested.getParameters().end());
+   params.push_back(ref);
+   nested.setParametersAttr(mlir::ArrayAttr::get(nested.getContext(), params));
+   return nested.getRegion().front().addArgument(ref.getColumn().type, nested.getLoc());
+}
+
+static subop::NestedExecutionGroupOp firstAggregateNestedExecutionGroup(subop::NestedMapOp nested) {
+   assert(!nested.getRegion().empty());
+   for (mlir::Operation& op : nested.getRegion().front()) {
+      if (auto neg = mlir::dyn_cast<subop::NestedExecutionGroupOp>(&op)) return neg;
+   }
+   llvm_unreachable("aggregate split nested_map must contain nested_execution_group");
+}
+
+static bool aggregateOpIsNestedInside(mlir::Operation* maybeAncestor, mlir::Operation* op) {
+   for (mlir::Operation* parent = op; parent; parent = parent->getParentOp()) {
+      if (parent == maybeAncestor) return true;
+   }
+   return false;
+}
+
+static void materializeAggregateColumnOnStreamBefore(mlir::Operation* anchor,
+                                                     mlir::Value& stream,
+                                                     tuples::ColumnDefAttr def,
+                                                     mlir::Value value) {
+   assert(anchor && "aggregate split predicate threading requires an anchor op");
+   mlir::OpBuilder b(anchor);
+   auto map = b.create<subop::MapOp>(anchor->getLoc(), tuples::TupleStreamType::get(anchor->getContext()),
+                                     stream, b.getArrayAttr({def}), b.getArrayAttr({}));
+   mlir::Block* block = new mlir::Block();
+   map.getFn().push_back(block);
+   mlir::OpBuilder rb(anchor->getContext());
+   rb.setInsertionPointToStart(block);
+   rb.create<tuples::ReturnOp>(anchor->getLoc(), mlir::ValueRange{value});
+   stream = map.getResult();
+}
+
+static void rewireAggregateStreamUsesAfterAnchor(mlir::Value oldStream, mlir::Value newStream,
+                                                 mlir::Operation* anchorOp,
+                                                 llvm::ArrayRef<mlir::Operation*> excludeOps) {
+   oldStream.replaceUsesWithIf(newStream, [&](mlir::OpOperand& use) {
+      mlir::Operation* owner = use.getOwner();
+      if (owner->getBlock() != anchorOp->getBlock()) return false;
+      if (!anchorOp->isBeforeInBlock(owner)) return false;
+      for (mlir::Operation* ex : excludeOps)
+         if (owner == ex) return false;
+      return true;
+   });
+}
+
+static subop::Member predMemberForScanList(subop::ScanListOp scan, llvm::StringRef predMemberName) {
+   auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(scan.getElem().getColumn().type);
+   if (!ler) return {};
+   subop::StateMembersAttr valueMembers;
+   if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(ler.getState())) {
+      valueMembers = mixed.getValueMembers();
+   } else if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(ler.getState())) {
+      valueMembers = hiv.getValueMembers();
+   } else {
+      return {};
+   }
+   auto& mm = scan.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (subop::Member member : valueMembers.getMembers()) {
+      if (mm.getName(member) == predMemberName) return member;
+   }
+   return {};
+}
+
+static std::optional<tuples::ColumnDefAttr>
+gatherAggregatePredAfterScanList(subop::ScanListOp scan, llvm::StringRef predMemberName) {
+   subop::Member predMember = predMemberForScanList(scan, predMemberName);
+   if (!predMember) return std::nullopt;
+   auto* ctx = scan.getContext();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   tuples::ColumnDefAttr predDef = cm.createDef(cm.getUniqueScope("split_branch_pred"), "filter_pred");
+   predDef.getColumn().type = mlir::IntegerType::get(ctx, 1);
+   mlir::OpBuilder b(scan);
+   b.setInsertionPointAfter(scan);
+   auto gather = b.create<subop::GatherOp>(
+      scan.getLoc(), scan.getRes().getType(), scan.getRes(), cm.createRef(&scan.getElem().getColumn()),
+      subop::ColumnDefMemberMappingAttr::get(ctx, {{predMember, predDef}}));
+   rewireAggregateStreamUsesAfterAnchor(scan.getRes(), gather.getRes(), scan.getOperation(),
+                                        {scan.getOperation(), gather.getOperation()});
+   gather->setOperand(0, scan.getRes());
+   return predDef;
+}
+
+static std::optional<std::pair<mlir::Value, tuples::ColumnRefAttr>>
+threadAggregatePredToCurrentStream(mlir::OpBuilder& b,
+                                   subop::ReduceOp reduce,
+                                   mlir::Operation* sourceOp,
+                                   tuples::ColumnDefAttr predDef,
+                                   mlir::Value currentStream) {
+   auto& cm = reduce.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   tuples::ColumnRefAttr ref = cm.createRef(&predDef.getColumn());
+
+   auto threadNestedValueToTargetOp = [](subop::NestedExecutionGroupOp neg,
+                                         mlir::Value value,
+                                         mlir::Operation* targetOp) -> mlir::Value {
+      llvm::SmallVector<mlir::Operation*, 8> portOps;
+      for (mlir::Operation* op = targetOp->getParentOp(); op && op != neg.getOperation();
+           op = op->getParentOp()) {
+         if (mlir::isa<subop::NestedExecutionGroupOp, subop::ExecutionStepOp>(op)) portOps.push_back(op);
+      }
+      assert(!portOps.empty() && "aggregate split value must be used inside a nested port op");
+      mlir::Value current = value;
+      for (mlir::Operation* op : llvm::reverse(portOps)) {
+         if (auto nestedGroup = mlir::dyn_cast<subop::NestedExecutionGroupOp>(op)) {
+            current = ensureNestedExecutionGroupInput(nestedGroup, current);
+         } else {
+            current = ensureExecutionStepInput(mlir::cast<subop::ExecutionStepOp>(op), current);
+         }
+      }
+      return current;
+   };
+
+   llvm::SmallVector<subop::NestedMapOp, 4> nestedMaps;
+   for (mlir::Operation* parent = reduce->getParentOp(); parent; parent = parent->getParentOp()) {
+      if (auto nested = mlir::dyn_cast<subop::NestedMapOp>(parent)) {
+         if (!aggregateOpIsNestedInside(nested.getOperation(), sourceOp)) nestedMaps.push_back(nested);
+      }
+   }
+   std::reverse(nestedMaps.begin(), nestedMaps.end());
+
+   mlir::Value currentValue;
+   for (auto [idx, nested] : llvm::enumerate(nestedMaps)) {
+      if (currentValue && !findAggregateNestedMapParameter(nested, ref, cm)) {
+         mlir::Value stream = nested.getStream();
+         materializeAggregateColumnOnStreamBefore(nested.getOperation(), stream, predDef, currentValue);
+         nested->setOperand(0, stream);
+      }
+
+      mlir::BlockArgument nestedArg = ensureAggregateNestedMapParameter(nested, ref, cm);
+      subop::NestedExecutionGroupOp neg = firstAggregateNestedExecutionGroup(nested);
+      mlir::BlockArgument negArg = ensureNestedExecutionGroupInput(neg, nestedArg);
+      mlir::Operation* targetOp = idx + 1 < nestedMaps.size()
+                                     ? nestedMaps[idx + 1].getOperation()
+                                     : reduce.getOperation();
+      currentValue = threadNestedValueToTargetOp(neg, negArg, targetOp);
+   }
+
+   if (!currentValue) return std::make_pair(currentStream, ref);
+
+   tuples::ColumnDefAttr localDef = cm.createDef(&predDef.getColumn());
+   auto map = b.create<subop::MapOp>(reduce.getLoc(), tuples::TupleStreamType::get(reduce.getContext()),
+                                     currentStream, b.getArrayAttr({localDef}), b.getArrayAttr({}));
+   mlir::Block* block = new mlir::Block();
+   map.getFn().push_back(block);
+   mlir::OpBuilder rb(reduce.getContext());
+   rb.setInsertionPointToStart(block);
+   rb.create<tuples::ReturnOp>(reduce.getLoc(), mlir::ValueRange{currentValue});
+   b.setInsertionPointAfter(map);
+   return std::make_pair(map.getResult(), cm.createRef(&localDef.getColumn()));
+}
+
+static mlir::Value filterCurrentStreamByPredRefs(mlir::OpBuilder& b,
+                                                 mlir::Location loc,
+                                                 mlir::Value stream,
+                                                 llvm::ArrayRef<tuples::ColumnRefAttr> predRefs) {
+   if (predRefs.empty()) return stream;
+   llvm::SmallVector<mlir::Attribute, 4> conds;
+   conds.append(predRefs.begin(), predRefs.end());
+   auto filter = b.create<subop::FilterOp>(loc, stream, subop::FilterSemantic::all_true,
+                                           b.getArrayAttr(conds));
+   b.setInsertionPointAfter(filter);
+   return filter.getRes();
+}
+
+static llvm::SmallVector<subop::ScanListOp, 4>
+scanListsOnAggregateReduceContext(subop::ReduceOp reduce);
+
+static mlir::Value materializeInheritedAggregatePredsBeforeLookup(
+   mlir::OpBuilder& b,
+   subop::ReduceOp reduce,
+   mlir::Value suffixStart,
+   const llvm::DenseSet<mlir::Operation*>& suffixOps,
+   mlir::Value current,
+   llvm::StringRef mixedPredMemberName,
+   const llvm::DenseMap<mlir::Type, unsigned>& predSlotByStateType) {
+   if (mixedPredMemberName.empty() && predSlotByStateType.empty()) return current;
+   llvm::SmallVector<tuples::ColumnRefAttr, 4> inheritedPredRefs;
+   mlir::Operation* suffixStartDef = suffixStart.getDefiningOp();
+   for (subop::ScanListOp scanList : scanListsOnAggregateReduceContext(reduce)) {
+      if (scanList.getOperation() == suffixStartDef) continue;
+      if (suffixOps.contains(scanList.getOperation())) continue;
+      std::string predMemberName = mixedPredMemberName.str();
+      if (auto itSlot = predSlotByStateType.find(scanListLookupStateType(scanList));
+          itSlot != predSlotByStateType.end()) {
+         predMemberName = ("filter_pred$" + llvm::Twine(itSlot->second)).str();
+      }
+      if (predMemberName.empty()) continue;
+      std::optional<tuples::ColumnDefAttr> predDef =
+         gatherAggregatePredAfterScanList(scanList, predMemberName);
+      if (!predDef) continue;
+      std::optional<std::pair<mlir::Value, tuples::ColumnRefAttr>> threaded =
+         threadAggregatePredToCurrentStream(b, reduce, scanList.getOperation(), *predDef, current);
+      if (!threaded) continue;
+      current = threaded->first;
+      inheritedPredRefs.push_back(threaded->second);
+   }
+   return filterCurrentStreamByPredRefs(b, reduce.getLoc(), current, inheritedPredRefs);
+}
+
+static void collectAggregateScanListsOnStreamChain(mlir::Value rootStream,
+                                                   llvm::SmallVectorImpl<subop::ScanListOp>& out,
+                                                   llvm::DenseSet<mlir::Operation*>& seenScanLists) {
+   llvm::SmallVector<mlir::Value, 4> worklist{rootStream};
+   llvm::DenseSet<void*> seenStreams;
+   while (!worklist.empty()) {
+      mlir::Value stream = worklist.pop_back_val();
+      if (!stream || !seenStreams.insert(stream.getAsOpaquePointer()).second) continue;
+      mlir::Operation* def = stream.getDefiningOp();
+      if (!def) continue;
+      if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(def)) {
+         if (seenScanLists.insert(scanList.getOperation()).second) out.push_back(scanList);
+         continue;
+      }
+      if (auto gather = mlir::dyn_cast<subop::GatherOp>(def)) {
+         worklist.push_back(gather.getStream());
+      } else if (auto map = mlir::dyn_cast<subop::MapOp>(def)) {
+         worklist.push_back(map.getStream());
+      } else if (auto filter = mlir::dyn_cast<subop::FilterOp>(def)) {
+         worklist.push_back(filter.getStream());
+      } else if (auto lookup = mlir::dyn_cast<subop::LookupOp>(def)) {
+         worklist.push_back(lookup.getStream());
+      } else if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(def)) {
+         worklist.push_back(lookup.getStream());
+      } else if (auto rename = mlir::dyn_cast<subop::RenamingOp>(def)) {
+         worklist.push_back(rename.getStream());
+      }
+   }
+}
+
+static llvm::SmallVector<subop::ScanListOp, 4>
+scanListsOnAggregateReduceContext(subop::ReduceOp reduce) {
+   llvm::SmallVector<subop::ScanListOp, 4> out;
+   llvm::DenseSet<mlir::Operation*> seenScanLists;
+   collectAggregateScanListsOnStreamChain(reduce.getStream(), out, seenScanLists);
+   for (mlir::Operation* parent = reduce->getParentOp(); parent; parent = parent->getParentOp()) {
+      if (auto nested = mlir::dyn_cast<subop::NestedMapOp>(parent))
+         collectAggregateScanListsOnStreamChain(nested.getStream(), out, seenScanLists);
+   }
+   return out;
 }
 
 static mlir::Type appendMembersToStateCarrierType(mlir::MLIRContext* ctx, mlir::Type type,
@@ -929,6 +1311,30 @@ static std::string residualFilterSemanticFingerprint(SplitResidualFilter residua
    return out;
 }
 
+static std::string mapBodySemanticFingerprint(subop::MapOp map) {
+   std::string out;
+   llvm::raw_string_ostream os(out);
+   os << "inputs:" << map.getInputCols().size() << "|returns:";
+   auto ret = mlir::cast<tuples::ReturnOp>(map.getFn().front().getTerminator());
+   llvm::DenseMap<mlir::Value, std::string> memo;
+   for (mlir::Value operand : ret.getOperands())
+      os << residualPredicateValueFingerprint(operand, memo) << ';';
+   os.flush();
+   return out;
+}
+
+static bool mapReturnUsesOnlyMapBlockArgs(subop::MapOp map) {
+   llvm::DenseSet<unsigned> used;
+   mlir::Block& block = map.getFn().front();
+   auto ret = mlir::cast<tuples::ReturnOp>(block.getTerminator());
+   for (mlir::Value operand : ret.getOperands())
+      collectSplitResidualBlockArgs(operand, &block, used);
+   for (unsigned idx : used) {
+      if (idx >= map.getInputCols().size()) return false;
+   }
+   return true;
+}
+
 static mlir::Value streamInputOfLinearSuffixOp(mlir::Operation* op) {
    if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(op)) return scanList.getList();
    if (auto gather = mlir::dyn_cast<subop::GatherOp>(op)) return gather.getStream();
@@ -1007,7 +1413,7 @@ static std::optional<SplitAggregateBuild> tryFindUniqueAggregateBuildWritingStat
    SplitAggregateBuild found;
    module.walk([&](subop::LookupOrInsertOp lookup) {
       mlir::Value lookupState = canonicalizeStateValueForReuse(
-         executionStepOperandForBlockArgument(lookup.getState()));
+         peelBlockArgsToEnclosingOperands(lookup.getState()));
       if (lookupState != state) return;
       assert(!found.lookup && "split-aggregate reuse expects one lookup_or_insert writer");
       found.lookup = lookup;
@@ -1034,7 +1440,7 @@ static std::optional<SplitAggregateBuild> tryFindUniquePlainReduceBuildWritingSt
    SplitAggregateBuild found;
    module.walk([&](subop::LookupOp lookup) {
       mlir::Value lookupState = canonicalizeStateValueForReuse(
-         executionStepOperandForBlockArgument(lookup.getState()));
+         peelBlockArgsToEnclosingOperands(lookup.getState()));
       if (lookupState != state) return;
       assert(!found.plainLookup && "split-reduce reuse expects one lookup writer");
       found.plainLookup = lookup;
@@ -1076,6 +1482,34 @@ linearStreamOpsBeforeReduce(mlir::Value suffixStart, subop::ReduceOp reduce) {
    llvm::SmallVector<mlir::Operation*, 8> ops;
    for (mlir::Operation* op : llvm::reverse(reverseOps)) ops.push_back(op);
    return ops;
+}
+
+static llvm::SmallVector<subop::MapOp, 8>
+linearMapOpsBeforeReduce(mlir::Value suffixStart, subop::ReduceOp reduce) {
+   llvm::SmallVector<subop::MapOp, 8> maps;
+   for (mlir::Operation* op : linearStreamOpsBeforeReduce(suffixStart, reduce)) {
+      if (auto map = mlir::dyn_cast<subop::MapOp>(op)) maps.push_back(map);
+   }
+   return maps;
+}
+
+static std::optional<SplitResidualFilter>
+findResidualFilterBeforeReduce(mlir::Value suffixStart, subop::ReduceOp reduce) {
+   mlir::Value stream = reduce.getStream();
+   while (stream != suffixStart) {
+      mlir::Operation* def = stream.getDefiningOp();
+      if (!def) return std::nullopt;
+      if (auto filter = mlir::dyn_cast<subop::FilterOp>(def)) {
+         auto map = mlir::dyn_cast_or_null<subop::MapOp>(filter.getStream().getDefiningOp());
+         if (map && filterConditionsComeFromMap(filter, map)) {
+            return SplitResidualFilter{map, filter, map.getStream()};
+         }
+         stream = filter.getStream();
+         continue;
+      }
+      stream = streamInputOfLinearSuffixOp(def);
+   }
+   return std::nullopt;
 }
 
 static subop::PreAggrHtFragmentType preAggrFragmentTypeFromBuildState(mlir::Type type) {
@@ -1133,19 +1567,17 @@ static llvm::StringRef stripReuseSuffix(llvm::StringRef s) {
 }
 
 static void rememberAggregateBranchColumn(mlir::MLIRContext* ctx,
-                                          llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
+                                          llvm::StringMap<tuples::ColumnRefAttr>& colByName,
                                           tuples::ColumnDefAttr def) {
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    tuples::ColumnRefAttr ref = cm.createRef(&def.getColumn());
    auto [scope, leaf] = cm.getName(&def.getColumn());
-   (void)scope;
-   colByName[leaf] = ref;
-   colByName[stripReuseSuffix(leaf)] = ref;
+   addSplitColumnAliases(colByName, scope, leaf, ref);
 }
 
 static void rememberAggregateBranchGatherColumns(
    subop::GatherOp gather,
-   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName) {
+   llvm::StringMap<tuples::ColumnRefAttr>& colByName) {
    auto* ctx = gather.getContext();
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
@@ -1155,15 +1587,267 @@ static void rememberAggregateBranchGatherColumns(
       colByName[memberName] = ref;
       colByName[stripReuseSuffix(memberName)] = ref;
       auto [scope, leaf] = cm.getName(&def.getColumn());
-      (void)scope;
-      colByName[leaf] = ref;
-      colByName[stripReuseSuffix(leaf)] = ref;
+      addSplitColumnAliases(colByName, scope, leaf, ref);
    }
+}
+
+static void freshenClonedAggregateGatherColumns(subop::GatherOp oldGather,
+                                                subop::GatherOp clonedGather,
+                                                subop::ColumnMapping& columnMapping) {
+   auto* ctx = clonedGather.getContext();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   llvm::SmallVector<subop::DefMappingPairT> freshPairs;
+   auto oldPairs = oldGather.getMapping().getMapping();
+   auto clonedPairs = clonedGather.getMapping().getMapping();
+   assert(oldPairs.size() == clonedPairs.size() &&
+          "split aggregate cloned gather mapping must align with donor gather mapping");
+   for (auto [oldPair, clonedPair] : llvm::zip(oldPairs, clonedPairs)) {
+      auto oldDef = mlir::cast<tuples::ColumnDefAttr>(oldPair.second);
+      auto clonedDef = mlir::cast<tuples::ColumnDefAttr>(clonedPair.second);
+      auto [scope, leaf] = cm.getName(&clonedDef.getColumn());
+      (void)scope;
+      tuples::ColumnDefAttr freshDef = cm.createDef(cm.getUniqueScope("split_agg_gather"), leaf);
+      freshDef.getColumn().type = clonedDef.getColumn().type;
+      freshPairs.push_back({clonedPair.first, freshDef});
+      columnMapping.mapRaw(&oldDef.getColumn(), &freshDef.getColumn());
+   }
+   clonedGather.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, freshPairs));
+}
+
+[[maybe_unused]] static void freshenLookupEntryRefGatherColumns(mlir::ModuleOp module) {
+   auto* ctx = module.getContext();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   llvm::DenseMap<tuples::Column*, tuples::Column*> replacement;
+
+   module.walk([&](subop::GatherOp gather) {
+      if (!mlir::isa<subop::LookupEntryRefType>(gather.getRef().getColumn().type)) return;
+      llvm::SmallVector<subop::DefMappingPairT> freshPairs;
+      bool changed = false;
+      for (auto [member, def] : gather.getMapping().getMapping()) {
+         auto [scope, leaf] = cm.getName(&def.getColumn());
+         (void)scope;
+         tuples::ColumnDefAttr freshDef = cm.createDef(cm.getUniqueScope("split_lookup_gather"), leaf);
+         freshDef.getColumn().type = def.getColumn().type;
+         replacement[&def.getColumn()] = &freshDef.getColumn();
+         freshPairs.push_back({member, freshDef});
+         changed = true;
+      }
+      if (changed) gather.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, freshPairs));
+   });
+
+   if (replacement.empty()) return;
+   auto remapRef = [&](tuples::ColumnRefAttr& ref) {
+      auto it = replacement.find(&ref.getColumn());
+      if (it == replacement.end()) return false;
+      ref = cm.createRef(it->second);
+      return true;
+   };
+   auto remapRefArray = [&](mlir::ArrayAttr arr) {
+      llvm::SmallVector<mlir::Attribute> out;
+      bool changed = false;
+      for (mlir::Attribute attr : arr) {
+         if (auto ref = mlir::dyn_cast<tuples::ColumnRefAttr>(attr)) {
+            if (remapRef(ref)) changed = true;
+            out.push_back(ref);
+         } else {
+            out.push_back(attr);
+         }
+      }
+      return std::make_pair(changed, mlir::ArrayAttr::get(ctx, out));
+   };
+   auto remapRefMapping = [&](subop::ColumnRefMemberMappingAttr mapping) {
+      llvm::SmallVector<subop::RefMappingPairT> out;
+      bool changed = false;
+      for (auto [member, ref] : mapping.getMapping()) {
+         if (remapRef(ref)) changed = true;
+         out.push_back({member, ref});
+      }
+      return std::make_pair(changed, subop::ColumnRefMemberMappingAttr::get(ctx, out));
+   };
+
+   module.walk([&](subop::MapOp op) {
+      auto [changed, attr] = remapRefArray(op.getInputColsAttr());
+      if (changed) op.setInputColsAttr(attr);
+   });
+   module.walk([&](subop::FilterOp op) {
+      auto [changed, attr] = remapRefArray(op.getConditionsAttr());
+      if (changed) op.setConditionsAttr(attr);
+   });
+   module.walk([&](subop::NestedMapOp op) {
+      auto [changed, attr] = remapRefArray(op.getParametersAttr());
+      if (changed) op.setParametersAttr(attr);
+   });
+   module.walk([&](subop::GatherOp op) {
+      tuples::ColumnRefAttr ref = op.getRef();
+      if (remapRef(ref)) op.setRefAttr(ref);
+   });
+   module.walk([&](subop::MaterializeOp op) {
+      auto [changed, attr] = remapRefMapping(op.getMapping());
+      if (changed) op.setMappingAttr(attr);
+   });
+   module.walk([&](subop::InsertOp op) {
+      auto [changed, attr] = remapRefMapping(op.getMapping());
+      if (changed) op.setMappingAttr(attr);
+   });
+   module.walk([&](subop::ReduceOp op) {
+      tuples::ColumnRefAttr ref = op.getRef();
+      if (remapRef(ref)) op.setRefAttr(ref);
+      auto [changed, attr] = remapRefArray(op.getColumnsAttr());
+      if (changed) op.setColumnsAttr(attr);
+   });
+   module.walk([&](subop::LookupOp op) {
+      auto [changed, attr] = remapRefArray(op.getKeysAttr());
+      if (changed) op.setKeysAttr(attr);
+      auto ref = op.getRef();
+      if (replacement.contains(&ref.getColumn())) {
+         llvm_unreachable("lookup result column must not be a remapped lookup-entry gather output");
+      }
+   });
+   module.walk([&](subop::LookupOrInsertOp op) {
+      auto [changed, attr] = remapRefArray(op.getKeysAttr());
+      if (changed) op.setKeysAttr(attr);
+      auto ref = op.getRef();
+      if (replacement.contains(&ref.getColumn())) {
+         llvm_unreachable("lookup_or_insert result column must not be a remapped lookup-entry gather output");
+      }
+   });
+}
+
+static void alignDirectSyntheticHivGathersToCachedLayouts(
+   mlir::ModuleOp module,
+   const CachedJoinBufferLayoutsByKey& layoutsByKey) {
+   (void)layoutsByKey;
+   auto& cm = module.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   auto asHivLayout = [](mlir::Type type) -> subop::HashIndexedViewType {
+      if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(type)) return hiv;
+      if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(type)) {
+         return subop::HashIndexedViewType::get(mixed.getContext(), mixed.getKeyMembers(),
+                                                mixed.getValueMembers(), mixed.getCompareHashForLookup());
+      }
+      return {};
+   };
+
+   auto& mm = module.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   auto valueMembersOf = [](subop::HashIndexedViewType hiv) {
+      llvm::DenseSet<subop::Member> out;
+      for (subop::Member member : hiv.getValueMembers().getMembers()) out.insert(member);
+      return out;
+   };
+   struct RefGatherGroup {
+      subop::HashIndexedViewType hiv;
+      llvm::SmallVector<subop::GatherOp, 8> gathers;
+   };
+   auto columnKey = [&](tuples::Column& column) {
+      auto [scope, leaf] = cm.getName(&column);
+      return scope + "::" + leaf;
+   };
+   llvm::StringMap<RefGatherGroup> groups;
+   module.walk([&](subop::ScanListOp scan) {
+      auto hiv = asHivLayout(mlir::cast<subop::LookupEntryRefType>(scan.getElem().getColumn().type).getState());
+      if (!hiv) return;
+      groups[columnKey(scan.getElem().getColumn())].hiv = hiv;
+   });
+   module.walk([&](subop::GatherOp gather) {
+      auto it = groups.find(columnKey(gather.getRef().getColumn()));
+      if (it == groups.end()) return;
+      it->second.gathers.push_back(gather);
+   });
+
+   auto layoutKey = [&](subop::HashIndexedViewType hiv) {
+      std::string out;
+      llvm::raw_string_ostream os(out);
+      for (subop::Member member : hiv.getValueMembers().getMembers()) {
+         if (parseFilterPredMemberSlot(mm.getName(member))) continue;
+         os << mm.getName(member) << ':';
+         mm.getType(member).print(os);
+         os << ';';
+      }
+      os.flush();
+      return out;
+   };
+
+   llvm::StringMap<llvm::StringMap<subop::Member>> memberByLeafByLayout;
+   for (auto& entry : groups) {
+      RefGatherGroup& group = entry.getValue();
+      if (!group.hiv || group.gathers.empty()) continue;
+      llvm::DenseSet<subop::Member> valueMembers = valueMembersOf(group.hiv);
+      llvm::StringMap<subop::Member>& memberByLeaf = memberByLeafByLayout[layoutKey(group.hiv)];
+      for (subop::Member member : group.hiv.getValueMembers().getMembers()) {
+         memberByLeaf[mm.getName(member)] = member;
+      }
+      for (subop::GatherOp gather : group.gathers) {
+         for (auto [member, def] : gather.getMapping().getMapping()) {
+            if (!valueMembers.contains(member)) continue;
+            auto [scope, leaf] = cm.getName(&def.getColumn());
+            (void)scope;
+            memberByLeaf[leaf] = member;
+            memberByLeaf[stripReuseSuffix(leaf)] = member;
+         }
+      }
+   }
+
+   llvm::DenseMap<subop::Member, subop::Member> globalMemberRemap;
+   for (auto& entry : groups) {
+      RefGatherGroup& group = entry.getValue();
+      if (!group.hiv || group.gathers.empty()) continue;
+      llvm::DenseSet<subop::Member> valueMembers = valueMembersOf(group.hiv);
+      llvm::StringMap<subop::Member> memberByLeaf = memberByLeafByLayout[layoutKey(group.hiv)];
+
+      llvm::DenseMap<subop::Member, subop::Member> localRemap;
+      llvm::DenseSet<subop::Member> usedNewMembers;
+      for (subop::GatherOp gather : group.gathers) {
+         for (auto [member, def] : gather.getMapping().getMapping()) {
+            if (valueMembers.contains(member) || localRemap.contains(member)) continue;
+            auto [scope, leaf] = cm.getName(&def.getColumn());
+            (void)scope;
+            auto it = memberByLeaf.find(leaf);
+            if (it == memberByLeaf.end()) it = memberByLeaf.find(stripReuseSuffix(leaf));
+            if (it == memberByLeaf.end()) continue;
+            localRemap[member] = it->second;
+            usedNewMembers.insert(it->second);
+         }
+      }
+      for (subop::GatherOp gather : group.gathers) {
+         for (auto [member, def] : gather.getMapping().getMapping()) {
+            (void)def;
+            if (valueMembers.contains(member) || localRemap.contains(member)) continue;
+            subop::Member found;
+            for (subop::Member candidate : group.hiv.getValueMembers().getMembers()) {
+               if (parseFilterPredMemberSlot(mm.getName(candidate))) continue;
+               if (usedNewMembers.contains(candidate)) continue;
+               if (mm.getType(candidate) != mm.getType(member)) continue;
+               assert(!found && "direct synthetic HIV gather fallback member remap must be type-unique");
+               found = candidate;
+            }
+            assert(found && "direct synthetic HIV gather must map every old member to current state member");
+            localRemap[member] = found;
+         }
+      }
+      for (auto [from, to] : localRemap) globalMemberRemap[from] = to;
+   }
+
+   if (globalMemberRemap.empty()) return;
+
+   module.walk([&](subop::GatherOp gather) {
+      auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(gather.getRef().getColumn().type);
+      if (!ler) return;
+      llvm::SmallVector<subop::DefMappingPairT> out;
+      bool changed = false;
+      for (auto [member, def] : gather.getMapping().getMapping()) {
+         subop::Member mappedMember = member;
+         if (auto it = globalMemberRemap.find(member); it != globalMemberRemap.end()) {
+            mappedMember = it->second;
+            changed = true;
+         }
+         out.push_back({mappedMember, def});
+      }
+      if (changed) gather.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(gather.getContext(), out));
+   });
 }
 
 static void rememberAggregateBranchMapColumns(
    subop::MapOp map,
-   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
+   llvm::StringMap<tuples::ColumnRefAttr>& colByName,
    tuples::ColumnRefAttr& tableEntryRef) {
    for (auto attr : map.getComputedCols()) {
       auto def = mlir::cast<tuples::ColumnDefAttr>(attr);
@@ -1173,6 +1857,59 @@ static void rememberAggregateBranchMapColumns(
          tableEntryRef = cm.createRef(&def.getColumn());
       }
    }
+}
+
+static void rememberSplitStreamColumnsFromChain(mlir::Value stream,
+                                                llvm::StringMap<tuples::ColumnRefAttr>& colByName) {
+   tuples::ColumnRefAttr ignoredTableEntryRef;
+   llvm::DenseSet<void*> seenStreams;
+   for (;;) {
+      if (!stream || !seenStreams.insert(stream.getAsOpaquePointer()).second) return;
+      mlir::Operation* def = stream.getDefiningOp();
+      if (!def) return;
+      if (auto gather = mlir::dyn_cast<subop::GatherOp>(def)) {
+         rememberAggregateBranchGatherColumns(gather, colByName);
+         stream = gather.getStream();
+         continue;
+      }
+      if (auto map = mlir::dyn_cast<subop::MapOp>(def)) {
+         rememberAggregateBranchMapColumns(map, colByName, ignoredTableEntryRef);
+         stream = map.getStream();
+         continue;
+      }
+      if (auto filter = mlir::dyn_cast<subop::FilterOp>(def)) {
+         stream = filter.getStream();
+         continue;
+      }
+      if (auto rename = mlir::dyn_cast<subop::RenamingOp>(def)) {
+         stream = rename.getStream();
+         continue;
+      }
+      return;
+   }
+}
+
+static subop::ColumnRefMemberMappingAttr remapResultMaterializeMappingToTargetLayoutAndStreamColumns(
+   mlir::MLIRContext* ctx,
+   subop::ColumnRefMemberMappingAttr sourceMapping,
+   mlir::Type targetStateType,
+   const llvm::StringMap<tuples::ColumnRefAttr>& colByName) {
+   llvm::SmallVector<subop::Member> targetMembers = stateMembersForType(targetStateType);
+   assert(!targetMembers.empty() && "split-materialize target must have members");
+   assert(sourceMapping.getMapping().size() == targetMembers.size() &&
+          "split-materialize branch result layout must align by ordinal with donor mapping");
+   llvm::SmallVector<subop::RefMappingPairT> pairs;
+   unsigned ordinal = 0;
+   for (auto& [member, colRef] : sourceMapping.getMapping()) {
+      (void)member;
+      tuples::ColumnRefAttr mappedCol = lookupSplitColumnByName(colByName, fullNameForColumnRef(colRef));
+      if (!mappedCol) mappedCol = lookupSplitColumnByName(colByName, baseNameForColumnRef(colRef));
+      assert(mappedCol && "split-materialize result column must exist on branch stream");
+      pairs.push_back({targetMembers[ordinal++], mappedCol});
+   }
+   llvm::SmallVector<subop::RefMappingPairT> attrPairs;
+   attrPairs.append(pairs.begin(), pairs.end());
+   return subop::ColumnRefMemberMappingAttr::get(ctx, attrPairs);
 }
 
 static std::optional<subop::Member> findTableEntryMemberForFilter(tuples::ColumnRefAttr tableEntryRef,
@@ -1192,7 +1929,7 @@ static mlir::Value gatherMissingAggregateBranchFilterColumns(
    mlir::Location loc,
    mlir::Value stream,
    tuples::ColumnRefAttr tableEntryRef,
-   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
+   llvm::StringMap<tuples::ColumnRefAttr>& colByName,
    llvm::ArrayRef<runtime::FilterDescription> filters) {
    llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>, 8> mappings;
    auto* ctx = b.getContext();
@@ -1223,13 +1960,36 @@ static mlir::Value materializeAggregateBranchFiltersBeforeLookup(
    mlir::Location loc,
    mlir::Value stream,
    tuples::ColumnRefAttr tableEntryRef,
-   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr>& colByName,
+   llvm::StringMap<tuples::ColumnRefAttr>& colByName,
    llvm::ArrayRef<runtime::FilterDescription> filters) {
    if (filters.empty()) return stream;
    stream = gatherMissingAggregateBranchFilterColumns(b, loc, stream, tableEntryRef, colByName, filters);
-   mlir::Value filtered = materializeRuntimeFiltersAsSubopFilter(b, loc, stream, colByName, filters);
+   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr> colByNameView;
+   for (auto& kv : colByName) colByNameView[kv.getKey()] = kv.second;
+   mlir::Value filtered = materializeRuntimeFiltersAsSubopFilter(b, loc, stream, colByNameView, filters);
    if (mlir::Operation* def = filtered.getDefiningOp()) b.setInsertionPointAfter(def);
    return filtered;
+}
+
+static llvm::SmallVector<tuples::ColumnRefAttr, 8> residualInputOverridesFromDonorOrdinal(
+   const llvm::StringMap<tuples::ColumnRefAttr>& colByName,
+   subop::ColumnMapping& columnMapping,
+   SplitResidualFilter donorResidual,
+   SplitResidualFilter branchResidual) {
+   assert(donorResidual.predMap.getInputCols().size() == branchResidual.predMap.getInputCols().size() &&
+          "split aggregate residual predicates must have ordinal-aligned inputs");
+   llvm::SmallVector<tuples::ColumnRefAttr, 8> out;
+   out.reserve(donorResidual.predMap.getInputCols().size());
+   for (mlir::Attribute donorAttr : donorResidual.predMap.getInputCols()) {
+      auto donorRef = mlir::cast<tuples::ColumnRefAttr>(donorAttr);
+      tuples::ColumnRefAttr currentRef = columnMapping.remap(donorRef);
+      if (&currentRef.getColumn() == &donorRef.getColumn())
+         currentRef = lookupSplitColumnByName(colByName, fullNameForColumnRef(donorRef));
+      if (!currentRef) currentRef = lookupSplitColumnByName(colByName, baseNameForColumnRef(donorRef));
+      if (!currentRef) currentRef = donorRef;
+      out.push_back(currentRef);
+   }
+   return out;
 }
 
 static void cloneAggregateSuffixToReduce(mlir::OpBuilder& b,
@@ -1238,21 +1998,75 @@ static void cloneAggregateSuffixToReduce(mlir::OpBuilder& b,
                                          mlir::Value newStart,
                                          mlir::Value newState,
                                          llvm::ArrayRef<runtime::FilterDescription> filters = {},
-                                         llvm::StringRef mixedPredMemberName = {}) {
+                                         llvm::StringRef mixedPredMemberName = {},
+                                         std::optional<SplitResidualFilter> donorResidualToReplace = std::nullopt,
+                                         std::optional<SplitResidualFilter> branchResidual = std::nullopt,
+                                         llvm::ArrayRef<subop::MapOp> branchMapOps = {},
+                                         llvm::DenseMap<mlir::Type, unsigned> predSlotByStateType =
+                                            llvm::DenseMap<mlir::Type, unsigned>()) {
    llvm::SmallVector<mlir::Operation*, 8> ops = linearStreamOpsBeforeReduce(suffixStart, reduce);
+   llvm::DenseSet<mlir::Operation*> suffixOps(ops.begin(), ops.end());
    mlir::IRMapping mapping;
    subop::ColumnMapping columnMapping;
    mlir::Value current = newStart;
    if (!mixedPredMemberName.empty()) {
-      current = filterSplitBranchByMixedPredMember(b, reduce.getLoc(), current, mixedPredMemberName);
+      current = filterScanListBranchByMixedPredMember(b, reduce.getLoc(), current, mixedPredMemberName);
    }
    mapping.map(suffixStart, current);
-   llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr> colByName;
+   llvm::StringMap<tuples::ColumnRefAttr> colByName;
    tuples::ColumnRefAttr tableEntryRef;
    bool filtersInserted = filters.empty();
+   bool inheritedPredsInserted = mixedPredMemberName.empty();
+   bool branchResidualInserted = !branchResidual || donorResidualToReplace.has_value();
    subop::LookupOrInsertOp clonedLookup;
    subop::LookupOp clonedPlainLookup;
+   unsigned mapOrdinal = 0;
    for (mlir::Operation* op : ops) {
+      subop::MapOp donorMap = mlir::dyn_cast<subop::MapOp>(op);
+      subop::MapOp branchMap;
+      if (donorMap && !branchMapOps.empty()) {
+         assert(mapOrdinal < branchMapOps.size() &&
+                "split aggregate branch map list must align with donor suffix maps");
+         branchMap = branchMapOps[mapOrdinal++];
+      }
+      if (donorResidualToReplace && op == donorResidualToReplace->predMap.getOperation()) {
+         if (branchResidual) {
+            llvm::SmallVector<tuples::ColumnRefAttr, 8> inputOverrides =
+               residualInputOverridesFromDonorOrdinal(colByName, columnMapping,
+                                                      *donorResidualToReplace, *branchResidual);
+            current = cloneResidualFilterBranch(b, op->getLoc(), current, colByName, *branchResidual,
+                                                inputOverrides);
+            if (mlir::Operation* def = current.getDefiningOp()) b.setInsertionPointAfter(def);
+         }
+         mapping.map(streamResultOfLinearSuffixOp(op), current);
+         continue;
+      }
+      if (donorMap && branchMap && donorMap.getInputCols().size() > 0 &&
+          mapBodySemanticFingerprint(donorMap) != mapBodySemanticFingerprint(branchMap)) {
+         if (!mapReturnUsesOnlyMapBlockArgs(branchMap))
+            llvm_unreachable("split aggregate branch map replacement cannot capture outer block arguments");
+         auto clonedMap = cloneBranchMapWithDonorColumns(b, current, donorMap, branchMap, columnMapping);
+         mapping.map(donorMap.getResult(), clonedMap.getResult());
+         current = clonedMap.getResult();
+         b.setInsertionPointAfter(clonedMap);
+         rememberAggregateBranchMapColumns(clonedMap, colByName, tableEntryRef);
+         continue;
+      }
+      if (donorResidualToReplace && op == donorResidualToReplace->filter.getOperation()) {
+         mapping.map(streamResultOfLinearSuffixOp(op), current);
+         continue;
+      }
+      if (!branchResidualInserted && mlir::isa<subop::LookupOrInsertOp, subop::LookupOp>(op)) {
+         current = cloneResidualFilterBranch(b, op->getLoc(), current, colByName, *branchResidual);
+         if (mlir::Operation* def = current.getDefiningOp()) b.setInsertionPointAfter(def);
+         branchResidualInserted = true;
+      }
+      if (!inheritedPredsInserted && mlir::isa<subop::LookupOrInsertOp, subop::LookupOp>(op)) {
+         current = materializeInheritedAggregatePredsBeforeLookup(b, reduce, suffixStart, suffixOps,
+                                                                  current, mixedPredMemberName,
+                                                                  predSlotByStateType);
+         inheritedPredsInserted = true;
+      }
       if (!filtersInserted && mlir::isa<subop::LookupOrInsertOp, subop::LookupOp>(op)) {
          current = materializeAggregateBranchFiltersBeforeLookup(b, op->getLoc(), current, tableEntryRef,
                                                                  colByName, filters);
@@ -1265,20 +2079,38 @@ static void cloneAggregateSuffixToReduce(mlir::OpBuilder& b,
          mapping.map(lookup.getState(), newState);
       auto sub = mlir::cast<subop::SubOperator>(op);
       mlir::Operation* cloned = sub.cloneSubOp(b, mapping, columnMapping);
-      if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(cloned)) clonedLookup = lookup;
-      if (auto lookup = mlir::dyn_cast<subop::LookupOp>(cloned)) clonedPlainLookup = lookup;
+      if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(cloned)) {
+         auto oldScanList = mlir::cast<subop::ScanListOp>(op);
+         columnMapping.mapRaw(&oldScanList.getElem().getColumn(), &scanList.getElem().getColumn());
+      }
+      if (auto lookup = mlir::dyn_cast<subop::LookupOrInsertOp>(cloned)) {
+         auto oldLookup = mlir::cast<subop::LookupOrInsertOp>(op);
+         columnMapping.mapRaw(&oldLookup.getRef().getColumn(), &lookup.getRef().getColumn());
+         clonedLookup = lookup;
+      }
+      if (auto lookup = mlir::dyn_cast<subop::LookupOp>(cloned)) {
+         auto oldLookup = mlir::cast<subop::LookupOp>(op);
+         columnMapping.mapRaw(&oldLookup.getRef().getColumn(), &lookup.getRef().getColumn());
+         clonedPlainLookup = lookup;
+      }
       current = streamResultOfLinearSuffixOp(cloned);
       if (mlir::isa<subop::ScanListOp>(cloned) && !mixedPredMemberName.empty()) {
          b.setInsertionPointAfter(cloned);
-         current = filterSplitBranchByMixedPredMember(b, cloned->getLoc(), current, mixedPredMemberName);
+         current = filterScanListBranchByMixedPredMember(b, cloned->getLoc(), current, mixedPredMemberName);
       }
       if (auto gather = mlir::dyn_cast<subop::GatherOp>(cloned)) {
+         freshenClonedAggregateGatherColumns(mlir::cast<subop::GatherOp>(op), gather, columnMapping);
          rememberAggregateBranchGatherColumns(gather, colByName);
       } else if (auto map = mlir::dyn_cast<subop::MapOp>(cloned)) {
          rememberAggregateBranchMapColumns(map, colByName, tableEntryRef);
       }
    }
+   assert((branchMapOps.empty() || mapOrdinal == branchMapOps.size()) &&
+          "split aggregate branch map list must align with donor suffix maps");
    assert(filtersInserted && "split aggregate branch filters must be inserted before lookup_or_insert");
+   assert(inheritedPredsInserted && "split aggregate inherited predicates must be inserted before lookup_or_insert");
+   assert(branchResidualInserted && "split aggregate residual predicate must be inserted before lookup_or_insert");
+
    mapping.map(reduce.getStream(), current);
    auto* clonedReduceOp =
       mlir::cast<subop::SubOperator>(reduce.getOperation()).cloneSubOp(b, mapping, columnMapping);
@@ -1353,11 +2185,49 @@ static mlir::Value resolveSplitMaterializeBuildState(mlir::ModuleOp module, mlir
    return target;
 }
 
+static bool stepMergesBuildStateToFinalState(ExecutionStepOp step,
+                                             mlir::Value buildState,
+                                             mlir::Value finalState) {
+   buildState = canonicalizeStateValueForReuse(buildState);
+   finalState = canonicalizeStateValueForReuse(finalState);
+   bool found = false;
+   step.walk([&](subop::MergeOp merge) {
+      if (canonicalizeStateValueForReuse(merge.getResult()) != finalState) return;
+      mlir::Value threadLocal = canonicalizeStateValueForReuse(
+         peelBlockArgsToEnclosingOperands(merge.getThreadLocal()));
+      if (threadLocal != buildState) return;
+      found = true;
+   });
+   return found;
+}
+
+static bool splitAggregateFinalStateHasNoExtraWriters(mlir::Value target,
+                                                      mlir::Value buildState,
+                                                      const ModuleReuseInfo& reuse) {
+   target = canonicalizeStateValueForReuse(target);
+   buildState = canonicalizeStateValueForReuse(buildState);
+   if (target == buildState) return true;
+   auto itW = findReuseMap(reuse.writerStepsByState, target);
+   if (itW == reuse.writerStepsByState.end()) return false;
+   if (itW->second.size() != 1) return false;
+   return stepMergesBuildStateToFinalState(itW->second.front(), buildState, target);
+}
+
 static bool splitAggregateBuildRewriteSupported(mlir::ModuleOp module, mlir::Value target,
                                                 const ModuleReuseInfo& reuse) {
    mlir::Value buildState = resolveSplitMaterializeBuildState(module, target, reuse);
+   if (!splitAggregateFinalStateHasNoExtraWriters(target, buildState, reuse)) return false;
    std::optional<SplitAggregateBuild> build = tryFindUniqueAggregateBuildWritingState(module, buildState);
-   return build && build->suffixStart;
+   if (!build || !build->suffixStart) return false;
+
+   auto itBuildW = findReuseMap(reuse.writerStepsByState, canonicalizeStateValueForReuse(buildState));
+   if (itBuildW == reuse.writerStepsByState.end()) return false;
+   ExecutionStepOp buildTopStep = topLevelExecutionStepFor(build->step);
+   unsigned matchingWriters = 0;
+   for (ExecutionStepOp writer : itBuildW->second) {
+      if (topLevelExecutionStepFor(writer) == buildTopStep) matchingWriters++;
+   }
+   return matchingWriters == itBuildW->second.size();
 }
 
 llvm::SmallVector<CacheTarget, 64> cacheTargetsWithFilterPredReuse(llvm::ArrayRef<CacheTarget> targets) {
@@ -2589,29 +3459,82 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
       return sig;
    };
 
+   auto aggregateSplitMapFingerprint = [&](mlir::ModuleOp module, mlir::Value target,
+                                           const ModuleReuseInfo& reuse)
+      -> std::optional<llvm::SmallVector<std::string, 8>> {
+      mlir::Value buildState = resolveSplitMaterializeBuildState(module, target, reuse);
+      std::optional<SplitAggregateBuild> build = tryFindUniqueAggregateBuildWritingState(module, buildState);
+      if (!build) build = tryFindUniquePlainReduceBuildWritingState(module, buildState);
+      if (!build) return std::nullopt;
+      std::optional<SplitResidualFilter> residual =
+         findResidualFilterBeforeReduce(build->suffixStart, build->reduce);
+      llvm::SmallVector<std::string, 8> fingerprints;
+      for (subop::MapOp map : linearMapOpsBeforeReduce(build->suffixStart, build->reduce)) {
+         if (residual && map == residual->predMap) continue;
+         fingerprints.push_back(mapBodySemanticFingerprint(map));
+      }
+      return fingerprints;
+   };
+
    for (const CrossQueryStateMatchGroup& g : rewriteGroups) {
       if (g.entries.size() < 2) continue;
       const CrossQueryStateMatchEntry* donor = nullptr;
       bool unsupportedAggregateGroup = false;
+      bool groupUsesSplitMaterialize = g.requiresSplitMaterialize;
       for (const CrossQueryStateMatchEntry& e : g.entries) {
          if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
          if (!e.state) continue;
          mlir::Value targetState = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
          assert(targetState && "batch reuse target must resolve during aggregate support check");
          if (mlir::isa<subop::PreAggrHtType>(targetState.getType())) {
-            bool supported = g.requiresSplitMaterialize
-                                ? splitAggregateBuildRewriteSupported(queries[e.query], targetState,
-                                                                      reuseEarly[e.query])
-                                : aggregateHashTablePayloadUnionSupported(e.state, reuseEarly[e.query]);
-            if (!supported) {
-               unsupportedAggregateGroup = true;
-               break;
+            if (groupUsesSplitMaterialize) {
+               if (!splitAggregateBuildRewriteSupported(queries[e.query], targetState, reuseEarly[e.query])) {
+                  unsupportedAggregateGroup = true;
+                  break;
+               }
+            } else if (!g.cacheDeps.empty()) {
+               groupUsesSplitMaterialize = true;
+            } else if (!aggregateHashTablePayloadUnionSupported(e.state, reuseEarly[e.query])) {
+               groupUsesSplitMaterialize = true;
             }
          }
          if (unsupportedAggregateGroup) {
             break;
          }
          if (!donor || e.query < donor->query) donor = &e;
+      }
+      if (g.requiresJoinLayoutUnion) groupUsesSplitMaterialize = false;
+      if (!unsupportedAggregateGroup && groupUsesSplitMaterialize && !g.requiresSplitMaterialize) {
+         for (const CrossQueryStateMatchEntry& e : g.entries) {
+            if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
+            if (!e.state) continue;
+            mlir::Value targetState = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
+            assert(targetState && "batch reuse target must resolve during aggregate split support check");
+            if (!mlir::isa<subop::PreAggrHtType>(targetState.getType())) continue;
+            if (!splitAggregateBuildRewriteSupported(queries[e.query], targetState, reuseEarly[e.query])) {
+               unsupportedAggregateGroup = true;
+               break;
+            }
+         }
+      }
+      if (!unsupportedAggregateGroup && groupUsesSplitMaterialize && donor) {
+         mlir::Value donorTarget = resolveCacheTargetStateForReuse(donor->state, reuseEarly[donor->query]);
+         if (mlir::isa<subop::PreAggrHtType>(donorTarget.getType())) {
+            std::optional<llvm::SmallVector<std::string, 8>> donorFp =
+               aggregateSplitMapFingerprint(queries[donor->query], donorTarget, reuseEarly[donor->query]);
+            assert(donorFp && "split aggregate donor must have map fingerprints");
+            for (const CrossQueryStateMatchEntry& e : g.entries) {
+               if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size() || !e.state) continue;
+               mlir::Value targetState = resolveCacheTargetStateForReuse(e.state, reuseEarly[e.query]);
+               if (!mlir::isa<subop::PreAggrHtType>(targetState.getType())) continue;
+               std::optional<llvm::SmallVector<std::string, 8>> fp =
+                  aggregateSplitMapFingerprint(queries[e.query], targetState, reuseEarly[e.query]);
+               if (!fp || *fp != *donorFp) {
+                  unsupportedAggregateGroup = true;
+                  break;
+               }
+            }
+         }
       }
       if (unsupportedAggregateGroup) continue;
       if (!donor) continue;
@@ -2637,6 +3560,7 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
       }
 
       CrossQueryStateMatchGroup groupForRewrite = g;
+      groupForRewrite.requiresSplitMaterialize = groupUsesSplitMaterialize;
       for (CrossQueryStateMatchEntry& e : groupForRewrite.entries) {
          if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
          e.reuseSlot = slotByQuery.lookup(static_cast<unsigned>(e.query));
@@ -2645,7 +3569,7 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
       donorGroups.push_back(DonorGroup{
          &activeRewriteGroups.back(), donor->query, donor->state,
          CacheTarget{donorTargetState, g.cacheKey, flags.enableFilterPredReuse},
-         g.requiresSplitMaterialize});
+         groupUsesSplitMaterialize});
 
       for (const CrossQueryStateMatchEntry& e : g.entries) {
          if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
@@ -2654,14 +3578,14 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
          assert(!mlir::isa<ThreadLocalType>(targetState.getType()) &&
                 "batch reuse must never target thread_local-wrapped states");
          unsigned splitSlot = slotByQuery.lookup(static_cast<unsigned>(e.query));
-         uint64_t targetCacheKey = g.requiresSplitMaterialize
+         uint64_t targetCacheKey = groupUsesSplitMaterialize
                                       ? splitMaterializeOutputCacheKey(g.cacheKey, splitSlot)
                                       : g.cacheKey;
          targetsByQuery[e.query].push_back(CacheTarget{targetState, targetCacheKey, flags.enableFilterPredReuse});
          llvm::SmallVector<size_t, 8>& categoryTargets =
-            g.requiresSplitMaterialize ? res.numBuildStepTargetsPerQuery : res.numUnionTargetsPerQuery;
+            groupUsesSplitMaterialize ? res.numBuildStepTargetsPerQuery : res.numUnionTargetsPerQuery;
          llvm::SmallVector<size_t, 8>& categoryTargetsNoTable =
-            g.requiresSplitMaterialize ? res.numBuildStepTargetsNoTablePerQuery
+            groupUsesSplitMaterialize ? res.numBuildStepTargetsNoTablePerQuery
                                        : res.numUnionTargetsNoTablePerQuery;
          categoryTargets[e.query]++;
          if (!mlir::isa<TableType>(targetState.getType())) categoryTargetsNoTable[e.query]++;
@@ -2749,14 +3673,21 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
    extendSyntheticAggregateHashTablesToPayloadUnionForGroups(*res.synthetic, queries, rewriteGroups,
                                                              targetsSynthetic, &aggregateLayoutsByKey);
 
-   expandSplitMaterializeTargetsInSynthetic(*res.synthetic, queries, rewriteGroups, reuseEarly,
-                                            donorMappings, rewriteCtx, targetsSynthetic);
-
    auto reuseSyntheticAfterLayoutPrep = collectModuleReuseInfo(*res.synthetic);
    ClonedJoinBufferBuildSitesByKey joinBuildSites =
       recordClonedJoinBufferBuildSites(*res.synthetic, targetsSynthetic, reuseSyntheticAfterLayoutPrep);
    insertSyntheticFilterPredsAfterColumnUnionForGroups(*res.synthetic, queries, rewriteGroups, targetsSynthetic,
                                                        producerLayoutsByKey, joinBuildSites);
+
+   bool hasSplitMaterializeGroup = llvm::any_of(rewriteGroups, [](const CrossQueryStateMatchGroup& g) {
+      return g.requiresSplitMaterialize;
+   });
+   expandSplitMaterializeTargetsInSynthetic(*res.synthetic, queries, rewriteGroups, reuseEarly,
+                                            donorMappings, rewriteCtx, targetsSynthetic);
+   if (hasSplitMaterializeGroup) {
+      syncProbeGatherMappingsInModule(*res.synthetic);
+      synchronizeExecutionStepPortTypes(*res.synthetic, nullptr);
+   }
 
    {
       auto reuseSyntheticAfterLayout = collectModuleReuseInfo(*res.synthetic);
@@ -2829,6 +3760,8 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
       applyProbePredFiltersForConsumerClosures(queries[qi], probeClosuresByQuery[qi]);
    }
 
+   if (res.synthetic) alignDirectSyntheticHivGathersToCachedLayouts(*res.synthetic, producerLayoutsByKey);
+
    return res;
 }
 
@@ -2848,6 +3781,10 @@ static void expandSplitMaterializeTargetsInSynthetic(
    llvm::DenseSet<uint64_t> splitGroupKeys;
    llvm::SmallVector<CacheTarget, 64> expanded;
    ModuleReuseInfo reuseSynthetic = collectModuleReuseInfo(synthetic);
+   llvm::DenseMap<mlir::Type, uint64_t> cacheKeyByStateType;
+   synthetic.walk([&](subop::CacheGetOp get) {
+      cacheKeyByStateType[get.getResult().getType()] = static_cast<uint64_t>(get.getKey());
+   });
 
    auto cloneCreateOnlyStepBefore = [](ExecutionStepOp beforeStep, ExecutionStepOp createStep,
                                        mlir::Value originalState) -> mlir::Value {
@@ -2888,6 +3825,17 @@ static void expandSplitMaterializeTargetsInSynthetic(
       return findResidualFilterBeforeMaterialize(itWriter->second.front(), mat);
    };
 
+   auto aggregateResidualForOriginalTarget = [](mlir::ModuleOp module, mlir::Value target,
+                                                const ModuleReuseInfo& reuse)
+      -> std::optional<SplitResidualFilter> {
+      mlir::Value buildState = resolveSplitMaterializeBuildState(module, target, reuse);
+      std::optional<SplitAggregateBuild> build =
+         tryFindUniqueAggregateBuildWritingState(module, buildState);
+      if (!build) build = tryFindUniquePlainReduceBuildWritingState(module, buildState);
+      if (!build) return std::nullopt;
+      return findResidualFilterBeforeReduce(build->suffixStart, build->reduce);
+   };
+
    for (const CrossQueryStateMatchGroup& g : groups) {
       if (!g.requiresSplitMaterialize) continue;
       splitGroupKeys.insert(g.cacheKey);
@@ -2926,6 +3874,8 @@ static void expandSplitMaterializeTargetsInSynthetic(
             clearGetExternalFiltersForState(canonicalizeStateValueForReuse(aggregateSourceScan.getState()));
          }
          mlir::Value suffixStart = aggBuild.suffixStart;
+         std::optional<SplitResidualFilter> donorResidual =
+            findResidualFilterBeforeReduce(suffixStart, aggBuild.reduce);
          llvm::DenseSet<uint64_t> emittedOutputKeys;
 
          for (const CrossQueryStateMatchEntry& e : g.entries) {
@@ -2990,13 +3940,39 @@ static void expandSplitMaterializeTargetsInSynthetic(
             assert(lookupAnchor && "split reduce build must have a lookup insertion anchor");
             mlir::OpBuilder b(lookupAnchor);
             b.setInsertionPoint(lookupAnchor);
-            unsigned branchPredSlot =
+            llvm::DenseMap<mlir::Type, unsigned> predSlotByStateType;
+            for (uint64_t depKey : g.cacheDeps) {
+               std::optional<unsigned> depSlot =
+                  rewriteCtx.lookupConsumerSlot(depKey, static_cast<unsigned>(e.query));
+               if (!depSlot) continue;
+               for (auto& [stateType, key] : cacheKeyByStateType) {
+                  if (key == depKey) predSlotByStateType[stateType] = *depSlot;
+               }
+            }
+            unsigned predSlot =
                rewriteCtx.inheritedConsumerSlot(g.cacheDeps, static_cast<unsigned>(e.query)).value_or(slot);
-            std::string slotPredName = ("filter_pred$" + llvm::Twine(branchPredSlot)).str();
+            if (auto scan = mlir::dyn_cast_or_null<subop::ScanListOp>(suffixStart.getDefiningOp())) {
+               if (auto itSlot = predSlotByStateType.find(scanListLookupStateType(scan));
+                   itSlot != predSlotByStateType.end()) {
+                  predSlot = itSlot->second;
+               }
+            }
+            std::string slotPredName = ("filter_pred$" + llvm::Twine(predSlot)).str();
+            std::optional<SplitResidualFilter> branchResidual =
+               aggregateResidualForOriginalTarget(queries[e.query], entryTarget, reuseEarly[e.query]);
+            llvm::SmallVector<subop::MapOp, 8> branchMapOps;
+            {
+               mlir::Value entryBuildState = resolveSplitMaterializeBuildState(queries[e.query], entryTarget,
+                                                                               reuseEarly[e.query]);
+               SplitAggregateBuild entryAggBuild =
+                  findUniqueAggregateBuildWritingState(queries[e.query], entryBuildState);
+               branchMapOps = linearMapOpsBeforeReduce(entryAggBuild.suffixStart, entryAggBuild.reduce);
+            }
             cloneAggregateSuffixToReduce(b, suffixStart, aggBuild.reduce, branchStream, stateArg,
                                          aggBuild.scan ? llvm::ArrayRef<runtime::FilterDescription>{}
                                                        : filters,
-                                         slotPredName);
+                                         slotPredName, donorResidual, branchResidual, branchMapOps,
+                                         predSlotByStateType);
             expanded.push_back(CacheTarget{syntheticFinalState, outputKey, /*enableFilterPredReuse=*/false});
          }
          eraseOriginalAggregateSuffix(suffixStart, aggBuild.reduce);
@@ -3033,8 +4009,8 @@ static void expandSplitMaterializeTargetsInSynthetic(
       unsigned localBranchSlot = 0;
       for (const CrossQueryStateMatchEntry& e : g.entries) {
          unsigned defaultBranchPredSlot = localBranchSlot++;
-         unsigned branchPredSlot =
-            rewriteCtx.inheritedConsumerSlot(g.cacheDeps, static_cast<unsigned>(e.query)).value_or(defaultBranchPredSlot);
+         unsigned branchPredSlot = rewriteCtx.consumerSlot(g.cacheKey, static_cast<unsigned>(e.query));
+         (void)defaultBranchPredSlot;
          branchPredSlotByQuery[e.query] = branchPredSlot;
          requiredBranchPredSlots.push_back(branchPredSlot);
       }
@@ -3104,7 +4080,7 @@ static void expandSplitMaterializeTargetsInSynthetic(
             assert(itDecoded != decodedFiltersByEntryTarget.end());
             filters = itDecoded->second;
          }
-         llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr> branchColByName = colByName;
+         llvm::StringMap<tuples::ColumnRefAttr> branchColByName = colByName;
          for (const runtime::FilterDescription& f : filters) {
             if (branchColByName.contains(f.columnName)) continue;
             llvm::StringRef name(f.columnName);
@@ -3118,8 +4094,10 @@ static void expandSplitMaterializeTargetsInSynthetic(
          assertRuntimeFiltersAvailableOnStream(branchColByName, filters);
          mlir::OpBuilder predBuilder(donorMat);
          predBuilder.setInsertionPoint(donorMat);
+         llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr> branchColByNameView;
+         for (auto& kv : branchColByName) branchColByNameView[kv.getKey()] = kv.second;
          mlir::Value branchStream = materializeRuntimeFiltersAsSubopFilter(
-            predBuilder, donorMat.getLoc(), baseStream, branchColByName, filters);
+            predBuilder, donorMat.getLoc(), baseStream, branchColByNameView, filters);
          if (splitResidual) {
             std::optional<SplitResidualFilter> residual = residualForOriginalTarget(entryTarget, reuseEarly[e.query]);
             if (!residual) {
@@ -3139,8 +4117,9 @@ static void expandSplitMaterializeTargetsInSynthetic(
          if (canonicalizeStateValueForReuse(stateArg) != canonicalizeStateValueForReuse(donorMat.getState())) {
             mlir::OpBuilder b(donorMat);
             b.setInsertionPointAfter(donorMat);
-            auto mapping = remapResultMaterializeMappingToTargetLayout(
-               donorMat.getContext(), donorMat.getMapping(), stateArg.getType());
+            rememberSplitStreamColumnsFromChain(branchStream, branchColByName);
+            auto mapping = remapResultMaterializeMappingToTargetLayoutAndStreamColumns(
+               donorMat.getContext(), donorMat.getMapping(), stateArg.getType(), branchColByName);
             b.create<subop::MaterializeOp>(donorMat.getLoc(), branchStream, stateArg,
                                            mapping);
          } else {
@@ -3191,20 +4170,6 @@ static subop::HashIndexedViewType asHashIndexedViewLayoutTypeLocal(mlir::Type ty
                                              mixed.getCompareHashForLookup());
    }
    return nullptr;
-}
-
-static std::optional<unsigned> highestFilterPredSlot(subop::HashIndexedViewType hiv) {
-   if (!hiv) return std::nullopt;
-   auto* ctx = hiv.getContext();
-   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   std::optional<unsigned> bestSlot;
-   for (subop::Member m : hiv.getValueMembers().getMembers()) {
-      llvm::StringRef name = mm.getName(m);
-      auto slot = parseFilterPredMemberSlot(name);
-      if (!slot) continue;
-      if (!bestSlot || *slot > *bestSlot) bestSlot = *slot;
-   }
-   return bestSlot;
 }
 
 static std::optional<std::pair<uint64_t, mlir::Value>>
@@ -3301,25 +4266,13 @@ static void alignSyntheticCacheGetDependenciesToCachedPuts(mlir::ModuleOp synthe
    });
    if (keysToAlign.empty()) return;
 
-   llvm::SmallVector<ConsumerCacheGetProbeClosure, 8> probeClosures;
    for (uint64_t key : keysToAlign) {
       subop::HashIndexedViewType hiv = cachedHivByKey.lookup(key);
-      std::optional<unsigned> predSlot = highestFilterPredSlot(hiv);
-      if (!predSlot || *predSlot < 2) continue;
       CachedJoinBufferLayout layout = cachedJoinLayoutFromHiv(hiv);
-      size_t probeStart = probeClosures.size();
-      alignConsumerModulesToCachedJoinLayout(synthetic, layout, key, std::nullopt, &probeClosures);
-      for (size_t i = probeStart; i < probeClosures.size(); ++i)
-         probeClosures[i].consumerReuseQueryIndex = *predSlot;
-      setMixedLookupPredSlotForCacheGet(synthetic, key, *predSlot);
+      alignConsumerModulesToCachedJoinLayout(synthetic, layout, key, std::nullopt, nullptr);
       resyncConsumerCachedHivCarrierTypesFromCacheGet(synthetic, key);
    }
-   if (probeClosures.empty()) return;
-   for (ConsumerCacheGetProbeClosure& probe : probeClosures) {
-      finalizeConsumerCachedJoinProbeColumnAttrs(synthetic, probe);
-   }
    syncProbeGatherMappingsInModule(synthetic);
-   applyProbePredFiltersForConsumerClosures(synthetic, probeClosures);
 }
 
 BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
@@ -3370,6 +4323,8 @@ BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
             appendSyntheticProducerSteps(*total.synthetic, *one.synthetic);
          }
          alignSyntheticCacheGetDependenciesToCachedPuts(*total.synthetic);
+         CachedJoinBufferLayoutsByKey noLayouts;
+         alignDirectSyntheticHivGathersToCachedLayouts(*total.synthetic, noLayouts);
       }
 
       llvm::SmallVector<std::pair<int, mlir::ModuleOp>, 8> qmods;

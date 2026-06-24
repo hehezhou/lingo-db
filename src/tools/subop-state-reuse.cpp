@@ -1026,6 +1026,7 @@ static int runBatchNightlyMain(int argc, char** argv) {
          for (int rep = 0; rep < repetitions; rep++) {
             SubOpStateReuseOptions opts;
             opts.skipReuseRewrite = parsedMode == BatchNightlyMode::ReuseOff;
+            opts.skipExecute = (std::getenv("LINGODB_SKIP_EXECUTE") != nullptr);
             opts.captureResultHashes = true;
             auto t0 = std::chrono::high_resolution_clock::now();
             SubOpStateReuseBatchResult res = runSubOpStateReuseBatch(queries, catalog.get(), session.get(), opts);
