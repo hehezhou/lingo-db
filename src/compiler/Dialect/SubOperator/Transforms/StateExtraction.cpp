@@ -55,6 +55,20 @@ static std::string normalizeMappingMemberName(llvm::StringRef name) {
    return name.take_front(dollar).str();
 }
 
+struct StateReuseMatchOptions {
+   bool disableHivDisjointClustering = false;
+   bool disableAggregateDisjointClustering = false;
+};
+
+static StateReuseMatchOptions readStateReuseMatchOptions() {
+   StateReuseMatchOptions options;
+   options.disableHivDisjointClustering =
+      std::getenv("LINGODB_DISABLE_HIV_DISJOINT_CLUSTERING") != nullptr;
+   options.disableAggregateDisjointClustering =
+      std::getenv("LINGODB_DISABLE_AGGREGATE_DISJOINT_CLUSTERING") != nullptr;
+   return options;
+}
+
 static std::string renderExternalDataSourceDescrMatchString(
    const lingodb::runtime::ExternalDatasourceProperty& ds,
    llvm::ArrayRef<lingodb::runtime::ExternalDatasourceProperty::Mapping> mapping, bool includeFilters = true) {
@@ -276,21 +290,8 @@ mlir::Value canonicalizeStateValue(subop::ExecutionStepOp step, mlir::Value v) {
       if (idx < parent->getNumOperands() && canMapBlockArgToOperandByType(parent->getOperand(idx).getType(), ba.getType())) {
          return canonicalizeStateValue(step, parent->getOperand(idx));
       }
-      // Fallback: if there is exactly one operand with the same type, assume that's the mapping.
-      mlir::Value candidate;
-      for (auto opnd : parent->getOperands()) {
-         if (!canMapBlockArgToOperandByType(opnd.getType(), ba.getType())) continue;
-         if (candidate) {
-            candidate = mlir::Value();
-            break;
-         }
-         candidate = opnd;
-      }
-      if (candidate) {
-         return canonicalizeStateValue(step, candidate);
-      }
-      // No parent operand matches (e.g. state threaded only through `subop.map` region args).
-      // Keep the value so `getMembersForStateValue` can still classify the type; reuse keys may be less canonical.
+      // No parent operand matches by the region argument contract; keep the value local instead
+      // of guessing by type, as state-reuse hashing must not invent a source mapping.
       return v;
    }
    auto inputs = step.getInputs();
@@ -462,7 +463,7 @@ static bool isTransparentStateValue(mlir::Value v, const llvm::DenseSet<mlir::Va
 
 static bool isSpecialNonReuseStateValue(mlir::Value v, const llvm::DenseSet<mlir::Value>& transparentStates) {
    if (!v) return false;
-   if (mlir::isa<subop::TableType, subop::SharedTableType>(v.getType())) return true;
+   if (mlir::isa<subop::TableType, subop::SharedTableType, subop::ExternalHashIndexType>(v.getType())) return true;
    return isTransparentStateValue(v, transparentStates);
 }
 
@@ -3043,7 +3044,89 @@ struct StateMatchProfile {
    bool hasResidualTableFilter = false;
    bool hasComplexResidualTableFilter = false;
    bool hasUnsupportedResidualTableFilter = false;
+   unsigned constructionSinkStepCount = 0;
+   unsigned constructionSinkOpCount = 0;
 };
+
+struct MatchGroupEmitOptions {
+   bool enableFilterPredReuse = false;
+   bool forceSplitMaterialize = false;
+   const llvm::DenseMap<const StateMatchProfile*, unsigned>* reuseSlotByProfile = nullptr;
+};
+
+struct MatchGroupEmissionContext {
+   llvm::SmallVectorImpl<CrossQueryStateMatchGroup>& out;
+   llvm::DenseSet<mlir::Value>& matchedStates;
+   llvm::DenseMap<uint64_t, unsigned>& emittedGroupCountByBaseCacheKey;
+};
+
+struct StateMatchProfileBucketSet {
+   llvm::DenseMap<uint64_t, llvm::SmallVector<const StateMatchProfile*, 8>> buckets;
+   llvm::SmallVector<uint64_t, 64> order;
+};
+
+static void appendToProfileBucket(StateMatchProfileBucketSet& bucketSet,
+                                  uint64_t hash,
+                                  const StateMatchProfile* profile) {
+   auto it = bucketSet.buckets.find(hash);
+   if (it == bucketSet.buckets.end()) {
+      bucketSet.order.push_back(hash);
+      it = bucketSet.buckets.try_emplace(hash).first;
+   }
+   it->second.push_back(profile);
+}
+
+static StateMatchProfileBucketSet buildProfileBuckets(
+   llvm::ArrayRef<const StateMatchProfile*> profiles,
+   llvm::function_ref<bool(const StateMatchProfile&)> includeProfile,
+   llvm::function_ref<std::string(const StateMatchProfile&)> keyForProfile) {
+   StateMatchProfileBucketSet bucketSet;
+   for (const StateMatchProfile* profile : profiles) {
+      if (!includeProfile(*profile)) continue;
+      std::string key = keyForProfile(*profile);
+      uint64_t hash = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(key)));
+      appendToProfileBucket(bucketSet, hash, profile);
+   }
+   return bucketSet;
+}
+
+static uint64_t allocateMatchGroupCacheKey(MatchGroupEmissionContext& ctx, llvm::StringRef key) {
+   uint64_t baseCacheKey = static_cast<uint64_t>(llvm::hash_value(key));
+   unsigned sameBaseOrdinal = ctx.emittedGroupCountByBaseCacheKey[baseCacheKey]++;
+   if (!sameBaseOrdinal) return baseCacheKey;
+   return llvm::hash_combine(baseCacheKey,
+                             llvm::StringRef("state_reuse_match_group_collision"),
+                             sameBaseOrdinal);
+}
+
+static bool profileHasSingleConstructionSink(const StateMatchProfile& p) {
+   return p.constructionSinkStepCount == 1 && p.constructionSinkOpCount == 1;
+}
+
+static bool profileHasRelaxedConstructionParts(const StateMatchProfile& p) {
+   return p.stateHash != p.constructionHash;
+}
+
+static bool profileCanUseDirectConstructionBucket(const StateMatchProfile& p) {
+   if (!profileHasRelaxedConstructionParts(p)) return true;
+   assert(profileHasSingleConstructionSink(p) && "eligible relaxed profile must have one construction sink");
+   return mlir::isa<subop::HashIndexedViewType>(p.value.getType());
+}
+
+static bool profileCanUseForcedSplitMaterializeBucket(
+   const StateMatchProfile& p,
+   llvm::function_ref<bool(const StateMatchProfile&)> hasPreAggrCacheDependency) {
+   if (mlir::isa<subop::HashIndexedViewType, subop::PreAggrHtType>(p.value.getType())) return false;
+   assert(profileHasSingleConstructionSink(p) && "eligible split-materialize profile must have one construction sink");
+   if (!profileHasRelaxedConstructionParts(p)) return false;
+   return !hasPreAggrCacheDependency(p);
+}
+
+static bool profileCanUseAggregateRewriteBucket(const StateMatchProfile& p) {
+   if (!mlir::isa<subop::PreAggrHtType>(p.value.getType())) return false;
+   assert(profileHasSingleConstructionSink(p) && "eligible aggregate profile must have one construction sink");
+   return true;
+}
 
 /// Phase 1 output: per top-level-step state read/write (nested bodies merged into parent).
 struct ModuleStepRwAnalysis {
@@ -3152,6 +3235,37 @@ struct ConstructionResidualFilterSummary {
    bool supported = false;
    bool complex = false;
 };
+
+struct ConstructionSinkSummary {
+   unsigned sinkStepCount = 0;
+   unsigned sinkOpCount = 0;
+};
+
+static ConstructionSinkSummary constructionSinkSummary(
+   mlir::Value state, const ModuleMatchAndReuseAnalysis& module,
+   llvm::ArrayRef<int> constructionStepIndices) {
+   ConstructionSinkSummary out;
+   llvm::DenseSet<mlir::Value> constructionStates;
+   collectStateAndShadowConstructionStates(state, module, constructionStates);
+   for (int si : constructionStepIndices) {
+      auto itS = module.stepByIndex.find(si);
+      assert(itS != module.stepByIndex.end());
+      subop::ExecutionStepOp step = itS->second;
+      unsigned sinksInStep = 0;
+      step.walk([&](subop::MaterializeOp mat) {
+         if (constructionStates.contains(canonicalizeStateValueDeep(mat.getState()))) sinksInStep++;
+      });
+      step.walk([&](subop::ReduceOp reduce) {
+         mlir::Value st = stateWrittenByReduce(reduce);
+         if (st && constructionStates.contains(st)) sinksInStep++;
+      });
+      if (sinksInStep) {
+         out.sinkStepCount++;
+         out.sinkOpCount += sinksInStep;
+      }
+   }
+   return out;
+}
 
 static ConstructionResidualFilterSummary constructionResidualFilterSummary(
    mlir::Value state, const ModuleMatchAndReuseAnalysis& module,
@@ -3455,6 +3569,19 @@ static bool constructionStepHasMultipleWrites(int stepIdx, const ModuleStepRwAna
    return false;
 }
 
+static bool constructionShapeEligibleForReuse(
+   mlir::Value state, const ModuleMatchAndReuseAnalysis& module,
+   llvm::ArrayRef<int> constructionStepIndices,
+   const ModuleStepRwAnalysis& stepRw) {
+   ConstructionSinkSummary sinks = constructionSinkSummary(state, module, constructionStepIndices);
+   if (sinks.sinkStepCount != 1 || sinks.sinkOpCount != 1) return false;
+   for (int si : constructionStepIndices) {
+      if (constructionStepHasMultipleWrites(si, stepRw)) return false;
+   }
+   return !constructionHasTupleStreamSplitOnTargetMaterialize(canonicalizeStateValueDeep(state), module,
+                                                              constructionStepIndices, module.stepByIndex);
+}
+
 /// Phase 3: dependency-graph eligibility plus single-write construction constraint.
 static bool determineStateReuseEligibility(
    mlir::Value state, const StateDependencyGraph& depGraph,
@@ -3471,13 +3598,7 @@ static bool determineStateReuseEligibility(
    outDep = evaluateStateDepEligibility(stateCanon, depGraph, module.transparentStates, tableDescrByTableState);
    if (!outDep.eligible) return false;
 
-   for (int si : constructionStepIndices) {
-      if (constructionStepHasMultipleWrites(si, stepRw)) return false;
-   }
-   if (constructionHasTupleStreamSplitOnTargetMaterialize(stateCanon, module, constructionStepIndices,
-                                                          module.stepByIndex))
-      return false;
-   return true;
+   return constructionShapeEligibleForReuse(stateCanon, module, constructionStepIndices, stepRw);
 }
 
 /// Phase 4: construction hash and type fingerprint (eligible states only).
@@ -3584,6 +3705,9 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
       prof.depTokensSorted.assign(depElig.depTokensSorted.begin(), depElig.depTokensSorted.end());
 
       if (prof.eligible) {
+         ConstructionSinkSummary sinks = constructionSinkSummary(state, module, constructionStepIndices);
+         prof.constructionSinkStepCount = sinks.sinkStepCount;
+         prof.constructionSinkOpCount = sinks.sinkOpCount;
          ConstructionResidualFilterSummary residual =
             constructionResidualFilterSummary(state, module, constructionStepIndices, module.stepByIndex);
          prof.hasResidualTableFilter = residual.supported;
@@ -4784,869 +4908,1083 @@ llvm::DenseMap<const void*, uint64_t> collectStateConstructionColumnHashes(mlir:
    return out;
 }
 
+struct ExactFilterSubgroup {
+   llvm::SmallVector<const StateMatchProfile*, 4> members;
+   llvm::SmallVector<lingodb::runtime::FilterDescription, 8> simpleFilters;
+   std::string fingerprint;
+};
+
+struct DisjointExactFilterSubgroupCluster {
+   llvm::SmallVector<unsigned, 4> subgroupIndices;
+};
+
+struct SimpleFilterCluster {
+   unsigned root = 0;
+   llvm::SmallVector<const StateMatchProfile*, 8> members;
+};
+
+struct DisjointExactFilterClusterEmission {
+   llvm::SmallVector<const StateMatchProfile*, 8> members;
+   llvm::DenseMap<const StateMatchProfile*, unsigned> slotByProfile;
+   std::string keySuffix;
+};
+
+struct AdditionalFilterFingerprintOptions {
+   bool requireSimpleFilters = false;
+   bool includeFullAggregateDeps = false;
+   bool includeRelaxedFilterSources = false;
+};
+
+static std::optional<std::string> exactAdditionalFilterFingerprintForProfile(
+   const StateMatchProfile& p,
+   AdditionalFilterFingerprintOptions options,
+   llvm::function_ref<llvm::SmallVector<lingodb::runtime::FilterDescription, 8>(
+      const StateMatchProfile&)> simpleFiltersForProfile,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile,
+   llvm::SmallVectorImpl<lingodb::runtime::FilterDescription>& simpleFilters) {
+   simpleFilters = simpleFiltersForProfile(p);
+   if (options.requireSimpleFilters && simpleFilters.empty()) return std::nullopt;
+
+   std::string fingerprint;
+   if (!simpleFilters.empty())
+      fingerprint += "simple:" + matchFilterFingerprint(simpleFilters);
+   else
+      fingerprint += "simple:<none>";
+   if (options.includeRelaxedFilterSources) {
+      fingerprint += "@@residual=";
+      fingerprint += p.hasResidualTableFilter ? "1" : "0";
+      fingerprint += p.hasComplexResidualTableFilter ? ":complex" : ":simple";
+      fingerprint += p.hasUnsupportedResidualTableFilter ? ":unsupported" : ":supported";
+      std::string mixedPred = mixedPredFingerprintForProfile(p);
+      fingerprint += "@@mixed=";
+      fingerprint += mixedPred.empty() ? "<none>" : mixedPred;
+   }
+   if (options.includeFullAggregateDeps)
+      fingerprint += "@@full_dep=" + aggregateDependencyFingerprint(p.depTokensSorted);
+   return fingerprint;
+}
+
+static std::optional<llvm::SmallVector<ExactFilterSubgroup, 8>> buildExactAdditionalFilterSubgroups(
+   llvm::ArrayRef<const StateMatchProfile*> members,
+   AdditionalFilterFingerprintOptions options,
+   llvm::function_ref<llvm::SmallVector<lingodb::runtime::FilterDescription, 8>(
+      const StateMatchProfile&)> simpleFiltersForProfile,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile) {
+   llvm::SmallVector<ExactFilterSubgroup, 8> subgroups;
+   llvm::StringMap<unsigned> subgroupByFingerprint;
+   for (const StateMatchProfile* p : members) {
+      llvm::SmallVector<lingodb::runtime::FilterDescription, 8> simpleFilters;
+      std::optional<std::string> fingerprint = exactAdditionalFilterFingerprintForProfile(
+         *p, options, simpleFiltersForProfile, mixedPredFingerprintForProfile, simpleFilters);
+      if (!fingerprint) return std::nullopt;
+      auto it = subgroupByFingerprint.find(*fingerprint);
+      if (it == subgroupByFingerprint.end()) {
+         unsigned idx = subgroups.size();
+         subgroupByFingerprint[*fingerprint] = idx;
+         ExactFilterSubgroup subgroup;
+         subgroup.simpleFilters = std::move(simpleFilters);
+         subgroup.fingerprint = std::move(*fingerprint);
+         subgroup.members.push_back(p);
+         subgroups.push_back(std::move(subgroup));
+      } else {
+         subgroups[it->second].members.push_back(p);
+      }
+   }
+   return subgroups;
+}
+
+static llvm::SmallVector<DisjointExactFilterSubgroupCluster, 8>
+clusterExactFilterSubgroupsByDisjointness(llvm::ArrayRef<ExactFilterSubgroup> subgroups) {
+   llvm::SmallVector<DisjointExactFilterSubgroupCluster, 8> clusters;
+   for (unsigned subgroupIdx = 0; subgroupIdx < subgroups.size(); ++subgroupIdx) {
+      bool inserted = false;
+      for (DisjointExactFilterSubgroupCluster& cluster : clusters) {
+         bool disjointFromCluster = true;
+         for (unsigned existingIdx : cluster.subgroupIndices) {
+            if (!matchFiltersDefinitelyDisjoint(subgroups[subgroupIdx].simpleFilters,
+                                                subgroups[existingIdx].simpleFilters)) {
+               disjointFromCluster = false;
+               break;
+            }
+         }
+         if (!disjointFromCluster) continue;
+         cluster.subgroupIndices.push_back(subgroupIdx);
+         inserted = true;
+         break;
+      }
+      if (!inserted) {
+         DisjointExactFilterSubgroupCluster cluster;
+         cluster.subgroupIndices.push_back(subgroupIdx);
+         clusters.push_back(std::move(cluster));
+      }
+   }
+   return clusters;
+}
+
+static std::optional<DisjointExactFilterClusterEmission>
+buildDisjointExactFilterClusterEmission(
+   llvm::ArrayRef<ExactFilterSubgroup> subgroups,
+   const DisjointExactFilterSubgroupCluster& cluster) {
+   DisjointExactFilterClusterEmission out;
+   for (unsigned localSlot = 0; localSlot < cluster.subgroupIndices.size(); ++localSlot) {
+      const ExactFilterSubgroup& subgroup = subgroups[cluster.subgroupIndices[localSlot]];
+      out.keySuffix += "@@filter_subgroup=" + std::to_string(localSlot) + ":" +
+                       std::to_string(static_cast<size_t>(llvm::hash_value(llvm::StringRef(subgroup.fingerprint))));
+      for (const StateMatchProfile* p : subgroup.members) {
+         out.members.push_back(p);
+         out.slotByProfile[p] = localSlot;
+      }
+   }
+   if (cluster.subgroupIndices.size() == 1 && out.members.size() < 2) return std::nullopt;
+   return out;
+}
+
+static bool clusterNormalizedFiltersByColumn(
+   llvm::ArrayRef<const StateMatchProfile*> currentMembers,
+   llvm::ArrayRef<llvm::StringMap<MatchNormalizedColumnFilter>> normalizedByMember,
+   llvm::StringRef clusterColumn,
+   llvm::SmallVectorImpl<SimpleFilterCluster>& clusters) {
+   bool useNumeric = true;
+   bool useString = true;
+   for (auto& normalized : normalizedByMember) {
+      auto it = normalized.find(clusterColumn);
+      if (it == normalized.end()) return false;
+      const MatchNormalizedColumnFilter& filter = it->getValue();
+      assert(!((filter.hasNumericRange || filter.hasStringRange) && (filter.hasNumericIn || filter.hasStringIn)) &&
+             "simple filter preprocessing must collapse same-column range+IN into IN");
+      useNumeric = useNumeric && (filter.hasNumericIn || filter.hasNumericRange);
+      useString = useString && (filter.hasStringIn || filter.hasStringRange);
+   }
+   if (useNumeric == useString) return false;
+
+   llvm::SmallVector<unsigned, 8> parent;
+   parent.reserve(currentMembers.size());
+   for (unsigned i = 0; i < currentMembers.size(); ++i) parent.push_back(i);
+   std::function<unsigned(unsigned)> findRoot = [&](unsigned idx) -> unsigned {
+      if (parent[idx] == idx) return idx;
+      parent[idx] = findRoot(parent[idx]);
+      return parent[idx];
+   };
+   auto unite = [&](unsigned a, unsigned b) {
+      unsigned ra = findRoot(a);
+      unsigned rb = findRoot(b);
+      if (ra != rb) parent[rb] = ra;
+   };
+
+   if (useNumeric) {
+      std::map<double, unsigned> ownerByElement;
+      for (unsigned i = 0; i < currentMembers.size(); ++i) {
+         auto it = normalizedByMember[i].find(clusterColumn);
+         assert(it != normalizedByMember[i].end());
+         for (double v : it->getValue().numericIn) {
+            auto owner = ownerByElement.find(v);
+            if (owner == ownerByElement.end()) {
+               ownerByElement[v] = i;
+            } else {
+               unite(i, owner->second);
+            }
+         }
+      }
+
+      struct NumericRangeItem {
+         unsigned memberIdx;
+         MatchNumericFilterRange range;
+      };
+      llvm::SmallVector<NumericRangeItem, 8> ranges;
+      for (unsigned i = 0; i < currentMembers.size(); ++i) {
+         auto it = normalizedByMember[i].find(clusterColumn);
+         assert(it != normalizedByMember[i].end());
+         const MatchNormalizedColumnFilter& filter = it->getValue();
+         if (!filter.hasNumericRange) continue;
+         ranges.push_back({i, canonicalizeNumericRangeForClustering(filter.numericRange)});
+      }
+
+      auto firstElementInRange = [&](const MatchNumericFilterRange& range) {
+         if (!range.hasLower) return ownerByElement.begin();
+         return range.lowerInclusive ? ownerByElement.lower_bound(range.lower)
+                                     : ownerByElement.upper_bound(range.lower);
+      };
+      auto endElementInRange = [&](const MatchNumericFilterRange& range) {
+         if (!range.hasUpper) return ownerByElement.end();
+         return range.upperInclusive ? ownerByElement.upper_bound(range.upper)
+                                     : ownerByElement.lower_bound(range.upper);
+      };
+      for (const NumericRangeItem& item : ranges) {
+         for (auto owner = firstElementInRange(item.range), end = endElementInRange(item.range);
+              owner != end; ++owner) {
+            unite(item.memberIdx, owner->second);
+         }
+      }
+
+      llvm::sort(ranges, [](const NumericRangeItem& a, const NumericRangeItem& b) {
+         if (a.range.hasLower != b.range.hasLower) return !a.range.hasLower;
+         if (!a.range.hasLower) return false;
+         if (a.range.lower != b.range.lower) return a.range.lower < b.range.lower;
+         return a.range.lowerInclusive && !b.range.lowerInclusive;
+      });
+      bool hasCurrent = false;
+      unsigned currentOwner = 0;
+      MatchNumericFilterRange currentRange;
+      for (const NumericRangeItem& item : ranges) {
+         if (!hasCurrent) {
+            currentOwner = item.memberIdx;
+            currentRange = item.range;
+            hasCurrent = true;
+            continue;
+         }
+         if (matchRangesAreDisjoint(currentRange, item.range)) {
+            currentOwner = item.memberIdx;
+            currentRange = item.range;
+         } else {
+            unite(currentOwner, item.memberIdx);
+            unionNumericRangeInto(currentRange, item.range);
+         }
+      }
+   } else {
+      std::map<std::string, unsigned> ownerByElement;
+      for (unsigned i = 0; i < currentMembers.size(); ++i) {
+         auto it = normalizedByMember[i].find(clusterColumn);
+         assert(it != normalizedByMember[i].end());
+         for (const std::string& v : it->getValue().stringIn) {
+            auto owner = ownerByElement.find(v);
+            if (owner == ownerByElement.end()) {
+               ownerByElement[v] = i;
+            } else {
+               unite(i, owner->second);
+            }
+         }
+      }
+
+      struct StringRangeItem {
+         unsigned memberIdx;
+         MatchStringFilterRange range;
+      };
+      llvm::SmallVector<StringRangeItem, 8> ranges;
+      for (unsigned i = 0; i < currentMembers.size(); ++i) {
+         auto it = normalizedByMember[i].find(clusterColumn);
+         assert(it != normalizedByMember[i].end());
+         const MatchNormalizedColumnFilter& filter = it->getValue();
+         if (!filter.hasStringRange) continue;
+         ranges.push_back({i, canonicalizeStringRangeForClustering(filter.stringRange)});
+      }
+
+      auto firstElementInRange = [&](const MatchStringFilterRange& range) {
+         if (!range.lower) return ownerByElement.begin();
+         return range.lowerInclusive ? ownerByElement.lower_bound(*range.lower)
+                                     : ownerByElement.upper_bound(*range.lower);
+      };
+      auto endElementInRange = [&](const MatchStringFilterRange& range) {
+         if (!range.upper) return ownerByElement.end();
+         return range.upperInclusive ? ownerByElement.upper_bound(*range.upper)
+                                     : ownerByElement.lower_bound(*range.upper);
+      };
+      for (const StringRangeItem& item : ranges) {
+         for (auto owner = firstElementInRange(item.range), end = endElementInRange(item.range);
+              owner != end; ++owner) {
+            unite(item.memberIdx, owner->second);
+         }
+      }
+
+      llvm::sort(ranges, [](const StringRangeItem& a, const StringRangeItem& b) {
+         if (a.range.lower.has_value() != b.range.lower.has_value()) return !a.range.lower.has_value();
+         if (!a.range.lower) return false;
+         if (*a.range.lower != *b.range.lower) return *a.range.lower < *b.range.lower;
+         return a.range.lowerInclusive && !b.range.lowerInclusive;
+      });
+      bool hasCurrent = false;
+      unsigned currentOwner = 0;
+      MatchStringFilterRange currentRange;
+      for (const StringRangeItem& item : ranges) {
+         if (!hasCurrent) {
+            currentOwner = item.memberIdx;
+            currentRange = item.range;
+            hasCurrent = true;
+            continue;
+         }
+         if (matchStringRangesAreDisjoint(currentRange, item.range)) {
+            currentOwner = item.memberIdx;
+            currentRange = item.range;
+         } else {
+            unite(currentOwner, item.memberIdx);
+            unionStringRangeInto(currentRange, item.range);
+         }
+      }
+   }
+
+   llvm::DenseMap<unsigned, unsigned> clusterByRoot;
+   for (unsigned i = 0; i < currentMembers.size(); ++i) {
+      unsigned root = findRoot(i);
+      auto it = clusterByRoot.find(root);
+      if (it == clusterByRoot.end()) {
+         unsigned pos = clusters.size();
+         clusters.push_back(SimpleFilterCluster{root, {}});
+         it = clusterByRoot.try_emplace(root, pos).first;
+      }
+      clusters[it->second].members.push_back(currentMembers[i]);
+   }
+   return true;
+}
+
+static std::optional<llvm::SmallVector<llvm::StringMap<MatchNormalizedColumnFilter>, 8>>
+buildNormalizedFiltersForProfiles(
+   llvm::ArrayRef<const StateMatchProfile*> members,
+   llvm::function_ref<llvm::SmallVector<lingodb::runtime::FilterDescription, 8>(
+      const StateMatchProfile&)> simpleFiltersForProfile) {
+   llvm::SmallVector<llvm::StringMap<MatchNormalizedColumnFilter>, 8> normalizedByMember;
+   normalizedByMember.reserve(members.size());
+   for (const StateMatchProfile* p : members) {
+      llvm::SmallVector<lingodb::runtime::FilterDescription, 8> filters = simpleFiltersForProfile(*p);
+      if (filters.empty()) return std::nullopt;
+      normalizedByMember.push_back(preprocessSimpleMatchFilters(filters));
+   }
+   return normalizedByMember;
+}
+
+static bool decomposeSimpleFilterClustersAndEmit(
+   llvm::ArrayRef<const StateMatchProfile*> members,
+   llvm::function_ref<llvm::SmallVector<lingodb::runtime::FilterDescription, 8>(
+      const StateMatchProfile&)> simpleFiltersForProfile,
+   llvm::function_ref<void(llvm::ArrayRef<const StateMatchProfile*>, llvm::StringRef)> emitCluster) {
+   if (members.size() < 2) return false;
+
+   bool emittedAny = false;
+   std::function<void(llvm::ArrayRef<const StateMatchProfile*>, std::optional<std::string>, std::string)>
+      decomposeAndEmit = [&](llvm::ArrayRef<const StateMatchProfile*> currentMembers,
+                             std::optional<std::string> skipColumn,
+                             std::string keySuffix) {
+         if (currentMembers.size() == 1) return;
+
+         auto normalizedStorage = buildNormalizedFiltersForProfiles(currentMembers, simpleFiltersForProfile);
+         if (normalizedStorage) {
+            auto& normalizedByMember = *normalizedStorage;
+            for (auto& firstEntry : normalizedByMember.front()) {
+               llvm::StringRef col = firstEntry.getKey();
+               if (skipColumn && col == *skipColumn) continue;
+               llvm::SmallVector<SimpleFilterCluster, 8> clusters;
+               if (!clusterNormalizedFiltersByColumn(currentMembers, normalizedByMember, col, clusters)) continue;
+               if (clusters.size() < 2) continue;
+
+               for (const SimpleFilterCluster& cluster : clusters) {
+                  std::string childSuffix = keySuffix + "@@simple_filter_cluster=" + col.str() + "#" +
+                                            std::to_string(cluster.root);
+                  decomposeAndEmit(cluster.members, col.str(), std::move(childSuffix));
+               }
+               emittedAny = true;
+               return;
+            }
+         }
+
+         emitCluster(currentMembers, keySuffix);
+         emittedAny = true;
+      };
+
+   decomposeAndEmit(members, std::nullopt, "");
+   return emittedAny;
+}
+
+static bool matchProfilesSupportExactFilterDisjointClustering(
+   llvm::ArrayRef<const StateMatchProfile*> members) {
+   for (const StateMatchProfile* p : members) {
+      if (!mlir::isa<subop::HashIndexedViewType, subop::PreAggrHtType>(p->value.getType())) return false;
+      if (!profileHasSingleConstructionSink(*p)) return false;
+   }
+   return true;
+}
+
+static bool decomposeExactFilterDisjointClustersAndEmit(
+   llvm::ArrayRef<const StateMatchProfile*> members,
+   bool allowMixedReuse,
+   llvm::function_ref<llvm::SmallVector<lingodb::runtime::FilterDescription, 8>(
+      const StateMatchProfile&)> simpleFiltersForProfile,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile,
+   llvm::function_ref<void(llvm::ArrayRef<const StateMatchProfile*>, llvm::StringRef,
+                           const llvm::DenseMap<const StateMatchProfile*, unsigned>&, bool)> emitCluster) {
+   if (members.size() < 2) return false;
+   if (!matchProfilesSupportExactFilterDisjointClustering(members)) return false;
+
+   std::optional<llvm::SmallVector<ExactFilterSubgroup, 8>> subgroupStorage =
+      buildExactAdditionalFilterSubgroups(
+         members,
+         AdditionalFilterFingerprintOptions{
+            /*requireSimpleFilters=*/true,
+            /*includeFullAggregateDeps=*/mlir::isa<subop::PreAggrHtType>(members.front()->value.getType()),
+            /*includeRelaxedFilterSources=*/false},
+         simpleFiltersForProfile, mixedPredFingerprintForProfile);
+   if (!subgroupStorage) return false;
+   llvm::SmallVector<ExactFilterSubgroup, 8>& subgroups = *subgroupStorage;
+   if (subgroups.empty()) return false;
+
+   bool emittedAny = false;
+   llvm::SmallVector<DisjointExactFilterSubgroupCluster, 8> disjointClusters =
+      clusterExactFilterSubgroupsByDisjointness(subgroups);
+   for (const DisjointExactFilterSubgroupCluster& cluster : disjointClusters) {
+      std::optional<DisjointExactFilterClusterEmission> emission =
+         buildDisjointExactFilterClusterEmission(subgroups, cluster);
+      if (!emission) continue;
+      bool mixedReuse = allowMixedReuse && cluster.subgroupIndices.size() > 1;
+      emitCluster(emission->members, emission->keySuffix, emission->slotByProfile, mixedReuse);
+      emittedAny = true;
+   }
+   return emittedAny;
+}
+
+static bool profileHasCacheDependencyToken(const StateMatchProfile& p) {
+   return llvm::any_of(p.depTokensSorted, [](llvm::StringRef dep) {
+      return dep.starts_with("cache:");
+   });
+}
+
+static bool matchGroupProfilesAllHiv(llvm::ArrayRef<const StateMatchProfile*> members) {
+   return llvm::all_of(members, [](const StateMatchProfile* p) {
+      return mlir::isa<subop::HashIndexedViewType>(p->value.getType());
+   });
+}
+
+static void appendMatchGroupCacheDeps(CrossQueryStateMatchGroup& group,
+                                      llvm::ArrayRef<const StateMatchProfile*> members) {
+   llvm::DenseSet<uint64_t> seenCacheDeps;
+   for (const StateMatchProfile* p : members) {
+      for (llvm::StringRef dep : p->depTokensSorted) {
+         if (std::optional<uint64_t> cacheKey = parseCacheDepToken(dep)) {
+            if (seenCacheDeps.insert(*cacheKey).second) group.cacheDeps.push_back(*cacheKey);
+         }
+      }
+   }
+}
+
+static bool hivMatchGroupNeedsFilterPredReuse(
+   llvm::ArrayRef<const StateMatchProfile*> members,
+   llvm::function_ref<bool(const StateMatchProfile&)> hasSimpleMatchFilters) {
+   for (const StateMatchProfile* p : members) {
+      if (p->hasResidualTableFilter || p->hasComplexResidualTableFilter) return true;
+      if (hasSimpleMatchFilters(*p)) return true;
+      if (profileHasCacheDependencyToken(*p)) return true;
+   }
+   return false;
+}
+
+static void appendCrossQueryMatchGroup(
+   MatchGroupEmissionContext& ctx,
+   llvm::ArrayRef<const StateMatchProfile*> members,
+   const StateMatchProfile& keySeed,
+   llvm::StringRef keySuffix,
+   llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
+   MatchGroupEmitOptions options,
+   llvm::function_ref<bool(const StateMatchProfile&)> hasSimpleMatchFilters) {
+   assert(members.size() >= 2 && "singleton clusters must not be materialized as reuse groups");
+   std::string k = keyForSeed(keySeed);
+   k.append(keySuffix.data(), keySuffix.size());
+
+   CrossQueryStateMatchGroup group;
+   group.cacheKey = allocateMatchGroupCacheKey(ctx, llvm::StringRef(k));
+   appendMatchGroupCacheDeps(group, members);
+
+   bool allHiv = matchGroupProfilesAllHiv(members);
+   if (allHiv) group.requiresJoinLayoutUnion = true;
+   if (options.forceSplitMaterialize) group.requiresSplitMaterialize = true;
+   if (allHiv) group.requiresSplitMaterialize = false;
+
+   bool needsFilterPredReuse = options.enableFilterPredReuse;
+   if (needsFilterPredReuse && allHiv)
+      needsFilterPredReuse = hivMatchGroupNeedsFilterPredReuse(members, hasSimpleMatchFilters);
+   group.enableFilterPredReuse = needsFilterPredReuse;
+   if (allHiv && needsFilterPredReuse) group.requiresJoinLayoutUnion = true;
+   if (group.requiresSplitMaterialize) {
+      group.enableFilterPredReuse = false;
+      group.requiresJoinLayoutUnion = false;
+   }
+
+   for (const StateMatchProfile* p : members) {
+      unsigned reuseSlot = static_cast<unsigned>(p->queryId);
+      if (options.reuseSlotByProfile) {
+         auto itSlot = options.reuseSlotByProfile->find(p);
+         assert(itSlot != options.reuseSlotByProfile->end() && "subgrouped match entry must have a reuse slot");
+         reuseSlot = itSlot->second;
+      }
+      group.entries.push_back(CrossQueryStateMatchEntry{p->queryId, p->value, reuseSlot});
+      ctx.matchedStates.insert(p->value);
+   }
+   ctx.out.push_back(std::move(group));
+}
+
+static void appendMatchGroupsFromBucket(
+   llvm::ArrayRef<const StateMatchProfile*> bucket,
+   const llvm::DenseSet<mlir::Value>& matchedStates,
+   llvm::function_ref<bool(const StateMatchProfile&)> seedOk,
+   llvm::function_ref<bool(const StateMatchProfile&, const StateMatchProfile&)> peerOk,
+   llvm::function_ref<void(llvm::ArrayRef<const StateMatchProfile*>, const StateMatchProfile&)> emitMembers) {
+   for (size_t i = 0; i < bucket.size(); i++) {
+      const StateMatchProfile* a = bucket[i];
+      if (matchedStates.contains(a->value)) continue;
+      if (!seedOk(*a)) continue;
+
+      llvm::SmallVector<const StateMatchProfile*, 8> members;
+      members.push_back(a);
+      llvm::DenseSet<int> seenQueries;
+      seenQueries.insert(a->queryId);
+      for (size_t j = i + 1; j < bucket.size(); j++) {
+         const StateMatchProfile* b = bucket[j];
+         if (matchedStates.contains(b->value)) continue;
+         if (seenQueries.contains(b->queryId)) continue;
+         bool okWithGroup = true;
+         for (const StateMatchProfile* existing : members) {
+            if (!peerOk(*existing, *b)) {
+               okWithGroup = false;
+               break;
+            }
+         }
+         if (!okWithGroup) continue;
+         members.push_back(b);
+         seenQueries.insert(b->queryId);
+      }
+      if (members.size() < 2) continue;
+      emitMembers(members, *a);
+   }
+}
+
+static void appendMatchGroupsFromBucketSet(
+   const StateMatchProfileBucketSet& bucketSet,
+   const llvm::DenseSet<mlir::Value>& matchedStates,
+   llvm::function_ref<bool(const StateMatchProfile&)> seedOk,
+   llvm::function_ref<bool(const StateMatchProfile&, const StateMatchProfile&)> peerOk,
+   llvm::function_ref<void(llvm::ArrayRef<const StateMatchProfile*>, const StateMatchProfile&)> emitMembers) {
+   for (uint64_t hash : bucketSet.order) {
+      auto bucketIt = bucketSet.buckets.find(hash);
+      assert(bucketIt != bucketSet.buckets.end());
+      appendMatchGroupsFromBucket(bucketIt->second, matchedStates, seedOk, peerOk, emitMembers);
+   }
+}
+
+static void emitClusteredCrossQueryMatchGroup(
+   MatchGroupEmissionContext& emitContext,
+   const StateReuseMatchOptions& matchOptions,
+   llvm::ArrayRef<const StateMatchProfile*> members,
+   const StateMatchProfile& seed,
+   llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
+   bool enableFilterPredReuse,
+   bool forceSplitMaterialize,
+   llvm::function_ref<llvm::SmallVector<lingodb::runtime::FilterDescription, 8>(
+      const StateMatchProfile&)> simpleFiltersForProfile,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile,
+   llvm::function_ref<bool(const StateMatchProfile&)> hasSimpleFiltersForProfile) {
+   assert(members.size() >= 2 && "match group emission requires at least two members");
+
+   auto emitMatchGroup = [&](llvm::ArrayRef<const StateMatchProfile*> groupedMembers,
+                             const StateMatchProfile& keySeed,
+                             llvm::StringRef keySuffix,
+                             MatchGroupEmitOptions options) {
+      appendCrossQueryMatchGroup(emitContext, groupedMembers, keySeed, keySuffix, keyForSeed, options,
+                                 hasSimpleFiltersForProfile);
+   };
+
+   const bool allHiv = matchGroupProfilesAllHiv(members);
+   const bool hivDisjointClusteringDisabled =
+      matchOptions.disableHivDisjointClustering && allHiv;
+   if (forceSplitMaterialize) {
+      emitMatchGroup(members, seed, "",
+                     MatchGroupEmitOptions{/*enableFilterPredReuse=*/enableFilterPredReuse,
+                                           /*forceSplitMaterialize=*/true});
+      return;
+   }
+
+   if (!hivDisjointClusteringDisabled) {
+      bool emittedExactDisjoint = decomposeExactFilterDisjointClustersAndEmit(
+         members, enableFilterPredReuse, simpleFiltersForProfile, mixedPredFingerprintForProfile,
+         [&](llvm::ArrayRef<const StateMatchProfile*> groupedMembers, llvm::StringRef keySuffix,
+             const llvm::DenseMap<const StateMatchProfile*, unsigned>& slotByProfile, bool mixedReuse) {
+            emitMatchGroup(groupedMembers, *groupedMembers.front(), keySuffix,
+                           MatchGroupEmitOptions{/*enableFilterPredReuse=*/mixedReuse,
+                                                 /*forceSplitMaterialize=*/false,
+                                                 /*reuseSlotByProfile=*/&slotByProfile});
+         });
+      if (emittedExactDisjoint) return;
+   }
+
+   if (hivDisjointClusteringDisabled) {
+      emitMatchGroup(members, seed, "",
+                     MatchGroupEmitOptions{/*enableFilterPredReuse=*/enableFilterPredReuse});
+      return;
+   }
+
+   bool emittedSimpleClusters = decomposeSimpleFilterClustersAndEmit(
+      members, simpleFiltersForProfile,
+      [&](llvm::ArrayRef<const StateMatchProfile*> currentMembers, llvm::StringRef keySuffix) {
+         emitMatchGroup(currentMembers, *currentMembers.front(), keySuffix,
+                        MatchGroupEmitOptions{/*enableFilterPredReuse=*/enableFilterPredReuse});
+      });
+   if (emittedSimpleClusters) return;
+
+   emitMatchGroup(members, seed, "",
+                  MatchGroupEmitOptions{/*enableFilterPredReuse=*/enableFilterPredReuse});
+}
+
+static void appendClusteredMatchGroupsFromBucketSet(
+   const StateMatchProfileBucketSet& bucketSet,
+   MatchGroupEmissionContext& emitContext,
+   const StateReuseMatchOptions& matchOptions,
+   llvm::function_ref<bool(const StateMatchProfile&)> seedOk,
+   llvm::function_ref<bool(const StateMatchProfile&, const StateMatchProfile&)> peerOk,
+   llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
+   bool enableFilterPredReuse,
+   bool forceSplitMaterialize,
+   llvm::function_ref<llvm::SmallVector<lingodb::runtime::FilterDescription, 8>(
+      const StateMatchProfile&)> simpleFiltersForProfile,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile,
+   llvm::function_ref<bool(const StateMatchProfile&)> hasSimpleFiltersForProfile) {
+   appendMatchGroupsFromBucketSet(
+      bucketSet, emitContext.matchedStates, seedOk, peerOk,
+      [&](llvm::ArrayRef<const StateMatchProfile*> members, const StateMatchProfile& seed) {
+         emitClusteredCrossQueryMatchGroup(
+            emitContext, matchOptions, members, seed, keyForSeed, enableFilterPredReuse,
+            forceSplitMaterialize, simpleFiltersForProfile, mixedPredFingerprintForProfile,
+            hasSimpleFiltersForProfile);
+      });
+}
+
+struct QueryMatchModel {
+   int id = -1;
+   mlir::ModuleOp module;
+   llvm::DenseMap<mlir::Value, std::string> tableDescr;
+   llvm::DenseMap<uint64_t, mlir::Type> cacheGetTypeByKey;
+   llvm::SmallVector<StateMatchProfile, 128> profiles;
+   ModuleReuseInfo reuse;
+};
+
+static llvm::SmallVector<QueryMatchModel, 4>
+buildQueryMatchModels(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> queries) {
+   llvm::SmallVector<QueryMatchModel, 4> models;
+   models.reserve(queries.size());
+   for (auto& q : queries) {
+      QueryMatchModel model;
+      model.id = q.first;
+      model.module = q.second;
+      model.tableDescr = buildTableDescrByTableState(model.module);
+      model.profiles = buildStateMatchProfiles(model.id, model.module, model.tableDescr);
+      model.reuse = collectModuleReuseInfo(model.module);
+      model.module.walk([&](subop::CacheGetOp get) {
+         model.cacheGetTypeByKey[static_cast<uint64_t>(get.getKey())] = get.getResult().getType();
+      });
+      models.push_back(std::move(model));
+   }
+   return models;
+}
+
+static llvm::SmallVector<const StateMatchProfile*, 256>
+collectEligibleMatchProfiles(llvm::ArrayRef<QueryMatchModel> models) {
+   llvm::SmallVector<const StateMatchProfile*, 256> all;
+   for (const QueryMatchModel& model : models) {
+      for (const StateMatchProfile& profile : model.profiles) {
+         if (!profile.eligible) continue;
+         all.push_back(&profile);
+      }
+   }
+   return all;
+}
+
+static llvm::DenseMap<int, const QueryMatchModel*>
+buildModelByQueryId(llvm::ArrayRef<QueryMatchModel> models) {
+   llvm::DenseMap<int, const QueryMatchModel*> modelByQueryId;
+   for (const QueryMatchModel& model : models) {
+      modelByQueryId[model.id] = &model;
+   }
+   return modelByQueryId;
+}
+
+static std::string buildMixedPredFingerprintForProfile(
+   const StateMatchProfile& profile,
+   const llvm::DenseMap<int, const QueryMatchModel*>& modelByQueryId) {
+   llvm::SmallVector<std::string, 8> parts;
+   if (!profile.mixedHivLookupPredFingerprint.empty()) {
+      llvm::SmallVector<llvm::StringRef, 8> split;
+      llvm::StringRef(profile.mixedHivLookupPredFingerprint).split(split, '|');
+      for (llvm::StringRef part : split) {
+         if (!part.empty()) parts.push_back(part.str());
+      }
+   }
+   const QueryMatchModel* model = modelByQueryId.lookup(profile.queryId);
+   assert(model && "missing query model for profile");
+   for (llvm::StringRef dep : profile.depTokensSorted) {
+      std::optional<uint64_t> key = parseCacheDepToken(dep);
+      if (!key) continue;
+      auto it = model->cacheGetTypeByKey.find(*key);
+      assert(it != model->cacheGetTypeByKey.end() && "cache dependency must resolve to a cache_get type");
+      std::string pred = mixedPredSelectionFingerprintFromStateType(it->second);
+      if (!pred.empty()) parts.push_back(std::move(pred));
+   }
+   llvm::sort(parts);
+   parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
+   std::string out;
+   for (llvm::StringRef part : parts) {
+      if (!out.empty()) out.push_back('|');
+      out += part;
+   }
+   return out;
+}
+
+static std::string joinedDependencyTokens(llvm::ArrayRef<std::string> depsSorted) {
+   std::string deps;
+   for (const std::string& dep : depsSorted) {
+      if (!deps.empty()) deps.push_back('|');
+      deps.append(dep);
+   }
+   return deps;
+}
+
+static std::string mixedLookupSuffixForCacheDependentProfile(
+   const StateMatchProfile& profile,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile) {
+   if (!profileHasCacheDependencyToken(profile)) return "";
+   return "@@mixed_lookup=" + mixedPredFingerprintForProfile(profile);
+}
+
+static bool profileHasPreAggrCacheDependency(
+   const StateMatchProfile& profile,
+   const llvm::DenseMap<int, const QueryMatchModel*>& modelByQueryId) {
+   const QueryMatchModel* model = modelByQueryId.lookup(profile.queryId);
+   assert(model && "missing query model for profile");
+   for (llvm::StringRef dep : profile.depTokensSorted) {
+      std::optional<uint64_t> key = parseCacheDepToken(dep);
+      if (!key) continue;
+      auto it = model->cacheGetTypeByKey.find(*key);
+      assert(it != model->cacheGetTypeByKey.end() && "cache dependency must resolve to a cache_get type");
+      if (mlir::isa<subop::PreAggrHtType>(it->second)) return true;
+   }
+   return false;
+}
+
+static llvm::SmallVector<lingodb::runtime::FilterDescription, 8>
+decodeSimpleFiltersForProfile(
+   const StateMatchProfile& profile,
+   const llvm::DenseMap<int, const QueryMatchModel*>& modelByQueryId) {
+   const QueryMatchModel* model = modelByQueryId.lookup(profile.queryId);
+   assert(model && "missing query model for profile");
+   return decodeSimpleMatchFiltersAlongShadowChain(profile.value, model->reuse);
+}
+
+static bool profilesAllowComplexResidualFilterMatch(const StateMatchProfile& a,
+                                                    const QueryMatchModel& modelA,
+                                                    const StateMatchProfile& b,
+                                                    const QueryMatchModel& modelB) {
+   if (!a.hasComplexResidualTableFilter && !b.hasComplexResidualTableFilter) return true;
+   if (!a.hasResidualTableFilter || !b.hasResidualTableFilter) return true;
+   if (a.hasComplexResidualTableFilter && b.hasComplexResidualTableFilter) return true;
+   return !decodeSimpleMatchFiltersAlongShadowChain(a.value, modelA.reuse).empty() ||
+          !decodeSimpleMatchFiltersAlongShadowChain(b.value, modelB.reuse).empty();
+}
+
+static bool profilesAllowRelaxedHivPayloadUnion(
+   const StateMatchProfile& a,
+   const StateMatchProfile& b,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile) {
+   if (!profileHasCacheDependencyToken(a) && !profileHasCacheDependencyToken(b)) return true;
+   if (a.hasResidualTableFilter && b.hasResidualTableFilter &&
+       !a.hasUnsupportedResidualTableFilter && !b.hasUnsupportedResidualTableFilter)
+      return true;
+   std::string fpA = mixedPredFingerprintForProfile(a);
+   std::string fpB = mixedPredFingerprintForProfile(b);
+   if (fpA.empty() || fpB.empty()) return false;
+   if (mixedHivLookupPredFingerprintUsesUnion(fpA) ||
+       mixedHivLookupPredFingerprintUsesUnion(fpB))
+      return false;
+   return fpA == fpB;
+}
+
+static bool profilesAllowAggregateMixedPredDisjointReuse(
+   const StateMatchProfile& a,
+   const StateMatchProfile& b,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile) {
+   if (!profileHasCacheDependencyToken(a) && !profileHasCacheDependencyToken(b)) return true;
+   std::string fpA = mixedPredFingerprintForProfile(a);
+   std::string fpB = mixedPredFingerprintForProfile(b);
+   if (fpA.empty() || fpB.empty()) return false;
+   if (mixedHivLookupPredFingerprintUsesUnion(fpA) ||
+       mixedHivLookupPredFingerprintUsesUnion(fpB))
+      return false;
+   return true;
+}
+
+static bool profilesAllowAggregateMixedPredExactReuse(
+   const StateMatchProfile& a,
+   const StateMatchProfile& b,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile) {
+   if (!profilesAllowAggregateMixedPredDisjointReuse(a, b, mixedPredFingerprintForProfile)) return false;
+   if (!profileHasCacheDependencyToken(a) && !profileHasCacheDependencyToken(b)) return true;
+   return mixedPredFingerprintForProfile(a) == mixedPredFingerprintForProfile(b);
+}
+
+static bool profilesShareAggregateNoFilterIdentity(const StateMatchProfile& a,
+                                                   const StateMatchProfile& b) {
+   if (!mlir::isa<subop::PreAggrHtType>(b.value.getType())) return false;
+   if (aggregateDependencyNoFilterFingerprint(a.depTokensSorted) !=
+       aggregateDependencyNoFilterFingerprint(b.depTokensSorted))
+      return false;
+   return a.aggregateGroupKeyFingerprint == b.aggregateGroupKeyFingerprint;
+}
+
+static bool profilesAllowAggregateDisjointFilterReuse(
+   const StateMatchProfile& a,
+   const StateMatchProfile& b,
+   const llvm::DenseMap<int, const QueryMatchModel*>& modelByQueryId,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile) {
+   if (!profilesShareAggregateNoFilterIdentity(a, b)) return false;
+   llvm::SmallVector<lingodb::runtime::FilterDescription, 8> filtersA =
+      decodeSimpleFiltersForProfile(a, modelByQueryId);
+   llvm::SmallVector<lingodb::runtime::FilterDescription, 8> filtersB =
+      decodeSimpleFiltersForProfile(b, modelByQueryId);
+   if (filtersA.empty() || filtersB.empty()) return false;
+   if (matchFilterFingerprint(filtersA) == matchFilterFingerprint(filtersB))
+      return profilesAllowAggregateMixedPredExactReuse(a, b, mixedPredFingerprintForProfile);
+   if (matchFiltersDefinitelyDisjoint(filtersA, filtersB))
+      return profilesAllowAggregateMixedPredDisjointReuse(a, b, mixedPredFingerprintForProfile);
+   return false;
+}
+
+static bool profilesAllowAggregateSplitMaterializeReuse(
+   const StateMatchProfile& a,
+   const StateMatchProfile& b,
+   const llvm::DenseMap<int, const QueryMatchModel*>& modelByQueryId) {
+   if (!profilesShareAggregateNoFilterIdentity(a, b)) return false;
+   if (a.hasUnsupportedResidualTableFilter || b.hasUnsupportedResidualTableFilter) return false;
+   llvm::SmallVector<lingodb::runtime::FilterDescription, 8> filtersA =
+      decodeSimpleFiltersForProfile(a, modelByQueryId);
+   llvm::SmallVector<lingodb::runtime::FilterDescription, 8> filtersB =
+      decodeSimpleFiltersForProfile(b, modelByQueryId);
+   return !filtersA.empty() || !filtersB.empty() ||
+          a.hasResidualTableFilter || b.hasResidualTableFilter ||
+          profileHasCacheDependencyToken(a) || profileHasCacheDependencyToken(b);
+}
+
+static bool profilesAllowAggregateExactReuse(
+   const StateMatchProfile& a,
+   const StateMatchProfile& b,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile) {
+   if (!mlir::isa<subop::PreAggrHtType>(b.value.getType())) return false;
+   if (!profileCanUseAggregateRewriteBucket(b)) return false;
+   if (aggregateDependencyFingerprint(a.depTokensSorted) != aggregateDependencyFingerprint(b.depTokensSorted))
+      return false;
+   if (!profilesAllowAggregateMixedPredExactReuse(a, b, mixedPredFingerprintForProfile)) return false;
+   return a.aggregateGroupKeyFingerprint == b.aggregateGroupKeyFingerprint;
+}
+
+static std::string constructionMatchKey(
+   const StateMatchProfile& profile,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile) {
+   return joinedDependencyTokens(profile.depTokensSorted) + "@@type=" + profile.typeFingerprintStr +
+          "@@h=" + std::to_string(profile.constructionHash) +
+          mixedLookupSuffixForCacheDependentProfile(profile, mixedPredFingerprintForProfile);
+}
+
+static std::string relaxedHivMatchKey(const StateMatchProfile& profile) {
+   return joinedDependencyTokens(profile.depTokensSorted) + "@@type=" + profile.typeFingerprintStr +
+          "@@hiv_relaxed";
+}
+
+static std::string splitMaterializeMatchKey(const StateMatchProfile& profile) {
+   return aggregateDependencyNoFilterFingerprint(profile.depTokensSorted) + "@@type=" +
+          profile.typeFingerprintStr + "@@h=" + std::to_string(profile.constructionHash) +
+          "@@split_materialize";
+}
+
+static std::string aggregateMatchKey(const StateMatchProfile& profile) {
+   return aggregateDependencyFingerprint(profile.depTokensSorted) + "@@agg=" +
+          profile.aggregateGroupKeyFingerprint;
+}
+
+static std::string aggregateNoFilterMatchKey(const StateMatchProfile& profile) {
+   return aggregateDependencyNoFilterFingerprint(profile.depTokensSorted) + "@@agg=" +
+          profile.aggregateGroupKeyFingerprint + "@@disjoint_filters";
+}
+
 llvm::SmallVector<CrossQueryStateMatchGroup, 64>
 collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> queries) {
    assert(queries.size() >= 2 && "need at least two modules to compare");
-   const bool disableHivDisjointClustering = std::getenv("LINGODB_DISABLE_HIV_DISJOINT_CLUSTERING") != nullptr;
+   const StateReuseMatchOptions matchOptions = readStateReuseMatchOptions();
 
-   struct QueryModel {
-      int id = -1;
-      mlir::ModuleOp module;
-      llvm::DenseMap<mlir::Value, std::string> tableDescr;
-      llvm::DenseMap<uint64_t, mlir::Type> cacheGetTypeByKey;
-      llvm::SmallVector<StateMatchProfile, 128> profiles;
-      ModuleReuseInfo reuse;
-   };
+   llvm::SmallVector<QueryMatchModel, 4> models = buildQueryMatchModels(queries);
+   llvm::SmallVector<const StateMatchProfile*, 256> all = collectEligibleMatchProfiles(models);
+   llvm::DenseMap<int, const QueryMatchModel*> modelByQueryId = buildModelByQueryId(models);
 
-   llvm::SmallVector<QueryModel, 4> models;
-   models.reserve(queries.size());
-   for (auto& q : queries) {
-      QueryModel m;
-      m.id = q.first;
-      m.module = q.second;
-      m.tableDescr = buildTableDescrByTableState(m.module);
-      m.profiles = buildStateMatchProfiles(m.id, m.module, m.tableDescr);
-      m.reuse = collectModuleReuseInfo(m.module);
-      m.module.walk([&](subop::CacheGetOp get) {
-         m.cacheGetTypeByKey[static_cast<uint64_t>(get.getKey())] = get.getResult().getType();
-      });
-      models.push_back(std::move(m));
-   }
-
-   llvm::SmallVector<const StateMatchProfile*, 256> all;
-   llvm::DenseMap<int, const QueryModel*> modelByQueryId;
-   for (auto& m : models) {
-      modelByQueryId[m.id] = &m;
-      for (auto& p : m.profiles) {
-         if (!p.eligible) continue;
-         all.push_back(&p);
-      }
-   }
-
-   auto profileHasCacheDependency = [](const StateMatchProfile& p) {
-      return llvm::any_of(p.depTokensSorted, [](llvm::StringRef dep) { return dep.starts_with("cache:"); });
-   };
    auto mixedPredFingerprintForProfile = [&](const StateMatchProfile& p) -> std::string {
-      llvm::SmallVector<std::string, 8> parts;
-      if (!p.mixedHivLookupPredFingerprint.empty()) {
-         llvm::SmallVector<llvm::StringRef, 8> split;
-         llvm::StringRef(p.mixedHivLookupPredFingerprint).split(split, '|');
-         for (llvm::StringRef part : split) {
-            if (!part.empty()) parts.push_back(part.str());
-         }
-      }
-      const QueryModel* model = modelByQueryId.lookup(p.queryId);
-      assert(model && "missing query model for profile");
-      for (llvm::StringRef dep : p.depTokensSorted) {
-         std::optional<uint64_t> key = parseCacheDepToken(dep);
-         if (!key) continue;
-         auto it = model->cacheGetTypeByKey.find(*key);
-         assert(it != model->cacheGetTypeByKey.end() && "cache dependency must resolve to a cache_get type");
-         std::string pred = mixedPredSelectionFingerprintFromStateType(it->second);
-         if (!pred.empty()) parts.push_back(std::move(pred));
-      }
-      llvm::sort(parts);
-      parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
-      std::string out;
-      for (llvm::StringRef part : parts) {
-         if (!out.empty()) out.push_back('|');
-         out += part;
-      }
-      return out;
-   };
-   auto mixedLookupSuffixForCacheDependentProfile = [&](const StateMatchProfile& p) -> std::string {
-      if (!profileHasCacheDependency(p)) return "";
-      return "@@mixed_lookup=" + mixedPredFingerprintForProfile(p);
+      return buildMixedPredFingerprintForProfile(p, modelByQueryId);
    };
    auto makeKeyStr = [&](const StateMatchProfile& p) -> std::string {
-      std::string deps;
-      for (auto& d : p.depTokensSorted) {
-         if (!deps.empty()) deps.push_back('|');
-         deps.append(d);
-      }
-      return deps + "@@type=" + p.typeFingerprintStr + "@@h=" + std::to_string(p.constructionHash) +
-             mixedLookupSuffixForCacheDependentProfile(p);
+      return constructionMatchKey(p, mixedPredFingerprintForProfile);
    };
-   auto makeRelaxedHivKeyStr = [](const StateMatchProfile& p) -> std::string {
-      std::string deps;
-      for (auto& d : p.depTokensSorted) {
-         if (!deps.empty()) deps.push_back('|');
-         deps.append(d);
-      }
-      return deps + "@@type=" + p.typeFingerprintStr + "@@hiv_relaxed";
-   };
-   auto makeSplitMaterializeKeyStr = [](const StateMatchProfile& p) -> std::string {
-      return aggregateDependencyNoFilterFingerprint(p.depTokensSorted) + "@@type=" + p.typeFingerprintStr +
-             "@@h=" + std::to_string(p.constructionHash) + "@@split_materialize";
-   };
-   auto complexResidualMatchAllowed = [&](const StateMatchProfile& a, const QueryModel* modelA,
-                                          const StateMatchProfile& b, const QueryModel* modelB) {
-      if (!a.hasComplexResidualTableFilter && !b.hasComplexResidualTableFilter) return true;
-      if (!a.hasResidualTableFilter || !b.hasResidualTableFilter) return true;
-      if (a.hasComplexResidualTableFilter && b.hasComplexResidualTableFilter) return true;
-      return !decodeSimpleMatchFiltersAlongShadowChain(a.value, modelA->reuse).empty() ||
-             !decodeSimpleMatchFiltersAlongShadowChain(b.value, modelB->reuse).empty();
-   };
-   auto hasCacheDependency = profileHasCacheDependency;
    auto hasPreAggrCacheDependency = [&](const StateMatchProfile& p) {
-      const QueryModel* model = modelByQueryId.lookup(p.queryId);
-      assert(model && "missing query model for profile");
-      for (llvm::StringRef dep : p.depTokensSorted) {
-         std::optional<uint64_t> key = parseCacheDepToken(dep);
-         if (!key) continue;
-         auto it = model->cacheGetTypeByKey.find(*key);
-         assert(it != model->cacheGetTypeByKey.end() && "cache dependency must resolve to a cache_get type");
-         if (mlir::isa<subop::PreAggrHtType>(it->second)) return true;
-      }
-      return false;
+      return profileHasPreAggrCacheDependency(p, modelByQueryId);
    };
    auto relaxedHivPayloadUnionAllowed = [&](const StateMatchProfile& a, const StateMatchProfile& b) {
-      if (!hasCacheDependency(a) && !hasCacheDependency(b)) return true;
-      if (a.hasResidualTableFilter && b.hasResidualTableFilter &&
-          !a.hasUnsupportedResidualTableFilter && !b.hasUnsupportedResidualTableFilter)
-         return true;
-      std::string fpA = mixedPredFingerprintForProfile(a);
-      std::string fpB = mixedPredFingerprintForProfile(b);
-      if (fpA.empty() || fpB.empty()) return false;
-      if (mixedHivLookupPredFingerprintUsesUnion(fpA) ||
-         mixedHivLookupPredFingerprintUsesUnion(fpB))
-         return false;
-      return fpA == fpB;
+      return profilesAllowRelaxedHivPayloadUnion(a, b, mixedPredFingerprintForProfile);
    };
-   auto aggregateMixedPredDisjointReuseAllowed = [&](const StateMatchProfile& a, const StateMatchProfile& b) {
-      if (!hasCacheDependency(a) && !hasCacheDependency(b)) return true;
-      std::string fpA = mixedPredFingerprintForProfile(a);
-      std::string fpB = mixedPredFingerprintForProfile(b);
-      if (fpA.empty() || fpB.empty()) return false;
-      if (mixedHivLookupPredFingerprintUsesUnion(fpA) ||
-          mixedHivLookupPredFingerprintUsesUnion(fpB))
-         return false;
-      return true;
-   };
-   auto aggregateMixedPredExactReuseAllowed = [&](const StateMatchProfile& a, const StateMatchProfile& b) {
-      if (!aggregateMixedPredDisjointReuseAllowed(a, b)) return false;
-      if (!hasCacheDependency(a) && !hasCacheDependency(b)) return true;
-      return mixedPredFingerprintForProfile(a) == mixedPredFingerprintForProfile(b);
-   };
-   using ProfileBucketMap = llvm::DenseMap<uint64_t, llvm::SmallVector<const StateMatchProfile*, 8>>;
-   auto appendToBucket = [](ProfileBucketMap& buckets,
-                            llvm::SmallVectorImpl<uint64_t>& bucketOrder,
-                            uint64_t hash,
-                            const StateMatchProfile* profile) {
-      auto it = buckets.find(hash);
-      if (it == buckets.end()) {
-         bucketOrder.push_back(hash);
-         it = buckets.try_emplace(hash).first;
-      }
-      it->second.push_back(profile);
-   };
+   StateMatchProfileBucketSet profilesByConstructionHash;
+   for (const StateMatchProfile* p : all)
+      appendToProfileBucket(profilesByConstructionHash, p->constructionHash, p);
 
-   ProfileBucketMap profilesByConstructionHash;
-   llvm::SmallVector<uint64_t, 64> constructionHashOrder;
-   for (auto* p : all) {
-      appendToBucket(profilesByConstructionHash, constructionHashOrder, p->constructionHash, p);
-   }
+   StateMatchProfileBucketSet hivProfilesByRelaxedHash = buildProfileBuckets(
+      all,
+      [](const StateMatchProfile& p) {
+         return mlir::isa<subop::HashIndexedViewType>(p.value.getType()) &&
+                profileHasSingleConstructionSink(p);
+      },
+      relaxedHivMatchKey);
 
-   ProfileBucketMap hivProfilesByRelaxedHash;
-   llvm::SmallVector<uint64_t, 32> hivRelaxedHashOrder;
-   for (auto* p : all) {
-      if (!mlir::isa<subop::HashIndexedViewType>(p->value.getType())) continue;
-      std::string k = makeRelaxedHivKeyStr(*p);
-      uint64_t hash = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
-      appendToBucket(hivProfilesByRelaxedHash, hivRelaxedHashOrder, hash, p);
-   }
-
-   ProfileBucketMap splitMaterializeProfilesByRelaxedHash;
-   llvm::SmallVector<uint64_t, 32> splitMaterializeRelaxedHashOrder;
-   for (auto* p : all) {
-      if (mlir::isa<subop::HashIndexedViewType, subop::PreAggrHtType>(p->value.getType())) continue;
-      if (!p->hasResidualTableFilter) continue;
-      if (hasPreAggrCacheDependency(*p)) continue;
-      std::string k = makeSplitMaterializeKeyStr(*p);
-      uint64_t hash = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
-      appendToBucket(splitMaterializeProfilesByRelaxedHash, splitMaterializeRelaxedHashOrder, hash, p);
-   }
+   StateMatchProfileBucketSet splitMaterializeProfilesByRelaxedHash = buildProfileBuckets(
+      all,
+      [&](const StateMatchProfile& p) {
+         return profileCanUseForcedSplitMaterializeBucket(p, hasPreAggrCacheDependency);
+      },
+      splitMaterializeMatchKey);
 
    llvm::SmallVector<CrossQueryStateMatchGroup, 64> out;
    llvm::DenseSet<mlir::Value> matchedStates;
    llvm::DenseMap<uint64_t, unsigned> emittedGroupCountByBaseCacheKey;
+   MatchGroupEmissionContext emitContext{out, matchedStates, emittedGroupCountByBaseCacheKey};
 
-   auto buildNormalizedFiltersForMembers = [&](llvm::ArrayRef<const StateMatchProfile*> members)
-      -> std::optional<llvm::SmallVector<llvm::StringMap<MatchNormalizedColumnFilter>, 8>> {
-      llvm::SmallVector<llvm::StringMap<MatchNormalizedColumnFilter>, 8> normalizedByMember;
-      normalizedByMember.reserve(members.size());
-      for (const StateMatchProfile* p : members) {
-         const QueryModel* model = modelByQueryId.lookup(p->queryId);
-         assert(model && "missing query model for profile");
-         llvm::SmallVector<lingodb::runtime::FilterDescription, 8> filters =
-            decodeSimpleMatchFiltersAlongShadowChain(p->value, model->reuse);
-         if (filters.empty()) return std::nullopt;
-         normalizedByMember.push_back(preprocessSimpleMatchFilters(filters));
-      }
-      return normalizedByMember;
+   auto simpleFiltersForProfile =
+      [&](const StateMatchProfile& p) -> llvm::SmallVector<lingodb::runtime::FilterDescription, 8> {
+      return decodeSimpleFiltersForProfile(p, modelByQueryId);
    };
-
-   auto emitMatchGroup = [&](llvm::ArrayRef<const StateMatchProfile*> members,
-                             const StateMatchProfile& keySeed,
-                             llvm::StringRef keySuffix,
-                             llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
-                             bool enableFilterPredReuse,
-                             const llvm::DenseMap<const StateMatchProfile*, unsigned>* reuseSlotByProfile = nullptr,
-                             bool forceSplitMaterialize = false) {
-      assert(members.size() >= 2 && "singleton clusters must not be materialized as reuse groups");
-      std::string k = keyForSeed(keySeed);
-      k.append(keySuffix.data(), keySuffix.size());
-      uint64_t baseCacheKey = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
-      unsigned sameBaseOrdinal = emittedGroupCountByBaseCacheKey[baseCacheKey]++;
-      uint64_t cacheKey = baseCacheKey;
-      if (sameBaseOrdinal) {
-         cacheKey = llvm::hash_combine(baseCacheKey,
-                                       llvm::StringRef("state_reuse_match_group_collision"),
-                                       sameBaseOrdinal);
-      }
-
-      CrossQueryStateMatchGroup g;
-      g.cacheKey = cacheKey;
-      llvm::DenseSet<uint64_t> seenCacheDeps;
-      for (const StateMatchProfile* p : members) {
-         for (llvm::StringRef dep : p->depTokensSorted) {
-            if (std::optional<uint64_t> cacheKey = parseCacheDepToken(dep)) {
-               if (seenCacheDeps.insert(*cacheKey).second) g.cacheDeps.push_back(*cacheKey);
-            }
-         }
-      }
-      bool allHiv = true;
-      for (const StateMatchProfile* p : members) {
-         if (!mlir::isa<subop::HashIndexedViewType>(p->value.getType())) {
-            allHiv = false;
-         }
-      }
-      if (allHiv) g.requiresJoinLayoutUnion = true;
-      if (forceSplitMaterialize) g.requiresSplitMaterialize = true;
-      if (allHiv) g.requiresSplitMaterialize = false;
-      bool needsFilterPredReuse = enableFilterPredReuse;
-      if (needsFilterPredReuse && allHiv) {
-         needsFilterPredReuse = false;
-         for (const StateMatchProfile* p : members) {
-            if (p->hasResidualTableFilter || p->hasComplexResidualTableFilter) {
-               needsFilterPredReuse = true;
-               break;
-            }
-            const QueryModel* model = modelByQueryId.lookup(p->queryId);
-            assert(model && "missing query model for profile");
-            if (!decodeSimpleMatchFiltersAlongShadowChain(p->value, model->reuse).empty()) {
-               needsFilterPredReuse = true;
-               break;
-            }
-            if (llvm::any_of(p->depTokensSorted, [](llvm::StringRef dep) {
-                   return dep.starts_with("cache:");
-                })) {
-               needsFilterPredReuse = true;
-               break;
-            }
-         }
-      }
-      g.enableFilterPredReuse = needsFilterPredReuse;
-      if (allHiv && needsFilterPredReuse) g.requiresJoinLayoutUnion = true;
-      if (g.requiresSplitMaterialize) {
-         g.enableFilterPredReuse = false;
-         g.requiresJoinLayoutUnion = false;
-      }
-      for (const StateMatchProfile* p : members) {
-         unsigned reuseSlot = static_cast<unsigned>(p->queryId);
-         if (reuseSlotByProfile) {
-            auto itSlot = reuseSlotByProfile->find(p);
-            assert(itSlot != reuseSlotByProfile->end() && "subgrouped match entry must have a reuse slot");
-            reuseSlot = itSlot->second;
-         }
-         g.entries.push_back(CrossQueryStateMatchEntry{p->queryId, p->value, reuseSlot});
-         matchedStates.insert(p->value);
-      }
-      out.push_back(std::move(g));
+   auto hasSimpleFiltersForProfile = [&](const StateMatchProfile& p) {
+      return !simpleFiltersForProfile(p).empty();
    };
-
-   auto tryEmitIdenticalFilterSubgroupDisjointGroups =
-      [&](llvm::ArrayRef<const StateMatchProfile*> members,
+   auto appendGroupsFromBucketSet =
+      [&](const StateMatchProfileBucketSet& bucketSet,
+          llvm::function_ref<bool(const StateMatchProfile&)> seedOk,
+          llvm::function_ref<bool(const StateMatchProfile&, const StateMatchProfile&)> peerOk,
           llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
-          bool allowMixedReuse) -> bool {
-      if (members.size() < 2) return false;
-      bool supportedStateKind = true;
-      for (const StateMatchProfile* p : members) {
-         if (!mlir::isa<subop::HashIndexedViewType, subop::PreAggrHtType>(p->value.getType())) {
-            supportedStateKind = false;
-            break;
-         }
-      }
-      if (!supportedStateKind) return false;
-
-      struct FilterSubgroup {
-         llvm::SmallVector<const StateMatchProfile*, 4> members;
-         llvm::SmallVector<lingodb::runtime::FilterDescription, 8> filters;
-         std::string fingerprint;
-      };
-      llvm::SmallVector<FilterSubgroup, 8> subgroups;
-      llvm::StringMap<unsigned> subgroupByFingerprint;
-      for (const StateMatchProfile* p : members) {
-         const QueryModel* model = modelByQueryId.lookup(p->queryId);
-         assert(model && "missing query model for profile");
-         llvm::SmallVector<lingodb::runtime::FilterDescription, 8> filters =
-            decodeSimpleMatchFiltersAlongShadowChain(p->value, model->reuse);
-         if (filters.empty()) return false;
-         std::string fingerprint = matchFilterFingerprint(filters);
-         if (mlir::isa<subop::PreAggrHtType>(p->value.getType())) {
-            fingerprint += "@@full_dep=" + aggregateDependencyFingerprint(p->depTokensSorted);
-         }
-         auto it = subgroupByFingerprint.find(fingerprint);
-         if (it == subgroupByFingerprint.end()) {
-            unsigned idx = subgroups.size();
-            subgroupByFingerprint[fingerprint] = idx;
-            FilterSubgroup subgroup;
-            subgroup.filters = std::move(filters);
-            subgroup.fingerprint = std::move(fingerprint);
-            subgroup.members.push_back(p);
-            subgroups.push_back(std::move(subgroup));
-         } else {
-            subgroups[it->second].members.push_back(p);
-         }
-      }
-      if (subgroups.empty()) return false;
-
-      struct GreedyGroup {
-         llvm::SmallVector<unsigned, 4> subgroupIndices;
-      };
-      llvm::SmallVector<GreedyGroup, 8> greedyGroups;
-      for (unsigned subgroupIdx = 0; subgroupIdx < subgroups.size(); ++subgroupIdx) {
-         bool inserted = false;
-         for (GreedyGroup& group : greedyGroups) {
-            bool disjointFromGroup = true;
-            for (unsigned existingIdx : group.subgroupIndices) {
-               if (!matchFiltersDefinitelyDisjoint(subgroups[subgroupIdx].filters,
-                                                   subgroups[existingIdx].filters)) {
-                  disjointFromGroup = false;
-                  break;
-               }
-            }
-            if (!disjointFromGroup) continue;
-            group.subgroupIndices.push_back(subgroupIdx);
-            inserted = true;
-            break;
-         }
-         if (!inserted) {
-            GreedyGroup group;
-            group.subgroupIndices.push_back(subgroupIdx);
-            greedyGroups.push_back(std::move(group));
-         }
-      }
-
-      bool emittedAny = false;
-      for (const GreedyGroup& group : greedyGroups) {
-         llvm::SmallVector<const StateMatchProfile*, 8> groupedMembers;
-         llvm::DenseMap<const StateMatchProfile*, unsigned> slotByProfile;
-         std::string suffix;
-         for (unsigned localSlot = 0; localSlot < group.subgroupIndices.size(); ++localSlot) {
-            const FilterSubgroup& subgroup = subgroups[group.subgroupIndices[localSlot]];
-            suffix += "@@filter_subgroup=" + std::to_string(localSlot) + ":" +
-                      std::to_string(static_cast<size_t>(llvm::hash_value(llvm::StringRef(subgroup.fingerprint))));
-            for (const StateMatchProfile* p : subgroup.members) {
-               groupedMembers.push_back(p);
-               slotByProfile[p] = localSlot;
-            }
-         }
-         if (group.subgroupIndices.size() == 1 && groupedMembers.size() < 2) continue;
-         bool mixedReuse = allowMixedReuse && group.subgroupIndices.size() > 1;
-         emitMatchGroup(groupedMembers, *groupedMembers.front(), suffix, keyForSeed, mixedReuse,
-                        &slotByProfile);
-         emittedAny = true;
-      }
-      return emittedAny;
+          bool enableFilterPredReuse,
+          bool forceSplitMaterialize = false) {
+      appendClusteredMatchGroupsFromBucketSet(
+         bucketSet, emitContext, matchOptions, seedOk, peerOk, keyForSeed, enableFilterPredReuse,
+         forceSplitMaterialize, simpleFiltersForProfile, mixedPredFingerprintForProfile,
+         hasSimpleFiltersForProfile);
    };
 
-   auto tryEmitSimpleFilterUnionFindClusteredGroups = [&](llvm::ArrayRef<const StateMatchProfile*> members,
-                                                          llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
-                                                          bool enableFilterPredReuse) -> bool {
-      if (members.size() < 2) return false;
-
-      struct SimpleFilterCluster {
-         unsigned root = 0;
-         llvm::SmallVector<const StateMatchProfile*, 8> members;
-      };
-
-      auto clusterByColumn = [&](llvm::ArrayRef<const StateMatchProfile*> currentMembers,
-                                 llvm::ArrayRef<llvm::StringMap<MatchNormalizedColumnFilter>> normalizedByMember,
-                                 llvm::StringRef clusterColumn,
-                                 llvm::SmallVectorImpl<SimpleFilterCluster>& clusters) -> bool {
-         bool useNumeric = true;
-         bool useString = true;
-         for (auto& normalized : normalizedByMember) {
-            auto it = normalized.find(clusterColumn);
-            if (it == normalized.end()) return false;
-            const MatchNormalizedColumnFilter& filter = it->getValue();
-            assert(!((filter.hasNumericRange || filter.hasStringRange) && (filter.hasNumericIn || filter.hasStringIn)) &&
-                   "simple filter preprocessing must collapse same-column range+IN into IN");
-            useNumeric = useNumeric && (filter.hasNumericIn || filter.hasNumericRange);
-            useString = useString && (filter.hasStringIn || filter.hasStringRange);
-         }
-         if (useNumeric == useString) return false;
-
-         llvm::SmallVector<unsigned, 8> parent;
-         parent.reserve(currentMembers.size());
-         for (unsigned i = 0; i < currentMembers.size(); ++i) parent.push_back(i);
-         std::function<unsigned(unsigned)> findRoot = [&](unsigned idx) -> unsigned {
-            if (parent[idx] == idx) return idx;
-            parent[idx] = findRoot(parent[idx]);
-            return parent[idx];
-         };
-         auto unite = [&](unsigned a, unsigned b) {
-            unsigned ra = findRoot(a);
-            unsigned rb = findRoot(b);
-            if (ra != rb) parent[rb] = ra;
-         };
-
-         if (useNumeric) {
-            std::map<double, unsigned> ownerByElement;
-            for (unsigned i = 0; i < currentMembers.size(); ++i) {
-               auto it = normalizedByMember[i].find(clusterColumn);
-               assert(it != normalizedByMember[i].end());
-               for (double v : it->getValue().numericIn) {
-                  auto owner = ownerByElement.find(v);
-                  if (owner == ownerByElement.end()) {
-                     ownerByElement[v] = i;
-                  } else {
-                     unite(i, owner->second);
-                  }
-               }
-            }
-
-            struct NumericRangeItem {
-               unsigned memberIdx;
-               MatchNumericFilterRange range;
-            };
-            llvm::SmallVector<NumericRangeItem, 8> ranges;
-            for (unsigned i = 0; i < currentMembers.size(); ++i) {
-               auto it = normalizedByMember[i].find(clusterColumn);
-               assert(it != normalizedByMember[i].end());
-               const MatchNormalizedColumnFilter& filter = it->getValue();
-               if (!filter.hasNumericRange) continue;
-               ranges.push_back({i, canonicalizeNumericRangeForClustering(filter.numericRange)});
-            }
-
-            auto firstElementInRange = [&](const MatchNumericFilterRange& range) {
-               if (!range.hasLower) return ownerByElement.begin();
-               return range.lowerInclusive ? ownerByElement.lower_bound(range.lower)
-                                           : ownerByElement.upper_bound(range.lower);
-            };
-            auto endElementInRange = [&](const MatchNumericFilterRange& range) {
-               if (!range.hasUpper) return ownerByElement.end();
-               return range.upperInclusive ? ownerByElement.upper_bound(range.upper)
-                                           : ownerByElement.lower_bound(range.upper);
-            };
-            for (const NumericRangeItem& item : ranges) {
-               for (auto owner = firstElementInRange(item.range), end = endElementInRange(item.range);
-                    owner != end; ++owner) {
-                  unite(item.memberIdx, owner->second);
-               }
-            }
-
-            llvm::sort(ranges, [](const NumericRangeItem& a, const NumericRangeItem& b) {
-               if (a.range.hasLower != b.range.hasLower) return !a.range.hasLower;
-               if (!a.range.hasLower) return false;
-               if (a.range.lower != b.range.lower) return a.range.lower < b.range.lower;
-               return a.range.lowerInclusive && !b.range.lowerInclusive;
-            });
-            bool hasCurrent = false;
-            unsigned currentOwner = 0;
-            MatchNumericFilterRange currentRange;
-            for (const NumericRangeItem& item : ranges) {
-               if (!hasCurrent) {
-                  currentOwner = item.memberIdx;
-                  currentRange = item.range;
-                  hasCurrent = true;
-                  continue;
-               }
-               if (matchRangesAreDisjoint(currentRange, item.range)) {
-                  currentOwner = item.memberIdx;
-                  currentRange = item.range;
-               } else {
-                  unite(currentOwner, item.memberIdx);
-                  unionNumericRangeInto(currentRange, item.range);
-               }
-            }
-         } else {
-            std::map<std::string, unsigned> ownerByElement;
-            for (unsigned i = 0; i < currentMembers.size(); ++i) {
-               auto it = normalizedByMember[i].find(clusterColumn);
-               assert(it != normalizedByMember[i].end());
-               for (const std::string& v : it->getValue().stringIn) {
-                  auto owner = ownerByElement.find(v);
-                  if (owner == ownerByElement.end()) {
-                     ownerByElement[v] = i;
-                  } else {
-                     unite(i, owner->second);
-                  }
-               }
-            }
-
-            struct StringRangeItem {
-               unsigned memberIdx;
-               MatchStringFilterRange range;
-            };
-            llvm::SmallVector<StringRangeItem, 8> ranges;
-            for (unsigned i = 0; i < currentMembers.size(); ++i) {
-               auto it = normalizedByMember[i].find(clusterColumn);
-               assert(it != normalizedByMember[i].end());
-               const MatchNormalizedColumnFilter& filter = it->getValue();
-               if (!filter.hasStringRange) continue;
-               ranges.push_back({i, canonicalizeStringRangeForClustering(filter.stringRange)});
-            }
-
-            auto firstElementInRange = [&](const MatchStringFilterRange& range) {
-               if (!range.lower) return ownerByElement.begin();
-               return range.lowerInclusive ? ownerByElement.lower_bound(*range.lower)
-                                           : ownerByElement.upper_bound(*range.lower);
-            };
-            auto endElementInRange = [&](const MatchStringFilterRange& range) {
-               if (!range.upper) return ownerByElement.end();
-               return range.upperInclusive ? ownerByElement.upper_bound(*range.upper)
-                                           : ownerByElement.lower_bound(*range.upper);
-            };
-            for (const StringRangeItem& item : ranges) {
-               for (auto owner = firstElementInRange(item.range), end = endElementInRange(item.range);
-                    owner != end; ++owner) {
-                  unite(item.memberIdx, owner->second);
-               }
-            }
-
-            llvm::sort(ranges, [](const StringRangeItem& a, const StringRangeItem& b) {
-               if (a.range.lower.has_value() != b.range.lower.has_value()) return !a.range.lower.has_value();
-               if (!a.range.lower) return false;
-               if (*a.range.lower != *b.range.lower) return *a.range.lower < *b.range.lower;
-               return a.range.lowerInclusive && !b.range.lowerInclusive;
-            });
-            bool hasCurrent = false;
-            unsigned currentOwner = 0;
-            MatchStringFilterRange currentRange;
-            for (const StringRangeItem& item : ranges) {
-               if (!hasCurrent) {
-                  currentOwner = item.memberIdx;
-                  currentRange = item.range;
-                  hasCurrent = true;
-                  continue;
-               }
-               if (matchStringRangesAreDisjoint(currentRange, item.range)) {
-                  currentOwner = item.memberIdx;
-                  currentRange = item.range;
-               } else {
-                  unite(currentOwner, item.memberIdx);
-                  unionStringRangeInto(currentRange, item.range);
-               }
-            }
-         }
-
-         llvm::DenseMap<unsigned, unsigned> clusterByRoot;
-         for (unsigned i = 0; i < currentMembers.size(); ++i) {
-            unsigned root = findRoot(i);
-            auto it = clusterByRoot.find(root);
-            if (it == clusterByRoot.end()) {
-               unsigned pos = clusters.size();
-               clusters.push_back(SimpleFilterCluster{root, {}});
-               it = clusterByRoot.try_emplace(root, pos).first;
-            }
-            clusters[it->second].members.push_back(currentMembers[i]);
-         }
-         return true;
-      };
-
-      bool emittedAny = false;
-      std::function<void(llvm::ArrayRef<const StateMatchProfile*>, std::optional<std::string>, std::string)>
-         decomposeAndEmit = [&](llvm::ArrayRef<const StateMatchProfile*> currentMembers,
-                                std::optional<std::string> skipColumn,
-                                std::string keySuffix) {
-            if (currentMembers.size() == 1) {
-               matchedStates.insert(currentMembers.front()->value);
-               emittedAny = true;
-               return;
-            }
-
-            auto normalizedStorage = buildNormalizedFiltersForMembers(currentMembers);
-            if (normalizedStorage) {
-               auto& normalizedByMember = *normalizedStorage;
-               for (auto& firstEntry : normalizedByMember.front()) {
-                  llvm::StringRef col = firstEntry.getKey();
-                  if (skipColumn && col == *skipColumn) continue;
-                  llvm::SmallVector<SimpleFilterCluster, 8> clusters;
-                  if (!clusterByColumn(currentMembers, normalizedByMember, col, clusters)) continue;
-                  if (clusters.size() < 2) continue;
-
-                  for (const SimpleFilterCluster& cluster : clusters) {
-                     std::string childSuffix = keySuffix + "@@simple_filter_cluster=" + col.str() + "#" +
-                                               std::to_string(cluster.root);
-                     decomposeAndEmit(cluster.members, col.str(), std::move(childSuffix));
-                  }
-                  emittedAny = true;
-                  return;
-               }
-            }
-
-            emitMatchGroup(currentMembers, *currentMembers.front(), keySuffix, keyForSeed,
-                           enableFilterPredReuse);
-            emittedAny = true;
-         };
-
-      decomposeAndEmit(members, std::nullopt, "");
-      return emittedAny;
-   };
-
-   auto appendGroupFromBucket = [&](llvm::ArrayRef<const StateMatchProfile*> bucket,
-                                    llvm::function_ref<bool(const StateMatchProfile&)> seedOk,
-                                    llvm::function_ref<bool(const StateMatchProfile&, const StateMatchProfile&)> peerOk,
-                                    llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
-                                    bool enableFilterPredReuse,
-                                    bool forceSplitMaterialize = false) {
-      for (size_t i = 0; i < bucket.size(); i++) {
-         auto* a = bucket[i];
-         if (matchedStates.contains(a->value)) continue;
-         if (!seedOk(*a)) continue;
-
-         llvm::SmallVector<const StateMatchProfile*, 8> members;
-         members.push_back(a);
-         llvm::DenseSet<int> seenQueries;
-         seenQueries.insert(a->queryId);
-         for (size_t j = i + 1; j < bucket.size(); j++) {
-            auto* b = bucket[j];
-            if (matchedStates.contains(b->value)) continue;
-            if (seenQueries.contains(b->queryId)) continue;
-            bool okWithGroup = true;
-            for (const StateMatchProfile* existing : members) {
-               if (!peerOk(*existing, *b)) {
-                  okWithGroup = false;
-                  break;
-               }
-            }
-            if (!okWithGroup) continue;
-            members.push_back(b);
-            seenQueries.insert(b->queryId);
-         }
-         if (members.size() < 2) continue;
-         const bool allHiv = llvm::all_of(members, [](const StateMatchProfile* p) {
-            return mlir::isa<subop::HashIndexedViewType>(p->value.getType());
-         });
-         if (forceSplitMaterialize) {
-            emitMatchGroup(members, *a, "", keyForSeed, enableFilterPredReuse,
-                           /*reuseSlotByProfile=*/nullptr, /*forceSplitMaterialize=*/true);
-            continue;
-         }
-         if (!(disableHivDisjointClustering && allHiv) &&
-             tryEmitIdenticalFilterSubgroupDisjointGroups(members, keyForSeed, enableFilterPredReuse))
-            continue;
-         if (disableHivDisjointClustering && allHiv) {
-            emitMatchGroup(members, *a, "", keyForSeed, enableFilterPredReuse);
-            continue;
-         }
-         if (tryEmitSimpleFilterUnionFindClusteredGroups(members, keyForSeed, enableFilterPredReuse)) continue;
-         emitMatchGroup(members, *a, "", keyForSeed, enableFilterPredReuse);
-      }
-   };
-
-   for (uint64_t hash : constructionHashOrder) {
-      auto bucketIt = profilesByConstructionHash.find(hash);
-      assert(bucketIt != profilesByConstructionHash.end());
-      auto& bucket = bucketIt->second;
-      appendGroupFromBucket(
-         bucket,
-         [](const StateMatchProfile& p) {
-            if (p.hasResidualTableFilter && !mlir::isa<subop::HashIndexedViewType>(p.value.getType()))
+   appendGroupsFromBucketSet(
+      profilesByConstructionHash,
+      [&](const StateMatchProfile& p) {
+         if (!profileCanUseDirectConstructionBucket(p)) return false;
+         return !mlir::isa<subop::PreAggrHtType>(p.value.getType());
+      },
+      [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+         if (mlir::isa<subop::PreAggrHtType>(b.value.getType())) return false;
+         if (!profileCanUseDirectConstructionBucket(a)) return false;
+         if (!profileCanUseDirectConstructionBucket(b)) return false;
+         if (mlir::isa<subop::ResultTableType>(a.value.getType()) && hasPreAggrCacheDependency(a))
+            return false;
+         if (mlir::isa<subop::ResultTableType>(b.value.getType()) && hasPreAggrCacheDependency(b))
+            return false;
+         if (a.constructionHash != b.constructionHash) return false;
+         if (a.typeFingerprintStr != b.typeFingerprintStr) return false;
+         if (a.depTokensSorted != b.depTokensSorted) return false;
+         if (profileHasCacheDependencyToken(a) || profileHasCacheDependencyToken(b)) {
+            std::string fpA = mixedPredFingerprintForProfile(a);
+            std::string fpB = mixedPredFingerprintForProfile(b);
+            if (fpA.empty() || fpB.empty()) return false;
+            if (mixedHivLookupPredFingerprintUsesUnion(fpA) ||
+                mixedHivLookupPredFingerprintUsesUnion(fpB))
                return false;
-            return !mlir::isa<subop::PreAggrHtType>(p.value.getType());
-         },
-         [&](const StateMatchProfile& a, const StateMatchProfile& b) {
-            if (mlir::isa<subop::PreAggrHtType>(b.value.getType())) return false;
-            if (a.hasResidualTableFilter && !mlir::isa<subop::HashIndexedViewType>(a.value.getType()))
-               return false;
-            if (b.hasResidualTableFilter && !mlir::isa<subop::HashIndexedViewType>(b.value.getType()))
-               return false;
-            if (mlir::isa<subop::ResultTableType>(a.value.getType()) && hasPreAggrCacheDependency(a))
-               return false;
-            if (mlir::isa<subop::ResultTableType>(b.value.getType()) && hasPreAggrCacheDependency(b))
-               return false;
-            if (a.constructionHash != b.constructionHash) return false;
-            if (a.typeFingerprintStr != b.typeFingerprintStr) return false;
-            if (a.depTokensSorted != b.depTokensSorted) return false;
-            if (hasCacheDependency(a) || hasCacheDependency(b)) {
-               std::string fpA = mixedPredFingerprintForProfile(a);
-               std::string fpB = mixedPredFingerprintForProfile(b);
-               if (fpA.empty() || fpB.empty()) return false;
-               if (mixedHivLookupPredFingerprintUsesUnion(fpA) ||
-                   mixedHivLookupPredFingerprintUsesUnion(fpB))
-                  return false;
-               if (fpA != fpB) return false;
-            }
-            const QueryModel* modelA = modelByQueryId.lookup(a.queryId);
-            const QueryModel* modelB = modelByQueryId.lookup(b.queryId);
-            assert(modelA && modelB && "missing query model for profile");
-            if (mlir::isa<subop::HashIndexedViewType>(a.value.getType()) &&
-                mlir::isa<subop::HashIndexedViewType>(b.value.getType())) {
-               if (a.hasUnsupportedResidualTableFilter || b.hasUnsupportedResidualTableFilter) return false;
-               if (!complexResidualMatchAllowed(a, modelA, b, modelB)) return false;
-            }
-            // TODO(batch-reuse): Restore filter-disjoint pruning as part of clustering / reuse cost modeling.
-            (void)profilesDefinitelyDisjointByFilters;
-            return true;
-         },
-         makeKeyStr, /*enableFilterPredReuse=*/true);
-   }
-
-   for (uint64_t hash : hivRelaxedHashOrder) {
-      auto bucketIt = hivProfilesByRelaxedHash.find(hash);
-      assert(bucketIt != hivProfilesByRelaxedHash.end());
-      auto& bucket = bucketIt->second;
-      appendGroupFromBucket(
-         bucket,
-         [](const StateMatchProfile& p) {
-            return mlir::isa<subop::HashIndexedViewType>(p.value.getType());
-         },
-         [&](const StateMatchProfile& a, const StateMatchProfile& b) {
-            if (!mlir::isa<subop::HashIndexedViewType>(b.value.getType())) return false;
+            if (fpA != fpB) return false;
+         }
+         const QueryMatchModel* modelA = modelByQueryId.lookup(a.queryId);
+         const QueryMatchModel* modelB = modelByQueryId.lookup(b.queryId);
+         assert(modelA && modelB && "missing query model for profile");
+         if (mlir::isa<subop::HashIndexedViewType>(a.value.getType()) &&
+             mlir::isa<subop::HashIndexedViewType>(b.value.getType())) {
             if (a.hasUnsupportedResidualTableFilter || b.hasUnsupportedResidualTableFilter) return false;
-            if (a.typeFingerprintStr != b.typeFingerprintStr) return false;
-            if (a.depTokensSorted != b.depTokensSorted) return false;
-            const QueryModel* modelA = modelByQueryId.lookup(a.queryId);
-            const QueryModel* modelB = modelByQueryId.lookup(b.queryId);
-            assert(modelA && modelB && "missing query model for HIV relaxed profile");
-            if (!relaxedHivPayloadUnionAllowed(a, b)) return false;
-            if (!complexResidualMatchAllowed(a, modelA, b, modelB)) return false;
-            // TODO(batch-reuse): Restore filter-disjoint pruning as part of clustering / reuse cost modeling.
-            return true;
-         },
-         makeRelaxedHivKeyStr, /*enableFilterPredReuse=*/true);
-   }
+            if (!profilesAllowComplexResidualFilterMatch(a, *modelA, b, *modelB)) return false;
+         }
+         // TODO(batch-reuse): Restore filter-disjoint pruning as part of clustering / reuse cost modeling.
+         (void)profilesDefinitelyDisjointByFilters;
+         return true;
+      },
+      makeKeyStr, /*enableFilterPredReuse=*/true);
+
+   appendGroupsFromBucketSet(
+      hivProfilesByRelaxedHash,
+      [](const StateMatchProfile& p) {
+         return mlir::isa<subop::HashIndexedViewType>(p.value.getType());
+      },
+      [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+         if (!mlir::isa<subop::HashIndexedViewType>(b.value.getType())) return false;
+         if (a.hasUnsupportedResidualTableFilter || b.hasUnsupportedResidualTableFilter) return false;
+         if (a.typeFingerprintStr != b.typeFingerprintStr) return false;
+         if (a.depTokensSorted != b.depTokensSorted) return false;
+         const QueryMatchModel* modelA = modelByQueryId.lookup(a.queryId);
+         const QueryMatchModel* modelB = modelByQueryId.lookup(b.queryId);
+         assert(modelA && modelB && "missing query model for HIV relaxed profile");
+         if (!relaxedHivPayloadUnionAllowed(a, b)) return false;
+         if (!profilesAllowComplexResidualFilterMatch(a, *modelA, b, *modelB)) return false;
+         // TODO(batch-reuse): Restore filter-disjoint pruning as part of clustering / reuse cost modeling.
+         return true;
+      },
+      relaxedHivMatchKey, /*enableFilterPredReuse=*/true);
 
    // Aggregate hash tables match on table/filter dependencies plus group-key identity. Payload value
    // layout is intentionally ignored here; the reuse rewrite computes the payload union later.
-   auto aggregateMatchKeyStr = [](const StateMatchProfile& p) -> std::string {
-      return aggregateDependencyFingerprint(p.depTokensSorted) + "@@agg=" + p.aggregateGroupKeyFingerprint;
+   StateMatchProfileBucketSet aggregateProfilesByNoFilterHash = buildProfileBuckets(
+      all,
+      [](const StateMatchProfile& p) {
+         return profileCanUseAggregateRewriteBucket(p);
+      },
+      aggregateNoFilterMatchKey);
+   auto appendAggregateNoFilterGroups = [&](auto peerOk, bool enableFilterPredReuse,
+                                            bool forceSplitMaterialize = false) {
+      appendGroupsFromBucketSet(
+         aggregateProfilesByNoFilterHash,
+         [&](const StateMatchProfile& p) {
+            return profileCanUseAggregateRewriteBucket(p);
+         },
+         peerOk, aggregateNoFilterMatchKey, enableFilterPredReuse, forceSplitMaterialize);
    };
-   auto aggregateNoFilterMatchKeyStr = [](const StateMatchProfile& p) -> std::string {
-      return aggregateDependencyNoFilterFingerprint(p.depTokensSorted) + "@@agg=" + p.aggregateGroupKeyFingerprint +
-             "@@disjoint_filters";
-   };
-   ProfileBucketMap aggregateProfilesByNoFilterHash;
-   llvm::SmallVector<uint64_t, 32> aggregateNoFilterHashOrder;
-   for (auto* p : all) {
-      if (!mlir::isa<subop::PreAggrHtType>(p->value.getType())) continue;
-      std::string k = aggregateNoFilterMatchKeyStr(*p);
-      uint64_t hash = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
-      appendToBucket(aggregateProfilesByNoFilterHash, aggregateNoFilterHashOrder, hash, p);
-   }
-   for (uint64_t hash : aggregateNoFilterHashOrder) {
-      auto bucketIt = aggregateProfilesByNoFilterHash.find(hash);
-      assert(bucketIt != aggregateProfilesByNoFilterHash.end());
-      auto& bucket = bucketIt->second;
-      appendGroupFromBucket(
-         bucket,
-         [](const StateMatchProfile& p) {
-            return mlir::isa<subop::PreAggrHtType>(p.value.getType());
-         },
+   if (!matchOptions.disableAggregateDisjointClustering) {
+      appendAggregateNoFilterGroups(
          [&](const StateMatchProfile& a, const StateMatchProfile& b) {
-            if (!mlir::isa<subop::PreAggrHtType>(b.value.getType())) return false;
-            if (aggregateDependencyNoFilterFingerprint(a.depTokensSorted) !=
-                aggregateDependencyNoFilterFingerprint(b.depTokensSorted))
-               return false;
-            if (a.aggregateGroupKeyFingerprint != b.aggregateGroupKeyFingerprint) return false;
-            const QueryModel* modelA = modelByQueryId.lookup(a.queryId);
-            const QueryModel* modelB = modelByQueryId.lookup(b.queryId);
-            assert(modelA && modelB && "missing query model for aggregate disjoint profile");
-            auto filtersA = decodeSimpleMatchFiltersAlongShadowChain(a.value, modelA->reuse);
-            auto filtersB = decodeSimpleMatchFiltersAlongShadowChain(b.value, modelB->reuse);
-            if (filtersA.empty() || filtersB.empty()) return false;
-            if (matchFilterFingerprint(filtersA) == matchFilterFingerprint(filtersB))
-               return aggregateMixedPredExactReuseAllowed(a, b);
-            if (matchFiltersDefinitelyDisjoint(filtersA, filtersB))
-               return aggregateMixedPredDisjointReuseAllowed(a, b);
-            return false;
+            return profilesAllowAggregateDisjointFilterReuse(a, b, modelByQueryId,
+                                                             mixedPredFingerprintForProfile);
          },
-         aggregateNoFilterMatchKeyStr, /*enableFilterPredReuse=*/true);
+         /*enableFilterPredReuse=*/true);
    }
 
-   for (uint64_t hash : aggregateNoFilterHashOrder) {
-      auto bucketIt = aggregateProfilesByNoFilterHash.find(hash);
-      assert(bucketIt != aggregateProfilesByNoFilterHash.end());
-      auto& bucket = bucketIt->second;
-      appendGroupFromBucket(
-         bucket,
-         [](const StateMatchProfile& p) {
-            return mlir::isa<subop::PreAggrHtType>(p.value.getType());
-         },
-         [&](const StateMatchProfile& a, const StateMatchProfile& b) {
-            if (!mlir::isa<subop::PreAggrHtType>(b.value.getType())) return false;
-            if (a.hasUnsupportedResidualTableFilter || b.hasUnsupportedResidualTableFilter) return false;
-            if (aggregateDependencyNoFilterFingerprint(a.depTokensSorted) !=
-                aggregateDependencyNoFilterFingerprint(b.depTokensSorted))
-               return false;
-            if (a.aggregateGroupKeyFingerprint != b.aggregateGroupKeyFingerprint) return false;
-            const QueryModel* modelA = modelByQueryId.lookup(a.queryId);
-            const QueryModel* modelB = modelByQueryId.lookup(b.queryId);
-            assert(modelA && modelB && "missing query model for aggregate split-materialize profile");
-            auto filtersA = decodeSimpleMatchFiltersAlongShadowChain(a.value, modelA->reuse);
-            auto filtersB = decodeSimpleMatchFiltersAlongShadowChain(b.value, modelB->reuse);
-            return !filtersA.empty() || !filtersB.empty() ||
-                   a.hasResidualTableFilter || b.hasResidualTableFilter ||
-                   hasCacheDependency(a) || hasCacheDependency(b);
-         },
-         aggregateNoFilterMatchKeyStr, /*enableFilterPredReuse=*/false,
-         /*forceSplitMaterialize=*/true);
-   }
+   appendAggregateNoFilterGroups(
+      [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+         return profilesAllowAggregateSplitMaterializeReuse(a, b, modelByQueryId);
+      },
+      /*enableFilterPredReuse=*/false, /*forceSplitMaterialize=*/true);
 
-   ProfileBucketMap aggregateProfilesByMatchHash;
-   llvm::SmallVector<uint64_t, 32> aggregateMatchHashOrder;
-   for (auto* p : all) {
-      if (!mlir::isa<subop::PreAggrHtType>(p->value.getType())) continue;
-      assert(!p->aggregateGroupKeyFingerprint.empty() && "eligible aggregate profile must carry group-key fingerprint");
-      std::string k = aggregateMatchKeyStr(*p);
-      uint64_t hash = static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(k)));
-      appendToBucket(aggregateProfilesByMatchHash, aggregateMatchHashOrder, hash, p);
-   }
-   for (uint64_t hash : aggregateMatchHashOrder) {
-      auto bucketIt = aggregateProfilesByMatchHash.find(hash);
-      assert(bucketIt != aggregateProfilesByMatchHash.end());
-      auto& bucket = bucketIt->second;
-      appendGroupFromBucket(
-         bucket,
-         [](const StateMatchProfile& p) {
-            return mlir::isa<subop::PreAggrHtType>(p.value.getType());
-         },
-         [&](const StateMatchProfile& a, const StateMatchProfile& b) {
-            if (!mlir::isa<subop::PreAggrHtType>(b.value.getType())) return false;
-            if (aggregateDependencyFingerprint(a.depTokensSorted) !=
-                aggregateDependencyFingerprint(b.depTokensSorted))
-               return false;
-            if (!aggregateMixedPredExactReuseAllowed(a, b)) return false;
-            return a.aggregateGroupKeyFingerprint == b.aggregateGroupKeyFingerprint;
-         },
-         aggregateMatchKeyStr, /*enableFilterPredReuse=*/false);
-   }
+   StateMatchProfileBucketSet aggregateProfilesByMatchHash = buildProfileBuckets(
+      all,
+      [](const StateMatchProfile& p) {
+         if (!profileCanUseAggregateRewriteBucket(p)) return false;
+         assert(!p.aggregateGroupKeyFingerprint.empty() &&
+                "eligible aggregate profile must carry group-key fingerprint");
+         return true;
+      },
+      aggregateMatchKey);
+   appendGroupsFromBucketSet(
+      aggregateProfilesByMatchHash,
+      [&](const StateMatchProfile& p) {
+         return profileCanUseAggregateRewriteBucket(p);
+      },
+      [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+         return profilesAllowAggregateExactReuse(a, b, mixedPredFingerprintForProfile);
+      },
+      aggregateMatchKey, /*enableFilterPredReuse=*/false);
 
-   for (uint64_t hash : splitMaterializeRelaxedHashOrder) {
-      auto bucketIt = splitMaterializeProfilesByRelaxedHash.find(hash);
-      assert(bucketIt != splitMaterializeProfilesByRelaxedHash.end());
-      auto& bucket = bucketIt->second;
-      appendGroupFromBucket(
-         bucket,
-         [](const StateMatchProfile& p) {
-            return !mlir::isa<subop::HashIndexedViewType, subop::PreAggrHtType>(p.value.getType()) &&
-                   p.hasResidualTableFilter;
-         },
-         [&](const StateMatchProfile& a, const StateMatchProfile& b) {
-            if (mlir::isa<subop::HashIndexedViewType, subop::PreAggrHtType>(b.value.getType())) return false;
-            if (!b.hasResidualTableFilter) return false;
-            if (a.hasUnsupportedResidualTableFilter || b.hasUnsupportedResidualTableFilter) return false;
-            if (a.constructionHash != b.constructionHash) return false;
-            if (a.typeFingerprintStr != b.typeFingerprintStr) return false;
-            return aggregateDependencyNoFilterFingerprint(a.depTokensSorted) ==
-                   aggregateDependencyNoFilterFingerprint(b.depTokensSorted);
-         },
-         makeSplitMaterializeKeyStr, /*enableFilterPredReuse=*/true,
-         /*forceSplitMaterialize=*/true);
-   }
+   appendGroupsFromBucketSet(
+      splitMaterializeProfilesByRelaxedHash,
+      [&](const StateMatchProfile& p) {
+         return profileCanUseForcedSplitMaterializeBucket(p, hasPreAggrCacheDependency);
+      },
+      [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+         if (!profileCanUseForcedSplitMaterializeBucket(b, hasPreAggrCacheDependency)) return false;
+         if (a.constructionHash != b.constructionHash) return false;
+         if (a.typeFingerprintStr != b.typeFingerprintStr) return false;
+         return aggregateDependencyNoFilterFingerprint(a.depTokensSorted) ==
+                aggregateDependencyNoFilterFingerprint(b.depTokensSorted);
+      },
+      splitMaterializeMatchKey, /*enableFilterPredReuse=*/true,
+      /*forceSplitMaterialize=*/true);
    return out;
 }
 

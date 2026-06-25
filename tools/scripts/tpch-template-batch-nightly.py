@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-MODES = ["reuse_off", "reuse_on_bloom_on", "reuse_on_bloom_off", "reuse_on_bloom_on_no_hiv_disjoint"]
+MODES = [
+    "reuse_off",
+    "reuse_on_bloom_on",
+    "reuse_on_bloom_off",
+    "reuse_on_bloom_on_no_hiv_disjoint",
+    "reuse_on_bloom_on_no_aggregate_disjoint",
+]
 
 
 def parse_int_list(spec: str) -> List[int]:
@@ -244,20 +250,25 @@ def run_batch_driver(args: argparse.Namespace) -> None:
     for db in dbs:
         db_label = make_db_label(db)
         ordered_modes = ["reuse_off"] + [m for m in modes if m != "reuse_off"]
-        for mode in ordered_modes:
-            partial = partial_dir / f"{db_label}-{mode}.json"
-            if args.resume and partial.exists():
-                with partial.open("r", encoding="utf-8") as f:
-                    data = json.load(f)
-                mode_records = data.get("records", [])
-                print(f"reuse existing {partial} ({len(mode_records)} records)", flush=True)
-            else:
-                print(f"run batch driver db={db_label} mode={mode}", flush=True)
-                mode_records = run_batch_driver_for_mode(
-                    args.subop_binary, db, query_dir, mode, templates, batch_sizes,
-                    args.repetitions, partial, args.timeout_s)
-            records.extend(mode_records)
-            write_json(out_path, meta, records)
+        for template in templates:
+            for batch_size in batch_sizes:
+                for mode in ordered_modes:
+                    partial = partial_dir / f"{db_label}-q{template}-b{batch_size}-{mode}.json"
+                    if args.resume and partial.exists():
+                        with partial.open("r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        mode_records = data.get("records", [])
+                        print(f"reuse existing {partial} ({len(mode_records)} records)", flush=True)
+                    else:
+                        print(
+                            f"run batch driver db={db_label} q{template} batch={batch_size} mode={mode}",
+                            flush=True,
+                        )
+                        mode_records = run_batch_driver_for_mode(
+                            args.subop_binary, db, query_dir, mode, [template], [batch_size],
+                            args.repetitions, partial, args.timeout_s)
+                    records.extend(mode_records)
+                    write_json(out_path, meta, records)
 
     write_json(out_path, meta, records)
     print(f"wrote {out_path}", flush=True)

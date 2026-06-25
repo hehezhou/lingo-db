@@ -890,10 +890,19 @@ static llvm::SmallVector<int, 16> parseIntList(llvm::StringRef spec) {
    llvm::SmallVector<llvm::StringRef, 16> parts;
    spec.split(parts, ',', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
    for (llvm::StringRef p : parts) {
+      p = p.trim();
+      auto range = p.split('-');
+      if (!range.second.empty()) {
+         int lo = 0;
+         int hi = 0;
+         if (range.first.trim().getAsInteger(10, lo) || range.second.trim().getAsInteger(10, hi) || lo > hi)
+            llvm::report_fatal_error("invalid integer range list argument");
+         for (int v = lo; v <= hi; ++v) out.push_back(v);
+         continue;
+      }
       int v = 0;
-      bool bad = p.trim().getAsInteger(10, v);
-      (void)bad;
-      assert(!bad && "invalid integer list argument");
+      if (p.getAsInteger(10, v))
+         llvm::report_fatal_error("invalid integer list argument");
       out.push_back(v);
    }
    return out;
@@ -933,6 +942,7 @@ enum class BatchNightlyMode {
    ReuseOnBloomOn,
    ReuseOnBloomOff,
    ReuseOnBloomOnNoHivDisjoint,
+   ReuseOnBloomOnNoAggregateDisjoint,
 };
 
 static BatchNightlyMode parseBatchNightlyMode(llvm::StringRef mode) {
@@ -940,7 +950,16 @@ static BatchNightlyMode parseBatchNightlyMode(llvm::StringRef mode) {
    if (mode == "reuse_on_bloom_on") return BatchNightlyMode::ReuseOnBloomOn;
    if (mode == "reuse_on_bloom_off") return BatchNightlyMode::ReuseOnBloomOff;
    if (mode == "reuse_on_bloom_on_no_hiv_disjoint") return BatchNightlyMode::ReuseOnBloomOnNoHivDisjoint;
+   if (mode == "reuse_on_bloom_on_no_aggregate_disjoint")
+      return BatchNightlyMode::ReuseOnBloomOnNoAggregateDisjoint;
    llvm_unreachable("unknown batch nightly mode");
+}
+
+static void setEnvFlag(const char* name, bool enabled) {
+   if (enabled)
+      setenv(name, "1", /*overwrite=*/1);
+   else
+      unsetenv(name);
 }
 
 static int runBatchNightlyMain(int argc, char** argv) {
@@ -982,18 +1001,13 @@ static int runBatchNightlyMain(int argc, char** argv) {
    assert(!outPath.empty() && "--out is required");
    BatchNightlyMode parsedMode = parseBatchNightlyMode(mode);
 
-   if (forceSequential)
-      setenv("LINGODB_SUBOP_FORCE_SEQUENTIAL", "1", /*overwrite=*/1);
-   else
-      unsetenv("LINGODB_SUBOP_FORCE_SEQUENTIAL");
-   if (parsedMode == BatchNightlyMode::ReuseOnBloomOff)
-      setenv("LINGODB_DISABLE_FILTER_PRED_BLOOM_ADAPTATION", "1", /*overwrite=*/1);
-   else
-      unsetenv("LINGODB_DISABLE_FILTER_PRED_BLOOM_ADAPTATION");
-   if (parsedMode == BatchNightlyMode::ReuseOnBloomOnNoHivDisjoint)
-      setenv("LINGODB_DISABLE_HIV_DISJOINT_CLUSTERING", "1", /*overwrite=*/1);
-   else
-      unsetenv("LINGODB_DISABLE_HIV_DISJOINT_CLUSTERING");
+   setEnvFlag("LINGODB_SUBOP_FORCE_SEQUENTIAL", forceSequential);
+   setEnvFlag("LINGODB_DISABLE_FILTER_PRED_BLOOM_ADAPTATION",
+              parsedMode == BatchNightlyMode::ReuseOnBloomOff);
+   setEnvFlag("LINGODB_DISABLE_HIV_DISJOINT_CLUSTERING",
+              parsedMode == BatchNightlyMode::ReuseOnBloomOnNoHivDisjoint);
+   setEnvFlag("LINGODB_DISABLE_AGGREGATE_DISJOINT_CLUSTERING",
+              parsedMode == BatchNightlyMode::ReuseOnBloomOnNoAggregateDisjoint);
 
    llvm::SmallVector<int, 16> templates = parseIntList(templatesSpec);
    llvm::SmallVector<int, 16> batchSizes = parseIntList(batchSizesSpec);

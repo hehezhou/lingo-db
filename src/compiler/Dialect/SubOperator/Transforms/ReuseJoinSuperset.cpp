@@ -107,6 +107,31 @@ static bool parseFilterPredLayoutSemanticKey(llvm::StringRef semanticKey, unsign
    return static_cast<bool>(parseFilterPredMemberSlot(semanticKey));
 }
 
+struct FilterPredLayoutSlot {
+   bool isPred = false;
+   bool isUnion = false;
+   unsigned slot = 0;
+};
+
+static FilterPredLayoutSlot classifyFilterPredLayoutSlot(llvm::StringRef semanticKey,
+                                                         llvm::StringRef memberName) {
+   FilterPredLayoutSlot out;
+   if (parseReuseFilterPredUnionSemanticKey(semanticKey, out.slot)) {
+      out.isPred = true;
+      out.isUnion = true;
+      return out;
+   }
+   if (parseReuseFilterPredSemanticKey(semanticKey, out.slot)) {
+      out.isPred = true;
+      return out;
+   }
+   if (auto slot = parseFilterPredMemberSlot(memberName)) {
+      out.isPred = true;
+      out.slot = *slot;
+   }
+   return out;
+}
+
 static llvm::StringRef normalizeColumnIdentifier(llvm::StringRef identifier) {
    return stripMemberSuffix(identifier);
 }
@@ -900,6 +925,11 @@ static subop::Member allocUnusedPayloadMemberSlot(subop::MemberManager& mm, mlir
       std::string name = "member$" + std::to_string(nextSlot);
       if (!mm.hasMemberDirect(name)) return mm.createMemberDirect(name, colType);
    }
+}
+
+static void sortUniqueSlots(llvm::SmallVectorImpl<unsigned>& slots) {
+   llvm::sort(slots);
+   slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
 }
 
 static mlir::Type cloneTypeToContext(mlir::Type ty, mlir::MLIRContext* ctx) {
@@ -1947,6 +1977,16 @@ static bool localHivLayoutsSame(subop::HashIndexedViewType a, subop::HashIndexed
           a.getCompareHashForLookup() == b.getCompareHashForLookup();
 }
 
+static bool localHivLayoutHasFilterPredMember(mlir::MLIRContext* ctx,
+                                              subop::HashIndexedViewType layout) {
+   if (!layout) return false;
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (subop::Member member : layout.getValueMembers().getMembers()) {
+      if (parseFilterPredMemberSlot(mm.getName(member))) return true;
+   }
+   return false;
+}
+
 struct DirectMixedDep {
    uint64_t cacheKey;
    subop::HashIndexedViewType layout;
@@ -1959,7 +1999,7 @@ static llvm::SmallVector<DirectMixedDep, 4> directMixedDepsForBuildStep(subop::E
       auto key = cacheGetKeyForStepResult(input);
       if (!key || !seenKeys.insert(*key).second) continue;
       auto layout = asLocalHivLayoutType(input.getType());
-      if (!layout || !mlir::isa<subop::MixedHashIndexedViewType>(input.getType())) continue;
+      if (!localHivLayoutHasFilterPredMember(buildStep.getContext(), layout)) continue;
       deps.push_back(DirectMixedDep{*key, layout});
    }
    return deps;
@@ -2018,17 +2058,18 @@ threadMappedUpstreamMixedPredColumnsToMaterializeStream(
    unsigned sourceIdx = 0;
    for (subop::ScanListOp scanList : inputScanLists) {
       auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(scanList.getElem().getColumn().type);
-      if (!ler || !mlir::isa<subop::MixedHashIndexedViewType>(ler.getState())) continue;
+      if (!ler) continue;
+      auto scannedLayout = asLocalHivLayoutType(ler.getState());
+      if (!localHivLayoutHasFilterPredMember(ctx, scannedLayout)) continue;
       uint64_t depKey = directDepKeyForScanList(scanList, directDeps);
       auto itWantedSlots = wantedSlotsByDep.find(depKey);
       if (itWantedSlots == wantedSlotsByDep.end()) continue;
-      auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(ler.getState());
       for (unsigned depSlot : itWantedSlots->second) {
          std::string key = (llvm::Twine(depKey) + ":" + llvm::Twine(depSlot)).str();
          if (!emitted.insert(key).second) continue;
          std::string predName = ("filter_pred$" + llvm::Twine(depSlot)).str();
          subop::Member predMember;
-         for (subop::Member m : mixed.getValueMembers().getMembers()) {
+         for (subop::Member m : scannedLayout.getValueMembers().getMembers()) {
             if (mm.getName(m) == predName) {
                predMember = m;
                break;
@@ -2853,7 +2894,9 @@ static void syncMaterializeMappingsToBufferMembers(mlir::ModuleOp module, subop:
 static void syncMaterializeMappingsToActualBufferTypes(mlir::ModuleOp module) {
    auto& mm = module.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    module.walk([&](subop::MaterializeOp mat) {
-      subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(mat.getState().getType());
+      mlir::Value actualState = peelBlockArgsToEnclosingOperands(mat.getState());
+      subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(actualState.getType());
+      if (!bufTy) bufTy = getInnerBufferTypeForMaterializeState(mat.getState().getType());
       if (!bufTy) return;
       llvm::DenseSet<subop::Member> bufferMembers(bufTy.getMembers().getMembers().begin(),
                                                   bufTy.getMembers().getMembers().end());
@@ -4351,6 +4394,16 @@ static void debugScanListsMissedByTraverse(mlir::ModuleOp module, const Consumer
    });
 }
 
+template <typename LayoutT>
+static unsigned appendPayloadLayoutSlot(LayoutT& layout, llvm::StringRef semanticKey,
+                                        subop::Member member, mlir::Type type) {
+   unsigned idx = static_cast<unsigned>(layout.payloadMembers.size());
+   layout.payloadSemanticKeys.push_back(semanticKey.str());
+   layout.payloadMembers.push_back(member);
+   layout.payloadColumnTypes.push_back(type);
+   return idx;
+}
+
 static CachedJoinBufferLayout layoutFromUnionPlan(subop::HashIndexedViewType producerHiv,
                                                   const JoinBufferUnionPlan& plan) {
    CachedJoinBufferLayout out;
@@ -4367,10 +4420,8 @@ static CachedJoinBufferLayout layoutFromUnionPlan(subop::HashIndexedViewType pro
       if (itPlan == planIndexByMember.end()) continue;
       unsigned planIdx = itPlan->second;
       const PayloadColumnSpec& spec = plan.payloadColumns[planIdx];
-      unsigned unionIdx = static_cast<unsigned>(out.payloadMembers.size());
-      out.payloadMembers.push_back(producerMember);
-      out.payloadColumnTypes.push_back(plan.payloadMemberTypes[planIdx]);
-      out.payloadSemanticKeys.push_back(spec.semanticKey);
+      unsigned unionIdx = appendPayloadLayoutSlot(out, spec.semanticKey, producerMember,
+                                                  plan.payloadMemberTypes[planIdx]);
       for (unsigned queryIndex : spec.queryIndices) {
          out.querySemanticKeysById[queryIndex].push_back(spec.semanticKey);
          out.querySlotInUnionById[queryIndex].push_back(unionIdx);
@@ -4437,11 +4488,9 @@ static CachedJoinBufferLayout layoutInProducerValueOrder(const CachedJoinBufferL
       }
       if (!oldIdxOpt) continue;
       unsigned oldIdx = *oldIdxOpt;
-      unsigned newIdx = static_cast<unsigned>(out.payloadMembers.size());
-      out.payloadMembers.push_back(producerMember);
-      out.payloadColumnTypes.push_back(layout.payloadColumnTypes[oldIdx]);
       llvm::StringRef semantic = layout.payloadSemanticKeys[oldIdx];
-      out.payloadSemanticKeys.push_back(std::string(semantic));
+      unsigned newIdx = appendPayloadLayoutSlot(out, semantic, producerMember,
+                                                layout.payloadColumnTypes[oldIdx]);
       for (unsigned query : knownQueries) {
          if (!queryOwnsSemantic(query, semantic)) continue;
          out.querySemanticKeysById[query].push_back(std::string(semantic));
@@ -4521,10 +4570,7 @@ static CachedJoinBufferLayout layoutFromMaterializeMapping(subop::HashIndexedVie
             semantic = itOld->second;
          }
       }
-      unsigned newIdx = static_cast<unsigned>(out.payloadMembers.size());
-      out.payloadMembers.push_back(member);
-      out.payloadColumnTypes.push_back(mm.getType(member));
-      out.payloadSemanticKeys.push_back(semantic);
+      unsigned newIdx = appendPayloadLayoutSlot(out, semantic, member, mm.getType(member));
       for (unsigned query : knownQueries) {
          if (!queryOwnsSemantic(query, semantic)) continue;
          out.querySemanticKeysById[query].push_back(semantic);
@@ -5060,6 +5106,93 @@ struct AggregatePeerRewriteInput {
    subop::ExecutionStepOp buildStep;
    ModuleReuseInfo reuse;
 };
+
+struct AggregateUnionGroupInput {
+   const CrossQueryStateMatchEntry* entry = nullptr;
+   unsigned queryId = 0;
+   unsigned filterSlot = 0;
+   mlir::ModuleOp module;
+   mlir::Value state;
+   subop::ExecutionStepOp buildStep;
+   ModuleReuseInfo reuse;
+};
+
+static llvm::SmallVector<AggregateUnionGroupInput, 8>
+collectAggregateUnionGroupInputs(const CrossQueryStateMatchGroup& group,
+                                 llvm::ArrayRef<mlir::ModuleOp> queries) {
+   llvm::SmallVector<AggregateUnionGroupInput, 8> inputs;
+   for (const CrossQueryStateMatchEntry& entry : group.entries) {
+      if (entry.query < 0 || static_cast<size_t>(entry.query) >= queries.size()) continue;
+      if (!entry.state) continue;
+      assert(mlir::isa<subop::PreAggrHtType>(entry.state.getType()) &&
+             "aggregate union group must contain optimistic_ht states");
+      ModuleReuseInfo reuse = collectModuleReuseInfo(queries[entry.query]);
+      subop::ExecutionStepOp buildStep = tryFindAggregateBuildStepForHt(entry.state, reuse);
+      if (!buildStep) return {};
+      inputs.push_back(AggregateUnionGroupInput{&entry, static_cast<unsigned>(entry.query),
+                                                aggregateReuseSlotForEntry(entry), queries[entry.query],
+                                                entry.state, buildStep, std::move(reuse)});
+   }
+   if (inputs.size() < 2) return {};
+   return inputs;
+}
+
+static const AggregateUnionGroupInput*
+selectAggregateUnionDonor(llvm::ArrayRef<AggregateUnionGroupInput> inputs) {
+   const AggregateUnionGroupInput* donor = nullptr;
+   for (const AggregateUnionGroupInput& input : inputs) {
+      if (!donor || input.queryId < donor->queryId) donor = &input;
+   }
+   return donor;
+}
+
+static AggregatePeerRewriteInput
+aggregatePeerRewriteInputFromGroupInput(const AggregateUnionGroupInput& input) {
+   AggregatePeerRewriteInput peer;
+   peer.queryId = input.queryId;
+   peer.filterSlot = input.filterSlot;
+   peer.module = input.module;
+   peer.state = input.state;
+   peer.buildStep = input.buildStep;
+   peer.reuse = input.reuse;
+   return peer;
+}
+
+struct AggregateUnionRewritePlan {
+   CachedAggregateLayout layout;
+   llvm::SmallVector<AggregatePeerRewriteInput, 8> peers;
+   ModuleReuseInfo reuseSynthetic;
+   unsigned donorFilterSlot = 0;
+};
+
+static std::optional<AggregateUnionRewritePlan>
+buildAggregateUnionRewritePlan(mlir::ModuleOp synthetic, mlir::Value syntheticState,
+                               const CrossQueryStateMatchGroup& group,
+                               llvm::ArrayRef<AggregateUnionGroupInput> groupInputs) {
+   const AggregateUnionGroupInput* donor = selectAggregateUnionDonor(groupInputs);
+   if (!donor) return std::nullopt;
+
+   AggregateUnionRewritePlan plan;
+   plan.layout.producerHt = mlir::cast<subop::PreAggrHtType>(syntheticState.getType());
+   plan.layout.mixedByQueryId = group.enableFilterPredReuse;
+   plan.reuseSynthetic = collectModuleReuseInfo(synthetic);
+   plan.donorFilterSlot = donor->filterSlot;
+
+   recordAggregateConsumerPayloadLayout(plan.layout, donor->queryId, donor->module, donor->state,
+                                        donor->reuse);
+   for (const auto& p : collectAggregatePayloadMembers(synthetic, syntheticState, plan.reuseSynthetic)) {
+      appendPayloadLayoutSlot(plan.layout, p.semanticKey, p.member, p.type);
+   }
+
+   for (const AggregateUnionGroupInput& input : groupInputs) {
+      if (&input == donor) continue;
+      AggregatePeerRewriteInput peer = aggregatePeerRewriteInputFromGroupInput(input);
+      recordAggregateConsumerPayloadLayout(plan.layout, peer.queryId, peer.module, peer.state, peer.reuse);
+      plan.peers.push_back(std::move(peer));
+   }
+   assert(!plan.peers.empty() && "aggregate union group must have peer entries");
+   return plan;
+}
 
 static void widenAggregateExternalTableForPeers(mlir::ModuleOp synthetic, subop::ExecutionStepOp buildStep,
                                                 subop::ScanRefsOp scanOp,
@@ -5641,6 +5774,124 @@ static void appendAggregateLookupKey(subop::LookupOrInsertOp lookup, tuples::Col
    ret.erase();
 }
 
+static llvm::SmallVector<unsigned, 8>
+aggregateFilterSlotsForMixedUnion(unsigned donorFilterSlot,
+                                  llvm::ArrayRef<AggregatePeerRewriteInput> peers) {
+   llvm::SmallVector<unsigned, 8> filterSlots;
+   filterSlots.push_back(donorFilterSlot);
+   for (const AggregatePeerRewriteInput& peer : peers) filterSlots.push_back(peer.filterSlot);
+   sortUniqueSlots(filterSlots);
+   return filterSlots;
+}
+
+static tuples::ColumnRefAttr insertSyntheticAggregateQueryIdForUnion(
+   mlir::ModuleOp synthetic, subop::ExecutionStepOp buildStep,
+   subop::LookupOrInsertOp lookup, llvm::ArrayRef<AggregatePeerRewriteInput> peers,
+   const ModuleReuseInfo& reuseSynthetic, unsigned donorFilterSlot) {
+   llvm::SmallVector<unsigned, 8> filterSlots = aggregateFilterSlotsForMixedUnion(donorFilterSlot, peers);
+   std::optional<tuples::ColumnRefAttr> qidRef =
+      insertSyntheticAggregateQueryIdFromMixedPreds(buildStep, filterSlots, donorFilterSlot);
+   if (qidRef) return *qidRef;
+
+   llvm::SmallVector<RuntimeFilterIdClause, 8> clauses;
+   llvm::DenseSet<unsigned> seenClauseSlots;
+   RuntimeFilterIdClause donorClause;
+   donorClause.id = donorFilterSlot;
+   donorClause.filters = decodeFiltersFromTableScanInExecutionStep(buildStep);
+   assert(!donorClause.filters.empty() && "mixed aggregate reuse requires donor simple filters");
+   clauses.push_back(std::move(donorClause));
+   seenClauseSlots.insert(donorFilterSlot);
+   for (const AggregatePeerRewriteInput& peer : peers) {
+      if (!seenClauseSlots.insert(peer.filterSlot).second) continue;
+      RuntimeFilterIdClause clause;
+      clause.id = peer.filterSlot;
+      clause.filters = decodeFiltersFromTableScanInExecutionStep(peer.buildStep);
+      assert(!clause.filters.empty() && "mixed aggregate reuse requires peer simple filters");
+      clauses.push_back(std::move(clause));
+   }
+   subop::ScanRefsOp scanOp = findAggregateTableScanInStep(buildStep);
+   widenAggregateExternalTableForPeers(synthetic, buildStep, scanOp, peers, reuseSynthetic,
+                                       /*mergeFiltersForOrReuse=*/true);
+   return insertSyntheticAggregateQueryIdColumn(buildStep, clauses, donorFilterSlot);
+}
+
+static void appendMixedAggregateQueryIdKey(
+   mlir::ModuleOp synthetic, CachedAggregateLayout& layout,
+   llvm::SmallVectorImpl<subop::Member>& newKeyMembers,
+   subop::ExecutionStepOp buildStep, subop::LookupOrInsertOp lookup,
+   llvm::ArrayRef<AggregatePeerRewriteInput> peers,
+   const ModuleReuseInfo& reuseSynthetic, unsigned donorFilterSlot) {
+   auto* ctx = synthetic.getContext();
+   layout.queryIdMember = makeOrGetAggregateQueryIdMember(ctx);
+   newKeyMembers.push_back(layout.queryIdMember);
+   tuples::ColumnRefAttr qidRef =
+      insertSyntheticAggregateQueryIdForUnion(synthetic, buildStep, lookup, peers, reuseSynthetic,
+                                              donorFilterSlot);
+   appendAggregateLookupKey(lookup, qidRef);
+}
+
+static std::string aggregatePayloadSemanticTypeKey(llvm::StringRef semanticKey, mlir::Type type) {
+   return (semanticKey + "\x1f" + mlirTypeToString(type)).str();
+}
+
+struct AggregateProducerPayloadIndex {
+   llvm::DenseMap<uint64_t, AggregatePayloadMemberInfo> byHash;
+   llvm::StringSet<> semanticTypeKeys;
+   unsigned nextSlot = 0;
+
+   bool containsEquivalentPayload(const AggregatePayloadMemberInfo& payload) const {
+      return byHash.contains(payload.semanticHash) ||
+             semanticTypeKeys.contains(aggregatePayloadSemanticTypeKey(payload.semanticKey, payload.type));
+   }
+
+   void record(const AggregatePayloadMemberInfo& payload, subop::MemberManager& mm) {
+      byHash[payload.semanticHash] = payload;
+      semanticTypeKeys.insert(aggregatePayloadSemanticTypeKey(payload.semanticKey, payload.type));
+      if (auto slot = parseAggregateValueSlot(mm.getName(payload.member))) nextSlot = std::max(nextSlot, *slot + 1);
+   }
+};
+
+static AggregateProducerPayloadIndex buildAggregateProducerPayloadIndex(
+   llvm::ArrayRef<AggregatePayloadMemberInfo> producerInfos, subop::MemberManager& mm) {
+   AggregateProducerPayloadIndex index;
+   for (const auto& payload : producerInfos) index.record(payload, mm);
+   return index;
+}
+
+struct InsertedAggregatePayload {
+   unsigned idx;
+   mlir::Type type;
+   AggregatePayloadKind kind;
+};
+
+static InsertedAggregatePayload insertAggregatePayloadIntoSyntheticBuild(
+   CachedAggregateLayout& layout,
+   llvm::SmallVectorImpl<subop::Member>& newMembers,
+   llvm::SmallVectorImpl<mlir::Type>& newTypes,
+   subop::LookupOrInsertOp lookup,
+   subop::ReduceOp reduce,
+   AggregateProducerPayloadIndex& producerIndex,
+   subop::MemberManager& mm,
+   const AggregatePayloadMemberInfo& payload,
+   tuples::ColumnRefAttr source,
+   mlir::Type slotTy) {
+   AggregatePayloadKind kind = aggregatePayloadKindForSemantic(payload.semanticKey);
+   subop::Member member = allocUnusedAggregateValueSlot(mm, slotTy, producerIndex.nextSlot);
+   unsigned insertIdx = layout.payloadSemanticKeys.size();
+   newMembers.insert(newMembers.begin() + insertIdx, member);
+   newTypes.insert(newTypes.begin() + insertIdx, slotTy);
+   layout.payloadSemanticKeys.insert(layout.payloadSemanticKeys.begin() + insertIdx, payload.semanticKey);
+   layout.payloadMembers.insert(layout.payloadMembers.begin() + insertIdx, member);
+   layout.payloadColumnTypes.insert(layout.payloadColumnTypes.begin() + insertIdx, slotTy);
+   insertAggregateLookupInitial(lookup, insertIdx, slotTy, kind);
+   insertAggregateReduceUpdate(reduce, insertIdx, source, member, slotTy, kind);
+   insertAggregateReduceCombine(reduce, insertIdx, slotTy, kind);
+   producerIndex.record(AggregatePayloadMemberInfo{payload.semanticKey, payload.semanticHash, member, slotTy,
+                                                   payload.sourceColumn},
+                        mm);
+   return InsertedAggregatePayload{insertIdx, slotTy, kind};
+}
+
 static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::Value syntheticHtState,
                                                 CachedAggregateLayout& layout,
                                                 llvm::ArrayRef<AggregatePeerRewriteInput> peers,
@@ -5660,51 +5911,13 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
                                                   oldHt.getKeyMembers().getMembers().end());
 
    if (layout.mixedByQueryId) {
-      llvm::SmallVector<unsigned, 8> filterSlots;
-      filterSlots.push_back(donorQueryId);
-      for (const AggregatePeerRewriteInput& peer : peers) {
-         filterSlots.push_back(peer.filterSlot);
-      }
-      layout.queryIdMember = makeOrGetAggregateQueryIdMember(ctx);
-      newKeyMembers.push_back(layout.queryIdMember);
-
-      std::optional<tuples::ColumnRefAttr> qidRef =
-         insertSyntheticAggregateQueryIdFromMixedPreds(buildStep, filterSlots, donorQueryId);
-      if (!qidRef) {
-         llvm::SmallVector<RuntimeFilterIdClause, 8> clauses;
-         llvm::DenseSet<unsigned> seenClauseSlots;
-         RuntimeFilterIdClause donorClause;
-         donorClause.id = donorQueryId;
-         donorClause.filters = decodeFiltersFromTableScanInExecutionStep(buildStep);
-         assert(!donorClause.filters.empty() && "mixed aggregate reuse requires donor simple filters");
-         clauses.push_back(std::move(donorClause));
-         seenClauseSlots.insert(donorQueryId);
-         for (const AggregatePeerRewriteInput& peer : peers) {
-            if (!seenClauseSlots.insert(peer.filterSlot).second) continue;
-            RuntimeFilterIdClause clause;
-            clause.id = peer.filterSlot;
-            clause.filters = decodeFiltersFromTableScanInExecutionStep(peer.buildStep);
-            assert(!clause.filters.empty() && "mixed aggregate reuse requires peer simple filters");
-            clauses.push_back(std::move(clause));
-         }
-         subop::ScanRefsOp scanOp = findAggregateTableScanInStep(buildStep);
-         widenAggregateExternalTableForPeers(synthetic, buildStep, scanOp, peers, reuseSynthetic,
-                                             /*mergeFiltersForOrReuse=*/true);
-         qidRef = insertSyntheticAggregateQueryIdColumn(buildStep, clauses, donorQueryId);
-      }
-      appendAggregateLookupKey(lookup, *qidRef);
+      appendMixedAggregateQueryIdKey(synthetic, layout, newKeyMembers, buildStep, lookup, peers,
+                                     reuseSynthetic, donorQueryId);
    }
 
    llvm::SmallVector<AggregatePayloadMemberInfo, 16> producerInfos =
       collectAggregatePayloadMembers(synthetic, syntheticHtState, buildStep);
-   llvm::DenseMap<uint64_t, AggregatePayloadMemberInfo> producerByHash;
-   llvm::StringSet<> producerSemanticTypeKeys;
-   unsigned nextSlot = 0;
-   for (const auto& p : producerInfos) {
-      producerByHash[p.semanticHash] = p;
-      producerSemanticTypeKeys.insert(p.semanticKey + "\x1f" + mlirTypeToString(p.type));
-      if (auto slot = parseAggregateValueSlot(mm.getName(p.member))) nextSlot = std::max(nextSlot, *slot + 1);
-   }
+   AggregateProducerPayloadIndex producerIndex = buildAggregateProducerPayloadIndex(producerInfos, mm);
 
    llvm::SmallVector<subop::Member> newMembers(oldHt.getValueMembers().getMembers().begin(),
                                                oldHt.getValueMembers().getMembers().end());
@@ -5712,19 +5925,13 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
    for (subop::Member m : newMembers) newTypes.push_back(mm.getType(m));
 
    subop::MapOp producerMap;
-   struct InsertedAggregatePayload {
-      unsigned idx;
-      mlir::Type type;
-      AggregatePayloadKind kind;
-   };
    llvm::SmallVector<InsertedAggregatePayload, 4> insertedPayloads;
    for (const AggregatePeerRewriteInput& peer : peers) {
       llvm::SmallVector<AggregatePayloadMemberInfo, 16> peerInfos =
          collectAggregatePayloadMembers(peer.module, peer.state, peer.buildStep);
       for (unsigned peerIdx = 0; peerIdx < peerInfos.size(); ++peerIdx) {
          const auto& p = peerInfos[peerIdx];
-         if (producerByHash.contains(p.semanticHash)) continue;
-         if (producerSemanticTypeKeys.contains(p.semanticKey + "\x1f" + mlirTypeToString(p.type))) continue;
+         if (producerIndex.containsEquivalentPayload(p)) continue;
          if (p.semanticKey == "count:*") continue;
          tuples::ColumnRefAttr source = cloneColumnRefToContext(p.sourceColumn, ctx);
          auto sourceProducerMap = findMapProducingColumn(buildStep, source, cm);
@@ -5741,21 +5948,8 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
                                                    reuseSynthetic, peer.reuse, synthetic);
          }
          mlir::Type slotTy = cloneTypeToContext(p.type, ctx);
-         AggregatePayloadKind kind = aggregatePayloadKindForSemantic(p.semanticKey);
-         subop::Member member = allocUnusedAggregateValueSlot(mm, slotTy, nextSlot);
-         unsigned insertIdx = layout.payloadSemanticKeys.size();
-         newMembers.insert(newMembers.begin() + insertIdx, member);
-         newTypes.insert(newTypes.begin() + insertIdx, slotTy);
-         layout.payloadSemanticKeys.insert(layout.payloadSemanticKeys.begin() + insertIdx, p.semanticKey);
-         layout.payloadMembers.insert(layout.payloadMembers.begin() + insertIdx, member);
-         layout.payloadColumnTypes.insert(layout.payloadColumnTypes.begin() + insertIdx, slotTy);
-         insertAggregateLookupInitial(lookup, insertIdx, slotTy, kind);
-         insertAggregateReduceUpdate(reduce, insertIdx, source, member, slotTy, kind);
-         insertAggregateReduceCombine(reduce, insertIdx, slotTy, kind);
-         insertedPayloads.push_back({insertIdx, slotTy, kind});
-         producerByHash[p.semanticHash] =
-            AggregatePayloadMemberInfo{p.semanticKey, p.semanticHash, member, slotTy, p.sourceColumn};
-         producerSemanticTypeKeys.insert(p.semanticKey + "\x1f" + mlirTypeToString(p.type));
+         insertedPayloads.push_back(insertAggregatePayloadIntoSyntheticBuild(
+            layout, newMembers, newTypes, lookup, reduce, producerIndex, mm, p, source, slotTy));
       }
    }
 
@@ -6473,8 +6667,8 @@ static bool consumerQueryHadPayloadColumn(const CachedJoinBufferLayout& layout, 
       return llvm::is_contained(it->second, semKey);
    }
    if (consumerQueryIndex == 0) return llvm::is_contained(layout.query0SemanticKeys, semKey);
-   assert(consumerQueryIndex == 1 && "join layout must record payload ownership for N-way consumers");
-   return llvm::is_contained(layout.query1SemanticKeys, semKey);
+   if (consumerQueryIndex == 1) return llvm::is_contained(layout.query1SemanticKeys, semKey);
+   return layout.querySemanticKeysById.empty();
 }
 
 /// Remap \c gather member keys to the aligned \c cache_get HIV layout (semantic keys, not slot guessing).
@@ -6828,9 +7022,8 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
       } else {
          consumerMem = cloneMemberToContext(m, producerCtx, ctx, /*allowMemberTypeUpdate=*/false);
       }
-      outConsumerLayout.payloadMembers.push_back(consumerMem);
-      outConsumerLayout.payloadColumnTypes.push_back(mm.getType(consumerMem));
-      outConsumerLayout.payloadSemanticKeys.push_back(layout.payloadSemanticKeys[i]);
+      appendPayloadLayoutSlot(outConsumerLayout, layout.payloadSemanticKeys[i], consumerMem,
+                              mm.getType(consumerMem));
    }
    return consumerHiv;
 }
@@ -6992,16 +7185,14 @@ void insertSyntheticFilterPredsAfterColumnUnion(
       modByQuery[static_cast<unsigned>(match.queryB)] = query1;
 
       for (size_t i = 0; i < layout.payloadSemanticKeys.size(); ++i) {
-         unsigned qIdx = 0;
-         if (parseReuseFilterPredUnionSemanticKey(layout.payloadSemanticKeys[i], qIdx)) {
+         FilterPredLayoutSlot predSlot =
+            classifyFilterPredLayoutSlot(layout.payloadSemanticKeys[i], mm.getName(layout.payloadMembers[i]));
+         if (!predSlot.isPred) continue;
+         if (predSlot.isUnion) {
             unionPredMembers.push_back(layout.payloadMembers[i]);
             continue;
          }
-         if (auto slot = parseFilterPredMemberSlot(mm.getName(layout.payloadMembers[i]))) {
-            qIdx = *slot;
-         } else if (!parseReuseFilterPredSemanticKey(layout.payloadSemanticKeys[i], qIdx)) {
-            continue;
-         }
+         unsigned qIdx = predSlot.slot;
          auto itH = hivByQuery.find(qIdx);
          auto itR = reuseByQuery.find(qIdx);
          auto itMod = modByQuery.find(qIdx);
@@ -7041,8 +7232,10 @@ void insertSyntheticFilterPredsAfterColumnUnion(
       }
 
       for (size_t i = 0; i < layout.payloadSemanticKeys.size(); ++i) {
-         unsigned qIdx = 0;
-         if (!parseReuseFilterPredSemanticKey(layout.payloadSemanticKeys[i], qIdx)) continue;
+         FilterPredLayoutSlot predSlot =
+            classifyFilterPredLayoutSlot(layout.payloadSemanticKeys[i], mm.getName(layout.payloadMembers[i]));
+         if (!predSlot.isPred || predSlot.isUnion) continue;
+         unsigned qIdx = predSlot.slot;
          llvm::StringRef predName = mm.getName(layout.payloadMembers[i]);
          subop::ExecutionStepOp peerBuild = peerBuilds.lookup(qIdx);
          assert(peerBuild && "insertSyntheticFilterPreds: missing peer build for filter_pred slot");
@@ -7109,12 +7302,9 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
       const CrossQueryStateMatchGroup& group = *itG->second;
       bool layoutHasFilterPredSlots = false;
       for (size_t i = 0; i < layout.payloadMembers.size(); ++i) {
-         unsigned slot = 0;
          llvm::StringRef semantic;
          if (i < layout.payloadSemanticKeys.size()) semantic = layout.payloadSemanticKeys[i];
-         if (parseReuseFilterPredSemanticKey(semantic, slot) ||
-             parseReuseFilterPredUnionSemanticKey(semantic, slot) ||
-             parseFilterPredMemberSlot(mm.getName(layout.payloadMembers[i])).has_value()) {
+         if (classifyFilterPredLayoutSlot(semantic, mm.getName(layout.payloadMembers[i])).isPred) {
             layoutHasFilterPredSlots = true;
             break;
          }
@@ -7140,20 +7330,16 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
       llvm::DenseMap<unsigned, subop::Member> predMembers;
       llvm::SmallVector<subop::Member, 2> unionPredMembers;
       for (size_t i = 0; i < layout.payloadMembers.size(); ++i) {
-         unsigned qIdx = 0;
          llvm::StringRef semantic;
          if (i < layout.payloadSemanticKeys.size()) semantic = layout.payloadSemanticKeys[i];
-         if (parseReuseFilterPredUnionSemanticKey(semantic, qIdx)) {
+         FilterPredLayoutSlot predSlot =
+            classifyFilterPredLayoutSlot(semantic, mm.getName(layout.payloadMembers[i]));
+         if (!predSlot.isPred) continue;
+         if (predSlot.isUnion) {
             unionPredMembers.push_back(layout.payloadMembers[i]);
             continue;
          }
-         if (!parseReuseFilterPredSemanticKey(semantic, qIdx)) {
-            if (auto slot = parseFilterPredMemberSlot(mm.getName(layout.payloadMembers[i]))) {
-               qIdx = *slot;
-            } else {
-               continue;
-            }
-         }
+         unsigned qIdx = predSlot.slot;
          auto itH = hivBySlot.find(qIdx);
          auto itR = reuseInfoBySlot.find(qIdx);
          auto itM = moduleBySlot.find(qIdx);
@@ -7378,6 +7564,41 @@ static void ensureReuseFilterPredColumn(JoinBufferUnionPlan& plan, unsigned quer
    refreshPayloadMemberTypes(plan);
 }
 
+struct JoinGroupPrimaryEntries {
+   const CrossQueryStateMatchEntry* donor = nullptr;
+   const CrossQueryStateMatchEntry* firstPeer = nullptr;
+};
+
+static bool joinGroupEntryValidForQueryList(const CrossQueryStateMatchEntry& entry, size_t numQueries) {
+   return entry.query >= 0 && static_cast<size_t>(entry.query) < numQueries && entry.state;
+}
+
+static JoinGroupPrimaryEntries selectJoinGroupPrimaryEntries(
+   const CrossQueryStateMatchGroup& group,
+   size_t numQueries) {
+   JoinGroupPrimaryEntries selected;
+   for (const CrossQueryStateMatchEntry& entry : group.entries) {
+      if (!joinGroupEntryValidForQueryList(entry, numQueries)) continue;
+      if (!selected.donor || entry.query < selected.donor->query) selected.donor = &entry;
+   }
+   if (!selected.donor) return selected;
+
+   auto findPeer = [&](bool requireDifferentReuseSlot) -> const CrossQueryStateMatchEntry* {
+      for (const CrossQueryStateMatchEntry& entry : group.entries) {
+         if (&entry == selected.donor) continue;
+         if (!joinGroupEntryValidForQueryList(entry, numQueries)) continue;
+         if (requireDifferentReuseSlot &&
+             reuseSlotForEntry(entry) == reuseSlotForEntry(*selected.donor))
+            continue;
+         return &entry;
+      }
+      return nullptr;
+   };
+   selected.firstPeer = findPeer(/*requireDifferentReuseSlot=*/group.enableFilterPredReuse);
+   if (!selected.firstPeer) selected.firstPeer = findPeer(/*requireDifferentReuseSlot=*/false);
+   return selected;
+}
+
 void extendSyntheticJoinBuffersToColumnUnionForGroups(
    mlir::ModuleOp synthetic, llvm::ArrayRef<mlir::ModuleOp> queries,
    llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
@@ -7401,29 +7622,10 @@ void extendSyntheticJoinBuffersToColumnUnionForGroups(
       if (!group.requiresJoinLayoutUnion) continue;
       if (!asHashIndexedViewLayoutType(t.state.getType())) continue;
 
-      const CrossQueryStateMatchEntry* donor = nullptr;
-      const CrossQueryStateMatchEntry* firstPeer = nullptr;
-      for (const CrossQueryStateMatchEntry& entry : group.entries) {
-         if (entry.query < 0 || static_cast<size_t>(entry.query) >= queries.size() || !entry.state) continue;
-         if (!donor || entry.query < donor->query) donor = &entry;
-      }
-      if (!donor) continue;
-      for (const CrossQueryStateMatchEntry& entry : group.entries) {
-         if (&entry == donor) continue;
-         if (entry.query < 0 || static_cast<size_t>(entry.query) >= queries.size() || !entry.state) continue;
-         if (group.enableFilterPredReuse && reuseSlotForEntry(entry) == reuseSlotForEntry(*donor)) continue;
-         firstPeer = &entry;
-         break;
-      }
-      if (!firstPeer) {
-         for (const CrossQueryStateMatchEntry& entry : group.entries) {
-            if (&entry == donor) continue;
-            if (entry.query < 0 || static_cast<size_t>(entry.query) >= queries.size() || !entry.state) continue;
-            firstPeer = &entry;
-            break;
-         }
-      }
-      if (!firstPeer) continue;
+      JoinGroupPrimaryEntries primary = selectJoinGroupPrimaryEntries(group, queries.size());
+      if (!primary.donor || !primary.firstPeer) continue;
+      const CrossQueryStateMatchEntry* donor = primary.donor;
+      const CrossQueryStateMatchEntry* firstPeer = primary.firstPeer;
 
       const ModuleReuseInfo& reuseDonor = reuseByQuery[donor->query];
       const ModuleReuseInfo& reusePeer = reuseByQuery[firstPeer->query];
@@ -7577,8 +7779,26 @@ void extendSyntheticJoinBuffersToColumnUnion(mlir::ModuleOp synthetic, mlir::Mod
    }
 }
 
+static llvm::SmallVector<unsigned, 8> sortedFilterPredSlotsInMembers(mlir::MLIRContext* ctx,
+                                                                     subop::StateMembersAttr members) {
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   llvm::SmallVector<unsigned, 8> slots;
+   for (subop::Member member : members.getMembers()) {
+      if (auto slot = parseFilterPredMemberSlot(mm.getName(member))) slots.push_back(*slot);
+   }
+   sortUniqueSlots(slots);
+   return slots;
+}
+
+static llvm::SmallVector<unsigned, 8> localFilterPredSlotsInMixedMembers(mlir::MLIRContext* ctx,
+                                                                         subop::StateMembersAttr members) {
+   llvm::SmallVector<unsigned, 8> slots = sortedFilterPredSlotsInMembers(ctx, members);
+   assert(!slots.empty() && "mixed HIV must expose at least one filter_pred slot");
+   slots.pop_back();
+   return slots;
+}
+
 static llvm::SmallVector<unsigned, 8> inheritedMixedPredSlotsInBuildStep(subop::ExecutionStepOp buildStep) {
-   auto& mm = buildStep.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    llvm::DenseSet<unsigned> seen;
    llvm::SmallVector<unsigned, 8> slots;
    buildStep.walk([&](subop::ScanListOp scanList) {
@@ -7586,17 +7806,7 @@ static llvm::SmallVector<unsigned, 8> inheritedMixedPredSlotsInBuildStep(subop::
       if (!ler) return;
       auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(ler.getState());
       if (!mixed) return;
-      std::optional<unsigned> unionSlot;
-      llvm::SmallVector<unsigned, 8> localSlots;
-      for (subop::Member member : mixed.getValueMembers().getMembers()) {
-         auto slot = parseFilterPredMemberSlot(mm.getName(member));
-         if (!slot) continue;
-         localSlots.push_back(*slot);
-         if (!unionSlot || *slot > *unionSlot) unionSlot = *slot;
-      }
-      assert(unionSlot && "mixed HIV scan_list must expose at least one filter_pred slot");
-      for (unsigned slot : localSlots) {
-         if (slot == *unionSlot) continue;
+      for (unsigned slot : localFilterPredSlotsInMixedMembers(buildStep.getContext(), mixed.getValueMembers())) {
          if (seen.insert(slot).second) slots.push_back(slot);
       }
    });
@@ -7609,7 +7819,8 @@ static llvm::SmallVector<uint64_t, 4> inheritedMixedCacheDepsInBuildStep(subop::
    llvm::SmallVector<uint64_t, 4> deps;
    auto recordCacheGetStep = [&](subop::ExecutionStepOp step) {
       step.walk([&](subop::CacheGetOp get) {
-         if (!mlir::isa<subop::MixedHashIndexedViewType>(get.getResult().getType())) return;
+         auto layout = asLocalHivLayoutType(get.getResult().getType());
+         if (!localHivLayoutHasFilterPredMember(buildStep.getContext(), layout)) return;
          uint64_t key = static_cast<uint64_t>(get.getKey());
          if (seen.insert(key).second) deps.push_back(key);
       });
@@ -7620,62 +7831,6 @@ static llvm::SmallVector<uint64_t, 4> inheritedMixedCacheDepsInBuildStep(subop::
       }
    }
    return deps;
-}
-
-static JoinBufferUnionPlan buildInheritedMixedPredPlan(mlir::ModuleOp synthetic,
-                                                       mlir::Value syntheticHiv,
-                                                       subop::ExecutionStepOp buildStep,
-                                                       subop::MaterializeOp mat,
-                                                       llvm::ArrayRef<unsigned> predSlots,
-                                                       const ModuleReuseInfo& reuseSynthetic) {
-   auto* ctx = synthetic.getContext();
-   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
-
-   subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(mat.getState().getType());
-   assert(bufTy && "inherited mixed pred target must materialize into a join buffer");
-
-   subop::CreateHashIndexedView chiv;
-   mlir::Value mergedBuffer = resolveJoinMergedBuffer(syntheticHiv, synthetic, reuseSynthetic);
-   mlir::Value canonMergedBuffer = canonicalizeStateValueForReuse(mergedBuffer);
-   synthetic.walk([&](subop::CreateHashIndexedView op) {
-      if (chiv) return;
-      if (canonicalizeStateValueForReuse(op.getSource()) == canonMergedBuffer) chiv = op;
-   });
-   assert(chiv && "inherited mixed pred target must create a hash indexed view");
-
-   JoinBufferUnionPlan plan;
-   resolveHashLinkMembersForChiv(chiv, bufTy, mm, plan.hashMember, plan.linkMember);
-   assert(plan.hashMember && plan.linkMember && "inherited mixed pred target must have hash/link members");
-
-   llvm::DenseMap<const void*, uint64_t> columnHashes =
-      collectStateConstructionColumnHashes(synthetic, syntheticHiv);
-   unsigned stableOrder = 0;
-   for (auto& [member, colRef] : mat.getMapping().getMapping()) {
-      if (member == plan.linkMember || member == plan.hashMember) continue;
-      llvm::StringRef memberName = mm.getName(member);
-      if (isJoinBufferInternalMemberName(memberName) || parseFilterPredMemberSlot(memberName)) continue;
-      auto [scope, leaf] = cm.getName(&colRef.getColumn());
-      PayloadColumnSpec spec;
-      spec.scope = scope;
-      spec.leaf = leaf;
-      spec.semanticKey = columnSemanticKey(scope, leaf);
-      spec.semanticHash = payloadColumnIdentityHash(colRef, columnHashes);
-      spec.colType = colRef.getColumn().type;
-      spec.queryIndices.assign(predSlots.begin(), predSlots.end());
-      spec.stableOrder = stableOrder++;
-      plan.payloadColumns.push_back(std::move(spec));
-   }
-   refreshPayloadMemberTypes(plan);
-   for (unsigned slot : predSlots) ensureReuseFilterPredColumn(plan, slot, ctx);
-   unsigned unionSlot = filterPredUnionSlotForQueryIndices(predSlots);
-   ensureFilterPredUnionColumn(plan, unionSlot, ctx);
-   return plan;
-}
-
-static void sortUniqueSlots(llvm::SmallVectorImpl<unsigned>& slots) {
-   llvm::sort(slots);
-   slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
 }
 
 static llvm::SmallVector<unsigned, 8> consumerSlotsForCacheKey(
@@ -7696,10 +7851,7 @@ static llvm::SmallVector<unsigned, 8> consumerSlotsForCacheKey(
 static llvm::DenseSet<unsigned> filterPredSlotsInMembers(mlir::MLIRContext* ctx,
                                                          subop::StateMembersAttr members) {
    llvm::DenseSet<unsigned> slots;
-   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   for (subop::Member member : members.getMembers()) {
-      if (auto slot = parseFilterPredMemberSlot(mm.getName(member))) slots.insert(*slot);
-   }
+   for (unsigned slot : sortedFilterPredSlotsInMembers(ctx, members)) slots.insert(slot);
    return slots;
 }
 
@@ -7707,6 +7859,24 @@ static llvm::DenseSet<unsigned> filterPredSlotsInHivLikeType(mlir::Type type) {
    if (auto hiv = asHashIndexedViewLayoutType(type))
       return filterPredSlotsInMembers(type.getContext(), hiv.getValueMembers());
    return {};
+}
+
+static subop::StateMembersAttr joinBufferMembersWithFilterPredSlots(mlir::MLIRContext* ctx,
+                                                                    subop::BufferType bufTy,
+                                                                    llvm::ArrayRef<unsigned> predSlots,
+                                                                    unsigned unionSlot) {
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   llvm::SmallVector<subop::Member> members(bufTy.getMembers().getMembers().begin(),
+                                            bufTy.getMembers().getMembers().end());
+   llvm::StringSet<> existing;
+   for (subop::Member member : members) existing.insert(mm.getName(member));
+   auto appendPredSlot = [&](unsigned slot) {
+      subop::Member predMember = makeOrGetPredMemberForSlot(ctx, slot);
+      if (existing.insert(mm.getName(predMember)).second) members.push_back(predMember);
+   };
+   for (unsigned slot : predSlots) appendPredSlot(slot);
+   appendPredSlot(unionSlot);
+   return subop::StateMembersAttr::get(ctx, members);
 }
 
 void extendSyntheticJoinBuffersWithInheritedMixedPreds(
@@ -7743,33 +7913,25 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
       if (!targetState || !asHashIndexedViewLayoutType(targetState.getType())) continue;
       subop::ExecutionStepOp buildStep = findStrictJoinBufferBuildStepForHiv(synthetic, targetState, reuseSynthetic);
       if (!buildStep) continue;
+      llvm::SmallVector<uint64_t, 4> inheritedDeps;
+      if (auto itDeps = inheritedDepsByTargetKey.find(target.cacheKey); itDeps != inheritedDepsByTargetKey.end())
+         inheritedDeps = itDeps->second;
+      else
+         inheritedDeps = inheritedMixedCacheDepsInBuildStep(buildStep);
+      if (inheritedDeps.empty()) continue;
       llvm::SmallVector<unsigned, 8> predSlots = inheritedMixedPredSlotsInBuildStep(buildStep);
       llvm::SmallVector<unsigned, 8> consumerSlots =
          consumerSlotsForCacheKey(target.cacheKey, consumerSlotByCacheKeyAndQuery);
       if (!consumerSlots.empty()) {
          predSlots = std::move(consumerSlots);
       } else if (auto mixedTarget = mlir::dyn_cast<subop::MixedHashIndexedViewType>(targetState.getType())) {
-            llvm::SmallVector<unsigned, 8> targetSlots;
-            std::optional<unsigned> unionSlot;
-            for (subop::Member member : mixedTarget.getValueMembers().getMembers()) {
-               auto slot = parseFilterPredMemberSlot(mm.getName(member));
-               if (!slot) continue;
-               targetSlots.push_back(*slot);
-               if (!unionSlot || *slot > *unionSlot) unionSlot = *slot;
-            }
-            assert(unionSlot && "mixed target must have a union predicate slot");
-            llvm::erase_if(targetSlots, [&](unsigned slot) { return slot == *unionSlot; });
-            sortUniqueSlots(targetSlots);
+            llvm::SmallVector<unsigned, 8> targetSlots =
+               localFilterPredSlotsInMixedMembers(synthetic.getContext(), mixedTarget.getValueMembers());
             if (!targetSlots.empty()) predSlots = std::move(targetSlots);
       }
       if (predSlots.empty()) continue;
       sortUniqueSlots(predSlots);
       unsigned unionSlot = filterPredUnionSlotForQueryIndices(predSlots);
-      llvm::SmallVector<uint64_t, 4> inheritedDeps;
-      if (auto itDeps = inheritedDepsByTargetKey.find(target.cacheKey); itDeps != inheritedDepsByTargetKey.end())
-         inheritedDeps = itDeps->second;
-      else
-         inheritedDeps = inheritedMixedCacheDepsInBuildStep(buildStep);
       if (outInheritedDepsByCacheKey) (*outInheritedDepsByCacheKey)[target.cacheKey] = inheritedDeps;
       if (consumerSlotByCacheKeyAndQuery)
          inheritSlotMapForSyntheticTarget(target.cacheKey, inheritedDeps, *consumerSlotByCacheKeyAndQuery);
@@ -7801,15 +7963,24 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
             layoutContainsRequiredPreds = layoutContainsRequiredPreds && typeSlots.contains(slot);
       }
 
-      JoinBufferUnionPlan plan;
-      CachedJoinBufferLayout planLayout;
-      bool hasPlanLayout = false;
       if (!layoutAlreadyHasPreds || !layoutContainsRequiredPreds) {
-         plan = buildInheritedMixedPredPlan(synthetic, targetState, buildStep, mat, predSlots, reuseSynthetic);
-         applyUnionPlanToSyntheticHiv(synthetic, targetState, plan, reuseSynthetic,
-                                      synthetic, targetState, reuseSynthetic,
-                                      synthetic, targetState, reuseSynthetic);
-         hasPlanLayout = true;
+         subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(mat.getState().getType());
+         assert(bufTy && "inherited mixed pred target must materialize a join buffer");
+         mlir::Value mergedBuffer = resolveJoinMergedBuffer(targetState, synthetic, reuseSynthetic);
+         subop::StateMembersAttr targetMembers =
+            joinBufferMembersWithFilterPredSlots(synthetic.getContext(), bufTy, predSlots, unionSlot);
+         applyBufferLayoutToSsaClosure(synthetic, {mergedBuffer}, targetMembers, reuseSynthetic);
+         auto targetBufTy = subop::BufferType::get(synthetic.getContext(), targetMembers);
+         auto targetTlTy = subop::ThreadLocalType::get(synthetic.getContext(), mlir::cast<subop::State>(targetBufTy));
+         if (mlir::isa<subop::BufferType>(mat.getState().getType())) {
+            mat.getState().setType(targetBufTy);
+         } else if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(mat.getState().getType())) {
+            if (mlir::isa<subop::BufferType>(tl.getWrapped())) mat.getState().setType(targetTlTy);
+         }
+         syncMaterializeMappingsToActualBufferTypes(synthetic);
+         synchronizeExecutionStepPortTypes(synthetic, nullptr);
+         mat = findJoinBufferMaterializeInStep(buildStep);
+         assert(mat && "inherited mixed pred target must still materialize a join buffer");
       }
 
       llvm::SmallVector<tuples::ColumnRefAttr, 8> inheritedPredRefs;
@@ -7837,8 +8008,9 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
          assert(consumerSlotByCacheKeyAndQuery &&
                 "inherited mixed pred rewrite requires explicit slot mapping");
          refs.append(upstreamRefs.begin(), upstreamRefs.end());
-         if (refs.empty())
+         if (refs.empty()) {
             llvm_unreachable("inherited mixed pred target must materialize upstream predicate");
+         }
          tuples::ColumnRefAttr combined =
             insertAndPredsBeforeMaterialize(mat, refs,
                                             ("reuse_inherited_combined_pred$" + llvm::Twine(slot)).str());
@@ -7858,12 +8030,9 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
       mlir::Value producer = findHashIndexedViewBuiltByStep(synthetic, buildStep, afterPreds);
       assert(producer && "inherited mixed pred target must still produce a hash indexed view");
       if (outLayouts) {
-         if (hasPlanLayout)
-            planLayout = layoutFromUnionPlan(asHashIndexedViewLayoutType(producer.getType()), plan);
          const CachedJoinBufferLayout* previousLayout = nullptr;
          if (auto itPrev = outLayouts->find(target.cacheKey); itPrev != outLayouts->end())
             previousLayout = &itPrev->second;
-         if (!previousLayout && hasPlanLayout) previousLayout = &planLayout;
          (*outLayouts)[target.cacheKey] =
             layoutFromMaterializeMapping(asHashIndexedViewLayoutType(producer.getType()), mat, previousLayout);
       }
@@ -7913,51 +8082,14 @@ void extendSyntheticAggregateHashTablesToPayloadUnionForGroups(
       const CrossQueryStateMatchGroup& group = *itG->second;
       if (!mlir::isa<subop::PreAggrHtType>(t.state.getType())) continue;
       assert(group.entries.size() >= 2 && "aggregate union group must have at least two entries");
-      const CrossQueryStateMatchEntry* donor = nullptr;
-      for (const CrossQueryStateMatchEntry& e : group.entries) {
-         if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
-         if (!e.state) continue;
-         assert(mlir::isa<subop::PreAggrHtType>(e.state.getType()) &&
-                "aggregate union group must contain optimistic_ht states");
-         if (!tryFindAggregateBuildStepForHt(e.state, collectModuleReuseInfo(queries[e.query]))) {
-            donor = nullptr;
-            break;
-         }
-         if (!donor || e.query < donor->query) donor = &e;
-      }
-      if (!donor) continue;
-
-      CachedAggregateLayout layout;
-      layout.producerHt = mlir::cast<subop::PreAggrHtType>(t.state.getType());
-      layout.mixedByQueryId = group.enableFilterPredReuse;
-      ModuleReuseInfo reuseSynthetic = collectModuleReuseInfo(synthetic);
-      recordAggregateConsumerPayloadLayout(layout, static_cast<unsigned>(donor->query),
-                                           queries[donor->query], donor->state,
-                                           collectModuleReuseInfo(queries[donor->query]));
-      for (const auto& p : collectAggregatePayloadMembers(synthetic, t.state, reuseSynthetic)) {
-         layout.payloadSemanticKeys.push_back(p.semanticKey);
-         layout.payloadMembers.push_back(p.member);
-         layout.payloadColumnTypes.push_back(p.type);
-      }
-
-      llvm::SmallVector<AggregatePeerRewriteInput, 8> peers;
-      for (const CrossQueryStateMatchEntry& e : group.entries) {
-         if (&e == donor) continue;
-         if (e.query < 0 || static_cast<size_t>(e.query) >= queries.size()) continue;
-         AggregatePeerRewriteInput peer;
-         peer.queryId = static_cast<unsigned>(e.query);
-         peer.filterSlot = aggregateReuseSlotForEntry(e);
-         peer.module = queries[e.query];
-         peer.state = e.state;
-         peer.reuse = collectModuleReuseInfo(peer.module);
-         peer.buildStep = findAggregateBuildStepForHt(peer.state, peer.reuse);
-         recordAggregateConsumerPayloadLayout(layout, peer.queryId, peer.module, peer.state, peer.reuse);
-         peers.push_back(std::move(peer));
-      }
-      assert(!peers.empty() && "aggregate union group must have peer entries");
-      applySyntheticAggregatePayloadUnion(synthetic, t.state, layout, peers, reuseSynthetic,
-                                          aggregateReuseSlotForEntry(*donor));
-      if (outLayouts) (*outLayouts)[t.cacheKey] = std::move(layout);
+      llvm::SmallVector<AggregateUnionGroupInput, 8> groupInputs =
+         collectAggregateUnionGroupInputs(group, queries);
+      std::optional<AggregateUnionRewritePlan> plan =
+         buildAggregateUnionRewritePlan(synthetic, t.state, group, groupInputs);
+      if (!plan) continue;
+      applySyntheticAggregatePayloadUnion(synthetic, t.state, plan->layout, plan->peers,
+                                          plan->reuseSynthetic, plan->donorFilterSlot);
+      if (outLayouts) (*outLayouts)[t.cacheKey] = std::move(plan->layout);
    }
 }
 
@@ -8095,8 +8227,11 @@ void applyProbePredFiltersForConsumerClosures(mlir::ModuleOp consumer,
       subop::Member predMember;
       if (probe.consumerReuseQueryIndex) {
          assert(probe.cacheKey && "mixed HIV probe predicate slot rewrite requires a cache_get key");
-         setMixedLookupPredSlotForCacheGet(consumer, *probe.cacheKey, *probe.consumerReuseQueryIndex);
          predMember = makeOrGetPredMemberForSlot(ctx, *probe.consumerReuseQueryIndex);
+         auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+         if (!valueMembersContainMemberNamed(ctx, probe.alignedHiv.getValueMembers(), mm.getName(predMember)))
+            continue;
+         setMixedLookupPredSlotForCacheGet(consumer, *probe.cacheKey, *probe.consumerReuseQueryIndex);
          probe.cacheGetRoot.setType(mixedHivTypeForPredMember(ctx, probe.alignedHiv, predMember));
       } else if (auto found = findFilterPredMemberOnHashIndexedView(probe.alignedHiv)) {
          predMember = *found;

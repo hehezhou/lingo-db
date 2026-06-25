@@ -1,6 +1,7 @@
 #ifndef LINGODB_COMPILER_DIALECT_SUBOPERATOR_TRANSFORMS_CROSSQUERYSTATEREUSE_H
 #define LINGODB_COMPILER_DIALECT_SUBOPERATOR_TRANSFORMS_CROSSQUERYSTATEREUSE_H
 
+#include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseJoinSuperset.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/StateExtraction.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ReuseRewriteCommon.h"
 
@@ -57,6 +58,7 @@ struct BatchReusePlanRewriteResult {
    size_t numUnionTargetsSyntheticMappedNoTable = 0;
    size_t numBuildStepTargetsSyntheticMapped = 0;
    size_t numBuildStepTargetsSyntheticMappedNoTable = 0;
+   CachedJoinBufferLayoutsByKey cachedJoinLayouts;
 };
 
 // Three-stage pipeline:
