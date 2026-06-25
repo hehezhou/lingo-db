@@ -943,6 +943,7 @@ enum class BatchNightlyMode {
    ReuseOnBloomOff,
    ReuseOnBloomOnNoHivDisjoint,
    ReuseOnBloomOnNoAggregateDisjoint,
+   ReuseOnBloomOnNoDisjoint,
 };
 
 static BatchNightlyMode parseBatchNightlyMode(llvm::StringRef mode) {
@@ -952,6 +953,7 @@ static BatchNightlyMode parseBatchNightlyMode(llvm::StringRef mode) {
    if (mode == "reuse_on_bloom_on_no_hiv_disjoint") return BatchNightlyMode::ReuseOnBloomOnNoHivDisjoint;
    if (mode == "reuse_on_bloom_on_no_aggregate_disjoint")
       return BatchNightlyMode::ReuseOnBloomOnNoAggregateDisjoint;
+   if (mode == "reuse_on_bloom_on_no_disjoint") return BatchNightlyMode::ReuseOnBloomOnNoDisjoint;
    llvm_unreachable("unknown batch nightly mode");
 }
 
@@ -1005,9 +1007,11 @@ static int runBatchNightlyMain(int argc, char** argv) {
    setEnvFlag("LINGODB_DISABLE_FILTER_PRED_BLOOM_ADAPTATION",
               parsedMode == BatchNightlyMode::ReuseOnBloomOff);
    setEnvFlag("LINGODB_DISABLE_HIV_DISJOINT_CLUSTERING",
-              parsedMode == BatchNightlyMode::ReuseOnBloomOnNoHivDisjoint);
+              parsedMode == BatchNightlyMode::ReuseOnBloomOnNoHivDisjoint ||
+                 parsedMode == BatchNightlyMode::ReuseOnBloomOnNoDisjoint);
    setEnvFlag("LINGODB_DISABLE_AGGREGATE_DISJOINT_CLUSTERING",
-              parsedMode == BatchNightlyMode::ReuseOnBloomOnNoAggregateDisjoint);
+              parsedMode == BatchNightlyMode::ReuseOnBloomOnNoAggregateDisjoint ||
+                 parsedMode == BatchNightlyMode::ReuseOnBloomOnNoDisjoint);
 
    llvm::SmallVector<int, 16> templates = parseIntList(templatesSpec);
    llvm::SmallVector<int, 16> batchSizes = parseIntList(batchSizesSpec);

@@ -62,6 +62,9 @@ struct CrossQueryStateMatchGroup {
    bool enableFilterPredReuse = true;
    /// True only when matched HIV payload layouts differ and need union layout rewrite.
    bool requiresJoinLayoutUnion = false;
+   /// True when matched plain buffers are read only through scan_refs and need per-slot
+   /// filter_pred payload columns plus scan_refs-side filtering.
+   bool requiresBufferScanRefsUnion = false;
    /// True when the matched states cannot be unioned into one physical state. The synthetic
    /// producer must share the pre-materialize build stream, then materialize one output state per
    /// logical reuse slot and cache each output under a derived per-slot cache key.

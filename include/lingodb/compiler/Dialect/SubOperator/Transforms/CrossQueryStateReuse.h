@@ -90,7 +90,8 @@ void insertCachePutsForTargets(mlir::ModuleOp producerModule, llvm::ArrayRef<Cac
 void injectCacheGetsAndDeleteConstructionSteps(mlir::ModuleOp consumerModule, llvm::ArrayRef<CacheTarget> targets,
                                                const ModuleReuseInfo* reuseBeforeMutation = nullptr,
                                                bool joinBufferHashmapLayoutAlreadyApplied = false,
-                                               bool joinBufferWritePredAlreadyApplied = false);
+                                               bool joinBufferWritePredAlreadyApplied = false,
+                                               const llvm::DenseMap<uint64_t, unsigned>* consumerReuseSlotByCacheKey = nullptr);
 
 } // namespace lingodb::compiler::dialect::subop
 

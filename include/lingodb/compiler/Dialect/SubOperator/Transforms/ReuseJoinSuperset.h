@@ -115,6 +115,21 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
    llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t, 4>>* outInheritedDepsByCacheKey = nullptr,
    llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>>* consumerSlotByCacheKeyAndQuery = nullptr);
 
+/// Widen scan_refs-only buffer reuse targets with per-query `filter_pred$N` members, materialize
+/// those predicates on the synthetic writer, and OR-filter the synthetic buffer stream.
+void extendSyntheticScanRefsBuffersWithFilterPredsForGroups(
+   mlir::ModuleOp synthetic, llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
+   llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+   const llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>>* consumerSlotByCacheKeyAndQuery =
+      nullptr);
+
+/// Align a consumer `cache_get` buffer to the synthetic predicate layout and filter each scan_refs
+/// of that cached buffer by the explicitly selected `filter_pred$N` slot.
+void alignConsumerScanRefsBufferCacheGetWithFilterPreds(
+   mlir::ModuleOp consumer, uint64_t cacheKey, subop::StateMembersAttr producerMembers,
+   llvm::ArrayRef<unsigned> predSlots,
+   unsigned consumerReuseSlot);
+
 void extendSyntheticAggregateHashTablesToPayloadUnion(mlir::ModuleOp synthetic, mlir::ModuleOp query0,
                                                       mlir::ModuleOp query1,
                                                       llvm::ArrayRef<CrossQueryStateMatchPair> matches,

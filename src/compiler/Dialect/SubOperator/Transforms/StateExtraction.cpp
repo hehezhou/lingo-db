@@ -1252,6 +1252,7 @@ static uint64_t provisionalStateHash(mlir::Value state, unsigned ordinal) {
 
 static std::string fingerprintSortedMemberPairs(subop::MemberManager& mm, llvm::ArrayRef<subop::Member> members);
 static std::string fingerprintMemberTypesSequence(subop::MemberManager& mm, llvm::ArrayRef<subop::Member> members);
+static std::string fingerprintMemberTypesMultiset(subop::MemberManager& mm, llvm::ArrayRef<subop::Member> members);
 
 /// Join HIV cross-query matching: hash/link slots + first stored lookup key; payload columns tracked separately.
 struct JoinHivMatchDetails {
@@ -1729,9 +1730,7 @@ struct StepDagHasher {
 
    bool sourceAllowsResidualFilterSkip(mlir::Value sourceState) const {
       if (!sourceState) return false;
-      mlir::Type sourceType = canonicalizeStateValueDeep(sourceState).getType();
-      return mlir::isa<subop::TableType, subop::SharedTableType,
-                       subop::HashIndexedViewType, subop::MixedHashIndexedViewType>(sourceType);
+      return true;
    }
 
    subop::MemberManager& memberManagerForType(mlir::Type t) const {
@@ -2188,7 +2187,7 @@ struct StepDagHasher {
       return true;
    }
 
-   bool isRelaxedResidualFilterOnTargetMaterializeChain(subop::FilterOp filter, subop::MapOp& predMap) {
+   bool isRelaxedResidualFilterOnTargetMaterializeChain(subop::FilterOp filter, mlir::Value& upstreamStream) {
       if (!targetAllowsResidualTableFilterSkip()) return false;
       subop::MaterializeOp mat = findUniqueTargetMaterialize();
       if (!mat) return false;
@@ -2196,10 +2195,14 @@ struct StepDagHasher {
       if (trace.split || trace.unsupported || !trace.filter) return false;
       if (trace.filter != filter) return false;
       if (!sourceAllowsResidualFilterSkip(trace.sourceState)) return false;
-      if (!filterPredicateColumnsOnlyFromSourceState(trace.predMap, trace.filter, trace.sourceState)) return false;
+      if (trace.predMap) {
+         if (!filterPredicateColumnsOnlyFromSourceState(trace.predMap, trace.filter, trace.sourceState)) return false;
+         upstreamStream = trace.predMap.getStream();
+      } else {
+         return false;
+      }
       relaxedResidualSourceScanLike = trace.scanLike;
-      predMap = trace.predMap;
-      return static_cast<bool>(predMap);
+      return static_cast<bool>(upstreamStream);
    }
 
    bool isRelaxedMixedScanOnTargetMaterializeChain(subop::ScanListOp scan) {
@@ -2391,9 +2394,9 @@ struct StepDagHasher {
       }
 
       if (auto filter = mlir::dyn_cast<subop::FilterOp>(def)) {
-         subop::MapOp predMap;
-         if (isRelaxedResidualFilterOnTargetMaterializeChain(filter, predMap)) {
-            return hashSelectedStreamProducer(predMap.getStream(), selected);
+         mlir::Value upstreamStream;
+         if (isRelaxedResidualFilterOnTargetMaterializeChain(filter, upstreamStream)) {
+            return hashSelectedStreamProducer(upstreamStream, selected);
          }
          SelectedColumnSet nextSelected(selected.begin(), selected.end());
          uint64_t local = hashOpName(*def);
@@ -2956,6 +2959,9 @@ std::string normalizedSubopStateTypeFingerprint(subop::MemberManager& mm, mlir::
    if (auto st = mlir::dyn_cast<subop::SimpleStateType>(t)) {
       return std::string("simple_state{members=") + fingerprintSortedMemberPairs(mm, st.getValueMembers().getMembers()) + "}";
    }
+   if (auto buf = mlir::dyn_cast<subop::BufferType>(t)) {
+      return std::string("buffer{types=") + fingerprintMemberTypesMultiset(mm, buf.getMembers().getMembers()) + "}";
+   }
    if (auto hm = mlir::dyn_cast<subop::HashMapType>(t)) {
       // Hash tables: normalize by key/value member *types* + lock flag.
       // Member names are compiler-generated and unstable across MLIRContexts.
@@ -3108,9 +3114,13 @@ static bool profileHasRelaxedConstructionParts(const StateMatchProfile& p) {
 }
 
 static bool profileCanUseDirectConstructionBucket(const StateMatchProfile& p) {
+   if (mlir::isa<subop::BufferType>(p.value.getType()))
+      return llvm::any_of(p.depTokensSorted, [](llvm::StringRef tok) { return tok.starts_with("cache:"); }) &&
+             !p.mixedHivLookupPredFingerprint.empty() &&
+             !llvm::StringRef(p.mixedHivLookupPredFingerprint).contains("union:");
    if (!profileHasRelaxedConstructionParts(p)) return true;
    assert(profileHasSingleConstructionSink(p) && "eligible relaxed profile must have one construction sink");
-   return mlir::isa<subop::HashIndexedViewType>(p.value.getType());
+   return mlir::isa<subop::HashIndexedViewType, subop::BufferType>(p.value.getType());
 }
 
 static bool profileCanUseForcedSplitMaterializeBucket(
@@ -3119,6 +3129,10 @@ static bool profileCanUseForcedSplitMaterializeBucket(
    if (mlir::isa<subop::HashIndexedViewType, subop::PreAggrHtType>(p.value.getType())) return false;
    assert(profileHasSingleConstructionSink(p) && "eligible split-materialize profile must have one construction sink");
    if (!profileHasRelaxedConstructionParts(p)) return false;
+   if (mlir::isa<subop::BufferType>(p.value.getType()))
+      return llvm::any_of(p.depTokensSorted, [](llvm::StringRef tok) { return tok.starts_with("cache:"); }) &&
+             !p.mixedHivLookupPredFingerprint.empty() &&
+             !llvm::StringRef(p.mixedHivLookupPredFingerprint).contains("union:");
    return !hasPreAggrCacheDependency(p);
 }
 
@@ -3154,13 +3168,29 @@ static std::string mixedPredSelectionFingerprintFromStateType(mlir::Type type) {
    if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(type)) {
       return "slot:" + mixed.getFilterPredMemberName().getValue().str();
    }
-   auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(type);
-   if (!hiv) return "";
-   auto& mm = hiv.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   auto& mm = type.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    llvm::SmallVector<unsigned, 8> predSlots;
-   for (subop::Member member : hiv.getValueMembers().getMembers()) {
-      if (std::optional<unsigned> slot = parseFilterPredMemberSlotLocal(mm.getName(member)))
-         predSlots.push_back(*slot);
+   if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(type)) {
+      for (subop::Member member : hiv.getValueMembers().getMembers()) {
+         if (std::optional<unsigned> slot = parseFilterPredMemberSlotLocal(mm.getName(member)))
+            predSlots.push_back(*slot);
+      }
+   } else if (auto buffer = mlir::dyn_cast<subop::BufferType>(type)) {
+      for (subop::Member member : buffer.getMembers().getMembers()) {
+         if (std::optional<unsigned> slot = parseFilterPredMemberSlotLocal(mm.getName(member)))
+            predSlots.push_back(*slot);
+      }
+      if (predSlots.empty()) return "";
+      llvm::sort(predSlots);
+      predSlots.erase(std::unique(predSlots.begin(), predSlots.end()), predSlots.end());
+      std::string out = "buffer:";
+      for (unsigned slot : predSlots) {
+         if (!out.ends_with(":")) out.push_back(',');
+         out += llvm::Twine(slot).str();
+      }
+      return out;
+   } else {
+      return "";
    }
    if (predSlots.empty()) return "";
    llvm::sort(predSlots);
@@ -3219,6 +3249,53 @@ struct ModuleMatchAndReuseAnalysis {
    llvm::SmallVector<mlir::Value, 64> statesSorted;
    ModuleReuseInfo reuse;
 };
+
+static bool bufferPureReadStepUsesOnlyScanRefs(mlir::Value state, subop::ExecutionStepOp step) {
+   mlir::Value canonState = canonicalizeStateValueDeep(state);
+   mlir::Block& body = step.getSubOps().front();
+   bool sawStateArg = false;
+   bool sawScanRefs = false;
+   auto inputs = step.getInputs();
+   for (unsigned i = 0; i < inputs.size() && i < body.getNumArguments(); ++i) {
+      if (canonicalizeStateValueDeep(inputs[i]) != canonState) continue;
+      mlir::BlockArgument arg = body.getArgument(i);
+      sawStateArg = true;
+      for (mlir::OpOperand& use : arg.getUses()) {
+         auto scan = mlir::dyn_cast<subop::ScanRefsOp>(use.getOwner());
+         if (!scan || scan.getState() != arg) return false;
+         sawScanRefs = true;
+      }
+   }
+   return sawStateArg && sawScanRefs;
+}
+
+static bool isScanRefsOnlyBufferReuseTarget(mlir::Value state, const ModuleMatchAndReuseAnalysis& module) {
+   mlir::Value canon = canonicalizeStateValueDeep(state);
+   if (!mlir::isa<subop::BufferType>(canon.getType())) return false;
+   if (module.transparentStates.contains(canon)) return false;
+   auto itInfo = module.stateInfo.find(canon);
+   if (itInfo == module.stateInfo.end() || itInfo->second.reads.empty()) return false;
+   for (int stepIdx : itInfo->second.reads) {
+      auto itRw = module.rwByStep.find(stepIdx);
+      assert(itRw != module.rwByStep.end() && "buffer read step must have RW info");
+      auto itFlag = itRw->second.find(canon);
+      assert(itFlag != itRw->second.end() && "buffer read step must mention the buffer");
+      if (itFlag->second.write) return false;
+      for (auto& kv : itRw->second) {
+         if (!kv.second.write) continue;
+         mlir::Type writeTy = kv.first.getType();
+         if (mlir::isa<subop::BufferType, subop::HashIndexedViewType>(writeTy)) continue;
+         if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(writeTy)) {
+            if (mlir::isa<subop::BufferType>(tl.getWrapped())) continue;
+         }
+         return false;
+      }
+      auto itStep = module.stepByIndex.find(stepIdx);
+      assert(itStep != module.stepByIndex.end() && "buffer read step must resolve");
+      if (!bufferPureReadStepUsesOnlyScanRefs(canon, itStep->second)) return false;
+   }
+   return true;
+}
 
 static void collectStateAndShadowConstructionStates(
    mlir::Value state, const ModuleMatchAndReuseAnalysis& module,
@@ -3544,8 +3621,10 @@ static llvm::SmallVector<mlir::Value, 64> collectReuseCandidateStates(mlir::Modu
          // Special states are only folded into dependency equality; they are never reused directly.
          if (isSpecialNonReuseStateValue(key, a.transparentStates)) continue;
          if (getCacheGetKeyForState(key)) continue;
-         // Carrier states that are not transparent are also not concrete reuse targets.
-         if (isTransparentDepCarrierType(key.getType())) continue;
+         // Carrier states are only concrete reuse targets for the explicit scan_refs-only
+         // buffer path; other carriers are folded as dependencies or ignored.
+         if (isTransparentDepCarrierType(key.getType()) &&
+             !isScanRefsOnlyBufferReuseTarget(key, a)) continue;
          candidates.push_back(key);
       }
    }
@@ -3591,7 +3670,9 @@ static bool determineStateReuseEligibility(
    StateDepEligibility& outDep) {
    mlir::Value stateCanon = canonicalizeStateValueDeep(state);
    assert(!isSpecialNonReuseStateValue(stateCanon, module.transparentStates) && "special states are never reuse targets");
-   assert(!isTransparentDepCarrierType(stateCanon.getType()) && "carrier states are never reuse match targets");
+   assert((!isTransparentDepCarrierType(stateCanon.getType()) ||
+           isScanRefsOnlyBufferReuseTarget(stateCanon, module)) &&
+          "carrier states are reuse targets only for scan_refs-only buffers");
    assert(!module.writesByState.lookup(stateCanon).empty() &&
           "reuse candidate must be constructed in at least one execution_step");
 
@@ -4809,7 +4890,8 @@ void printCrossQueryStateMatches(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>> 
    for (const CrossQueryStateMatchGroup& g : groups) {
       os << "\n// -- match_group cache_key=" << g.cacheKey
          << " filter_pred_reuse=" << (g.enableFilterPredReuse ? "true" : "false")
-         << " requires_join_layout_union=" << (g.requiresJoinLayoutUnion ? "true" : "false");
+         << " requires_join_layout_union=" << (g.requiresJoinLayoutUnion ? "true" : "false")
+         << " requires_buffer_scan_refs_union=" << (g.requiresBufferScanRefsUnion ? "true" : "false");
       if (!g.cacheDeps.empty()) {
          os << " cache_deps=[";
          for (size_t i = 0; i < g.cacheDeps.size(); ++i) {
@@ -5380,9 +5462,14 @@ static void appendCrossQueryMatchGroup(
    appendMatchGroupCacheDeps(group, members);
 
    bool allHiv = matchGroupProfilesAllHiv(members);
+   bool allScanRefsOnlyBuffer = llvm::all_of(members, [](const StateMatchProfile* p) {
+      return mlir::isa<subop::BufferType>(p->value.getType()) && profileHasCacheDependencyToken(*p) &&
+             !p->mixedHivLookupPredFingerprint.empty();
+   });
    if (allHiv) group.requiresJoinLayoutUnion = true;
+   if (allScanRefsOnlyBuffer) group.requiresBufferScanRefsUnion = true;
    if (options.forceSplitMaterialize) group.requiresSplitMaterialize = true;
-   if (allHiv) group.requiresSplitMaterialize = false;
+   if (allHiv || allScanRefsOnlyBuffer) group.requiresSplitMaterialize = false;
 
    bool needsFilterPredReuse = options.enableFilterPredReuse;
    if (needsFilterPredReuse && allHiv)
@@ -5392,6 +5479,7 @@ static void appendCrossQueryMatchGroup(
    if (group.requiresSplitMaterialize) {
       group.enableFilterPredReuse = false;
       group.requiresJoinLayoutUnion = false;
+      group.requiresBufferScanRefsUnion = false;
    }
 
    for (const StateMatchProfile* p : members) {

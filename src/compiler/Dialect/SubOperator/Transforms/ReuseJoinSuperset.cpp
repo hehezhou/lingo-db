@@ -9,6 +9,7 @@
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorDialect.h"
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorOpsAttributes.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/StateExtraction.h"
+#include "lingodb/compiler/Dialect/SubOperator/Transforms/ColumnCreationAnalysis.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/ColumnUsageAnalysis.h"
 #include "lingodb/compiler/Dialect/SubOperator/Transforms/StateUsageTransformer.h"
 #include "lingodb/compiler/Dialect/TupleStream/TupleStreamDialect.h"
@@ -338,12 +339,13 @@ static subop::ExecutionStepOp findBufferBuildStepWithTableMaterialize(mlir::Valu
                                                                       const ModuleReuseInfo& reuse);
 static subop::ExecutionStepOp findBufferBuildStepWithTableScan(mlir::ModuleOp module);
 
-static bool stepHasTableScan(subop::ExecutionStepOp step) {
-   bool hasTableScan = false;
+static bool stepHasSourceScanRefs(subop::ExecutionStepOp step) {
+   bool hasScanRefs = false;
    step.walk([&](subop::ScanRefsOp scan) {
-      if (mlir::isa<subop::TableType, subop::SharedTableType>(scan.getState().getType())) hasTableScan = true;
+      (void)scan;
+      hasScanRefs = true;
    });
-   return hasTableScan;
+   return hasScanRefs;
 }
 
 static bool materializeWritesExactState(subop::MaterializeOp mat, mlir::Value targetState) {
@@ -358,7 +360,7 @@ static subop::ExecutionStepOp findExactJoinBuildStepForState(mlir::Value buildSt
       auto itW = reuse.writerStepsByState.find(key);
       if (itW == reuse.writerStepsByState.end()) return {};
       for (subop::ExecutionStepOp step : itW->second) {
-         if (!stepHasTableScan(step)) continue;
+         if (!stepHasSourceScanRefs(step)) continue;
          subop::MaterializeOp matOp;
          step.walk([&](subop::MaterializeOp mat) {
             if (matOp) return;
@@ -405,7 +407,7 @@ static subop::ExecutionStepOp findJoinBufferBuildStepFromWriterChain(mlir::Value
          if (itW == reuse.writerStepsByState.end()) return {};
          for (subop::ExecutionStepOp step : itW->second) {
             if (!seenSteps.insert(step.getOperation()).second) continue;
-            if (!stepHasTableScan(step)) continue;
+            if (!stepHasSourceScanRefs(step)) continue;
             subop::MaterializeOp matOp;
             step.walk([&](subop::MaterializeOp mat) {
                if (matOp) return;
@@ -440,12 +442,12 @@ static subop::ExecutionStepOp findBufferBuildStepWithTableMaterialize(mlir::Valu
                                                                         const ModuleReuseInfo& reuse) {
    for (const ModuleReuseInfo::StepRW& rw : reuse.steps) {
       subop::ExecutionStepOp step = rw.step;
-      bool hasTableScan = stepHasTableScan(step);
+      bool hasSourceScan = stepHasSourceScanRefs(step);
       bool hasJoinMat = false;
       step->walk([&](subop::MaterializeOp mat) {
          if (materializeTargetsJoinBuffer(mat, mergedBuffer, reuse)) hasJoinMat = true;
       });
-      if (hasTableScan && hasJoinMat) return step;
+      if (hasSourceScan && hasJoinMat) return step;
    }
    return {};
 }
@@ -750,7 +752,7 @@ static void ingestExternalTableColumnsFromBuildStepScan(subop::ExecutionStepOp b
          insertPayloadColumnSpec(unionCols, std::move(spec));
 	      }
 	   });
-   if (!sawTableScan) llvm_unreachable("join union ingest: build step must contain scan_refs on a table state");
+   (void)sawTableScan;
 }
 
 static void mergePeerExternalFromBuildStepScan(ExternalDatasourceProperty& merged, bool& haveMerged,
@@ -998,7 +1000,6 @@ static std::optional<ResidualTableFilter> traceSingleUseStreamToScanLikeInStep(
       if (!def) return std::nullopt;
       if (!streamValueHasOnlyUseByWithinStep(stream, user, step)) return std::nullopt;
       if (auto scan = mlir::dyn_cast<subop::ScanRefsOp>(def)) {
-         if (!mlir::isa<subop::TableType, subop::SharedTableType>(scan.getState().getType())) return std::nullopt;
          auto& cm = scan.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
          return ResidualTableFilter{scan.getOperation(), cm.createRef(&scan.getRef().getColumn()),
                                     scan.getState().getType(), predMap, filter};
@@ -1037,12 +1038,113 @@ static subop::Member sourceMemberForIdentifier(mlir::Type sourceStateType,
                                                subop::MemberManager& mm,
                                                llvm::StringRef identifier);
 
+static bool filterConditionsComeFromGather(subop::FilterOp filter, subop::GatherOp gather) {
+   llvm::DenseSet<const void*> gatheredCols;
+   for (auto& [member, def] : gather.getMapping().getMapping()) {
+      (void)member;
+      gatheredCols.insert(&def.getColumn());
+   }
+   for (auto attr : filter.getConditions()) {
+      auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
+      if (!gatheredCols.contains(&ref.getColumn())) return false;
+   }
+   return true;
+}
+
+static subop::MapOp normalizeGatherResidualFilterToMap(subop::FilterOp filter,
+                                                       subop::GatherOp gather) {
+   auto* ctx = filter.getContext();
+   auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+
+   llvm::DenseMap<const tuples::Column*, subop::Member> memberByColumn;
+   llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> gatherPairs;
+   gatherPairs.reserve(gather.getMapping().getMapping().size());
+   for (auto& [member, def] : gather.getMapping().getMapping()) {
+      memberByColumn[&def.getColumn()] = member;
+      gatherPairs.push_back({member, def});
+   }
+
+   llvm::DenseSet<const tuples::Column*> conditionColumns;
+   for (auto attr : filter.getConditions()) {
+      auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
+      conditionColumns.insert(&ref.getColumn());
+   }
+
+   llvm::SmallVector<mlir::Attribute> mapInputs;
+   llvm::SmallVector<mlir::Attribute> computedCols;
+   llvm::DenseMap<const tuples::Column*, tuples::ColumnRefAttr> normalizedInputByOldColumn;
+   llvm::DenseMap<const tuples::Column*, tuples::ColumnRefAttr> outputByOldColumn;
+   for (auto& pair : gatherPairs) {
+      if (!conditionColumns.contains(&pair.second.getColumn())) continue;
+      const tuples::Column* oldColumn = &pair.second.getColumn();
+      subop::Member member = pair.first;
+      std::string memberName = mm.getName(member);
+      tuples::ColumnDefAttr inputDef = cm.createDef(cm.getUniqueScope("residual_gather_pred_input"),
+                                                    memberName);
+      inputDef.getColumn().type = pair.second.getColumn().type;
+      normalizedInputByOldColumn[oldColumn] = cm.createRef(&inputDef.getColumn());
+      pair.second = inputDef;
+
+      tuples::ColumnDefAttr outDef = cm.createDef(cm.getUniqueScope("residual_gather_pred"),
+                                                  memberName);
+      outDef.getColumn().type = inputDef.getColumn().type;
+      computedCols.push_back(outDef);
+      mapInputs.push_back(cm.createRef(&inputDef.getColumn()));
+      outputByOldColumn[oldColumn] = cm.createRef(&outDef.getColumn());
+   }
+
+   assert(!computedCols.empty() && "gather residual filter must have at least one predicate column");
+   gather.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, gatherPairs));
+
+   mlir::OpBuilder b(filter);
+   b.setInsertionPointAfter(gather);
+   auto map = b.create<subop::MapOp>(filter.getLoc(), tuples::TupleStreamType::get(ctx),
+                                     gather.getResult(), b.getArrayAttr(computedCols),
+                                     b.getArrayAttr(mapInputs));
+   mlir::Block* block = new mlir::Block();
+   for (auto attr : mapInputs) {
+      auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
+      block->addArgument(ref.getColumn().type, filter.getLoc());
+   }
+   map.getFn().push_back(block);
+   mlir::OpBuilder rb(ctx);
+   rb.setInsertionPointToStart(block);
+   llvm::SmallVector<mlir::Value> retVals;
+   for (mlir::BlockArgument arg : block->getArguments()) retVals.push_back(arg);
+   rb.create<tuples::ReturnOp>(filter.getLoc(), retVals);
+
+   llvm::SmallVector<mlir::Attribute> newConditions;
+   newConditions.reserve(filter.getConditions().size());
+   for (auto attr : filter.getConditions()) {
+      auto ref = mlir::cast<tuples::ColumnRefAttr>(attr);
+      auto itMember = memberByColumn.find(&ref.getColumn());
+      assert(itMember != memberByColumn.end() && "gather residual condition must map to a source member");
+      (void)itMember;
+      auto it = normalizedInputByOldColumn.find(&ref.getColumn());
+      assert(it != normalizedInputByOldColumn.end() && "gather residual condition was not normalized");
+      (void)it;
+      auto outIt = outputByOldColumn.find(&ref.getColumn());
+      assert(outIt != outputByOldColumn.end() && "gather residual normalized input must have map output");
+      newConditions.push_back(outIt->second);
+   }
+   filter.setConditionsAttr(b.getArrayAttr(newConditions));
+   filter->setOperand(0, map.getResult());
+   return map;
+}
+
 static std::optional<ResidualTableFilter> findResidualTableFilterInBuildStep(subop::ExecutionStepOp step) {
    std::optional<ResidualTableFilter> found;
    step.walk([&](subop::FilterOp filter) {
       if (found) return;
       auto map = mlir::dyn_cast_or_null<subop::MapOp>(filter.getStream().getDefiningOp());
-      if (!map) return;
+      if (!map) {
+         auto gather = mlir::dyn_cast_or_null<subop::GatherOp>(filter.getStream().getDefiningOp());
+         if (!gather) return;
+         if (!streamValueHasOnlyUseByWithinStep(gather.getResult(), filter.getOperation(), step)) return;
+         if (!filterConditionsComeFromGather(filter, gather)) return;
+         map = normalizeGatherResidualFilterToMap(filter, gather);
+      }
       if (!streamValueHasOnlyUseByWithinStep(map.getResult(), filter.getOperation(), step)) return;
       llvm::DenseSet<const void*> computedCols;
       for (auto attr : map.getComputedCols()) {
@@ -1128,6 +1230,15 @@ static tuples::ColumnRefAttr materializedColumnForMember(subop::MaterializeOp ma
    return {};
 }
 
+static bool isReuseGeneratedUpstreamPredicateColumn(tuples::ColumnRefAttr ref,
+                                                    tuples::ColumnManager& cm) {
+   if (!ref) return false;
+   auto [scope, name] = cm.getName(&ref.getColumn());
+   llvm::StringRef scopeRef(scope);
+   return scopeRef.starts_with("reuse_upstream_pred") ||
+          scopeRef.starts_with("reuse_inherited_combined_pred");
+}
+
 static mlir::BlockArgument appendMapInputColumn(subop::MapOp map, tuples::ColumnRefAttr ref) {
    llvm::SmallVector<mlir::Attribute> inputs(map.getInputCols().begin(), map.getInputCols().end());
    inputs.push_back(ref);
@@ -1138,6 +1249,10 @@ static mlir::BlockArgument appendMapInputColumn(subop::MapOp map, tuples::Column
 static subop::StateMembersAttr sourceValueMembersForResidualGather(mlir::Type sourceStateType) {
    if (auto tableTy = mlir::dyn_cast<subop::TableType>(sourceStateType)) return tableTy.getMembers();
    if (auto tableTy = mlir::dyn_cast<subop::SharedTableType>(sourceStateType)) return tableTy.getTableMembers();
+   if (auto bufferTy = mlir::dyn_cast<subop::BufferType>(sourceStateType)) return bufferTy.getMembers();
+   if (auto threadLocalTy = mlir::dyn_cast<subop::ThreadLocalType>(sourceStateType))
+      if (auto bufferTy = mlir::dyn_cast<subop::BufferType>(threadLocalTy.getWrapped()))
+         return bufferTy.getMembers();
    if (auto hiv = mlir::dyn_cast<subop::HashIndexedViewType>(sourceStateType)) return hiv.getValueMembers();
    if (auto mixed = mlir::dyn_cast<subop::MixedHashIndexedViewType>(sourceStateType)) return mixed.getValueMembers();
    return {};
@@ -1146,9 +1261,19 @@ static subop::StateMembersAttr sourceValueMembersForResidualGather(mlir::Type so
 static subop::Member sourceMemberForIdentifier(mlir::Type sourceStateType,
                                                subop::MemberManager& mm,
                                                llvm::StringRef identifier) {
+   auto exactFilterPredMember = [&](subop::StateMembersAttr members) -> subop::Member {
+      if (!members || !identifier.starts_with("filter_pred$")) return {};
+      for (subop::Member member : members.getMembers()) {
+         if (mm.getName(member) == identifier) return member;
+      }
+      return {};
+   };
+
    if (auto tableTy = mlir::dyn_cast<subop::TableType>(sourceStateType))
       return tableMemberForIdentifier(tableTy, mm, identifier);
    if (auto tableTy = mlir::dyn_cast<subop::SharedTableType>(sourceStateType)) {
+      if (subop::Member exactPred = exactFilterPredMember(tableTy.getPredicateMembers()))
+         return exactPred;
       llvm::StringRef normalized = normalizeColumnIdentifier(identifier);
       for (subop::Member member : tableTy.getTableMembers().getMembers()) {
          llvm::StringRef name = mm.getName(member);
@@ -1158,6 +1283,7 @@ static subop::Member sourceMemberForIdentifier(mlir::Type sourceStateType,
    }
    subop::StateMembersAttr members = sourceValueMembersForResidualGather(sourceStateType);
    if (!members) return {};
+   if (subop::Member exactPred = exactFilterPredMember(members)) return exactPred;
    llvm::StringRef normalized = normalizeColumnIdentifier(identifier);
    for (subop::Member member : members.getMembers()) {
       llvm::StringRef name = mm.getName(member);
@@ -1655,7 +1781,7 @@ static std::optional<ResidualTableFilter> findScanLikeSourceInBuildStep(subop::E
    mlir::Block& body = step.getSubOps().front();
    for (mlir::Operation& op : body.without_terminator()) {
       if (auto scan = mlir::dyn_cast<subop::ScanRefsOp>(&op)) {
-         if (!mlir::isa<subop::TableType>(scan.getState().getType())) continue;
+         if (!sourceValueMembersForResidualGather(scan.getState().getType())) continue;
          auto& cm = scan.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
          return ResidualTableFilter{scan.getOperation(), cm.createRef(&scan.getRef().getColumn()),
                                     scan.getState().getType(), {}, {}};
@@ -2033,7 +2159,7 @@ threadMappedUpstreamMixedPredColumnsToMaterializeStream(
    llvm::DenseSet<uint64_t> directDepKeys;
    for (const DirectMixedDep& dep : directDeps) directDepKeys.insert(dep.cacheKey);
 
-   llvm::DenseMap<uint64_t, llvm::DenseSet<unsigned>> wantedSlotsByDep;
+   llvm::DenseMap<uint64_t, llvm::SmallVector<unsigned, 4>> wantedSlotsByDep;
    for (const auto& [queryIdx, slot] : itTargetSlots->second) {
       if (slot != targetSlot) continue;
       for (uint64_t depKey : directDepKeys) {
@@ -2041,10 +2167,14 @@ threadMappedUpstreamMixedPredColumnsToMaterializeStream(
          if (itSlotsByQuery == consumerSlotByCacheKeyAndQuery.end()) continue;
          auto itDepSlot = itSlotsByQuery->second.find(queryIdx);
          if (itDepSlot == itSlotsByQuery->second.end()) continue;
-         wantedSlotsByDep[depKey].insert(itDepSlot->second);
+         wantedSlotsByDep[depKey].push_back(itDepSlot->second);
       }
    }
    if (wantedSlotsByDep.empty()) return {};
+   for (auto& [depKey, slots] : wantedSlotsByDep) {
+      llvm::sort(slots);
+      slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+   }
 
    subop::MaterializeOp matOp = findJoinBufferMaterializeInStep(buildStep);
    if (!matOp) return {};
@@ -2103,7 +2233,6 @@ static void inheritSlotMapForSyntheticTarget(
    uint64_t targetKey, llvm::ArrayRef<uint64_t> deps,
    llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>>& consumerSlotByCacheKeyAndQuery) {
    if (deps.empty()) return;
-   if (consumerSlotByCacheKeyAndQuery.contains(targetKey)) return;
    llvm::SmallVector<unsigned, 8> queries;
    llvm::DenseSet<unsigned> seenQueries;
    auto addQueries = [&](const llvm::DenseMap<unsigned, unsigned>& slots) {
@@ -2112,19 +2241,35 @@ static void inheritSlotMapForSyntheticTarget(
          if (seenQueries.insert(queryIdx).second) queries.push_back(queryIdx);
       }
    };
-   for (uint64_t depKey : deps) {
-      auto itDep = consumerSlotByCacheKeyAndQuery.find(depKey);
-      if (itDep != consumerSlotByCacheKeyAndQuery.end()) addQueries(itDep->second);
+   auto itTarget = consumerSlotByCacheKeyAndQuery.find(targetKey);
+   if (itTarget != consumerSlotByCacheKeyAndQuery.end()) addQueries(itTarget->second);
+   if (queries.empty()) {
+      for (uint64_t depKey : deps) {
+         auto itDep = consumerSlotByCacheKeyAndQuery.find(depKey);
+         if (itDep != consumerSlotByCacheKeyAndQuery.end()) addQueries(itDep->second);
+      }
    }
    if (queries.empty()) return;
    llvm::sort(queries);
 
    llvm::StringMap<unsigned> slotBySignature;
    llvm::DenseMap<unsigned, unsigned> mergedSlots;
+   llvm::DenseSet<unsigned> usedSlots;
+   if (itTarget != consumerSlotByCacheKeyAndQuery.end()) {
+      for (const auto& [queryIdx, slot] : itTarget->second) {
+         mergedSlots[queryIdx] = slot;
+         usedSlots.insert(slot);
+      }
+   }
    unsigned nextSlot = 0;
    for (unsigned queryIdx : queries) {
       std::string sig;
       llvm::raw_string_ostream os(sig);
+      std::optional<unsigned> preferredSlot;
+      if (itTarget != consumerSlotByCacheKeyAndQuery.end()) {
+         auto itSlot = itTarget->second.find(queryIdx);
+         if (itSlot != itTarget->second.end()) preferredSlot = itSlot->second;
+      }
       for (uint64_t depKey : deps) {
          auto itDep = consumerSlotByCacheKeyAndQuery.find(depKey);
          if (itDep == consumerSlotByCacheKeyAndQuery.end()) continue;
@@ -2134,8 +2279,23 @@ static void inheritSlotMapForSyntheticTarget(
       }
       os.flush();
       if (sig.empty()) continue;
+      if (preferredSlot && mergedSlots.lookup(queryIdx) == *preferredSlot) {
+         continue;
+      }
       auto itSlot = slotBySignature.find(sig);
-      if (itSlot == slotBySignature.end()) itSlot = slotBySignature.try_emplace(sig, nextSlot++).first;
+      if (itSlot == slotBySignature.end()) {
+         unsigned assignedSlot = 0;
+         bool preferredAlreadyBelongsToQuery =
+            preferredSlot && mergedSlots.lookup(queryIdx) == *preferredSlot;
+         if (preferredSlot && (preferredAlreadyBelongsToQuery || !usedSlots.contains(*preferredSlot))) {
+            assignedSlot = *preferredSlot;
+         } else {
+            while (usedSlots.contains(nextSlot)) ++nextSlot;
+            assignedSlot = nextSlot++;
+         }
+         usedSlots.insert(assignedSlot);
+         itSlot = slotBySignature.try_emplace(sig, assignedSlot).first;
+      }
       mergedSlots[queryIdx] = itSlot->second;
    }
    if (!mergedSlots.empty()) consumerSlotByCacheKeyAndQuery[targetKey] = std::move(mergedSlots);
@@ -3454,6 +3614,26 @@ static bool opIsNestedInside(mlir::Operation* maybeAncestor, mlir::Operation* op
    return false;
 }
 
+static bool tupleStreamCarriesColumn(mlir::Value stream, tuples::ColumnRefAttr ref) {
+   tuples::Column* target = &ref.getColumn();
+   llvm::DenseSet<void*> seenStreams;
+   llvm::SmallVector<mlir::Value, 8> worklist{stream};
+   while (!worklist.empty()) {
+      mlir::Value cur = worklist.pop_back_val();
+      if (!cur || !mlir::isa<tuples::TupleStreamType>(cur.getType())) continue;
+      if (!seenStreams.insert(cur.getAsOpaquePointer()).second) continue;
+      mlir::Operation* def = cur.getDefiningOp();
+      if (!def) continue;
+      std::unordered_set<tuples::Column*> created =
+         subop::ColumnCreationAnalysis::getCreatedColumnsForOp(def);
+      if (created.contains(target)) return true;
+      for (mlir::Value operand : def->getOperands()) {
+         if (mlir::isa<tuples::TupleStreamType>(operand.getType())) worklist.push_back(operand);
+      }
+   }
+   return false;
+}
+
 static tuples::ColumnRefAttr threadColumnRefFromSourceToMaterializeStream(subop::MaterializeOp matOp,
                                                                           mlir::Operation* sourceOp,
                                                                           tuples::ColumnDefAttr def,
@@ -3470,6 +3650,7 @@ static tuples::ColumnRefAttr threadColumnRefFromSourceToMaterializeStream(subop:
 
    mlir::Value currentValue;
    for (subop::NestedMapOp nested : nestedMaps) {
+      if (!currentValue && !tupleStreamCarriesColumn(nested.getStream(), ref)) continue;
       if (currentValue && !findNestedMapParameter(nested, ref, cm)) {
          mlir::Value stream = nested.getStream();
          materializeColumnOnStreamBefore(nested.getOperation(), stream, def, currentValue);
@@ -7300,6 +7481,7 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
       if (itL == layoutsByKey.end() || itG == groupByKey.end() || itB == buildSites.end()) continue;
       const CachedJoinBufferLayout& layout = itL->second;
       const CrossQueryStateMatchGroup& group = *itG->second;
+      const bool hasExplicitInheritedPredicateDeps = !group.cacheDeps.empty();
       bool layoutHasFilterPredSlots = false;
       for (size_t i = 0; i < layout.payloadMembers.size(); ++i) {
          llvm::StringRef semantic;
@@ -7386,6 +7568,9 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
          if (peerHasValueFilters) {
             assert(!filters.empty() &&
                    "insertSyntheticFilterPredsForGroups: peer pushdown filters must map to synthetic donor table scan");
+         }
+         if (filters.empty() && hasExplicitInheritedPredicateDeps) {
+            continue;
          }
          if (filters.empty() && materializePredMemberFromUpstreamMixedScanList(buildStep, predName)) {
             continue;
@@ -7879,6 +8064,178 @@ static subop::StateMembersAttr joinBufferMembersWithFilterPredSlots(mlir::MLIRCo
    return subop::StateMembersAttr::get(ctx, members);
 }
 
+static llvm::SmallVector<unsigned, 8> filterPredSlotsForScanRefsBufferGroup(
+   const CrossQueryStateMatchGroup& group) {
+   llvm::DenseSet<unsigned> seen;
+   llvm::SmallVector<unsigned, 8> slots;
+   for (const CrossQueryStateMatchEntry& entry : group.entries) {
+      unsigned slot = reuseSlotForEntry(entry);
+      if (seen.insert(slot).second) slots.push_back(slot);
+   }
+   llvm::sort(slots);
+   return slots;
+}
+
+static subop::ExecutionStepOp findBufferBuildStepForTarget(mlir::Value buffer,
+                                                           const ModuleReuseInfo& reuse) {
+   if (subop::ExecutionStepOp step = findBufferBuildStepWithTableMaterialize(buffer, reuse)) return step;
+   auto itW = findReuseMap(reuse.writerStepsByState, buffer);
+   if (itW == reuse.writerStepsByState.end()) return {};
+   for (subop::ExecutionStepOp step : itW->second) {
+      subop::MaterializeOp mat;
+      step.walk([&](subop::MaterializeOp op) {
+         if (mat) return;
+         if (materializeWritesExactState(op, buffer)) mat = op;
+      });
+      if (mat) return step;
+   }
+   return {};
+}
+
+void extendSyntheticScanRefsBuffersWithFilterPredsForGroups(
+   mlir::ModuleOp synthetic, llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
+   llvm::ArrayRef<CacheTarget> targetsInSynthetic,
+   const llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>>* consumerSlotByCacheKeyAndQuery) {
+   if (groups.empty() || targetsInSynthetic.empty()) return;
+
+   llvm::DenseMap<uint64_t, const CrossQueryStateMatchGroup*> groupByKey;
+   for (const CrossQueryStateMatchGroup& group : groups) {
+      if (group.requiresBufferScanRefsUnion) groupByKey[group.cacheKey] = &group;
+   }
+   if (groupByKey.empty()) return;
+
+   auto* ctx = synthetic.getContext();
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+
+   for (const CacheTarget& target : targetsInSynthetic) {
+      auto itG = groupByKey.find(target.cacheKey);
+      if (itG == groupByKey.end()) continue;
+      if (!mlir::isa<subop::BufferType>(target.state.getType())) continue;
+
+      llvm::SmallVector<unsigned, 8> predSlots = filterPredSlotsForScanRefsBufferGroup(*itG->second);
+      if (predSlots.empty()) continue;
+      unsigned unionSlot = filterPredUnionSlotForQueryIndices(predSlots);
+      subop::BufferType bufTy = mlir::cast<subop::BufferType>(target.state.getType());
+      subop::StateMembersAttr targetMembers =
+         joinBufferMembersWithFilterPredSlots(ctx, bufTy, predSlots, unionSlot);
+
+      ModuleReuseInfo reuseSynthetic = collectModuleReuseInfo(synthetic);
+      applyBufferLayoutToSsaClosure(synthetic, {target.state}, targetMembers, reuseSynthetic);
+      syncMaterializeMappingsToActualBufferTypes(synthetic);
+      synchronizeExecutionStepPortTypes(synthetic, nullptr);
+
+      reuseSynthetic = collectModuleReuseInfo(synthetic);
+      subop::ExecutionStepOp buildStep = findBufferBuildStepForTarget(target.state, reuseSynthetic);
+      assert(buildStep && "scan_refs buffer reuse requires a synthetic buffer materialize step");
+      subop::MaterializeOp mat = findJoinBufferMaterializeInStep(buildStep);
+      assert(mat && "scan_refs buffer reuse requires buffer materialize");
+
+      llvm::SmallVector<tuples::ColumnRefAttr, 8> predRefs;
+      for (unsigned slot : predSlots) {
+         std::string predName = ("filter_pred$" + llvm::Twine(slot)).str();
+         bool materialized = false;
+         if (consumerSlotByCacheKeyAndQuery) {
+            llvm::SmallVector<tuples::ColumnRefAttr, 4> upstreamRefs =
+               threadMappedUpstreamMixedPredColumnsToMaterializeStream(
+                  buildStep, slot, target.cacheKey, *consumerSlotByCacheKeyAndQuery);
+            if (!upstreamRefs.empty()) {
+               tuples::ColumnRefAttr predRef =
+                  insertAndPredsBeforeMaterialize(mat, upstreamRefs,
+                                                  ("reuse_upstream_pred$" + llvm::Twine(slot)).str());
+               subop::Member predMember;
+               for (subop::Member member : getInnerBufferTypeForMaterializeState(mat.getState().getType()).getMembers().getMembers()) {
+                  if (mm.getName(member) == predName) {
+                     predMember = member;
+                     break;
+                  }
+               }
+               assert(predMember && "scan_refs buffer predicate member must exist in synthetic layout");
+               llvm::SmallVector<subop::RefMappingPairT> pairs;
+               for (auto& pr : mat.getMapping().getMapping()) {
+                  if (pr.first != predMember) pairs.push_back(pr);
+               }
+               pairs.push_back({predMember, predRef});
+               mat.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, pairs));
+               materialized = true;
+            }
+         }
+         if (!materialized && !materializePredMemberFromUpstreamMixedScanList(buildStep, predName))
+            materializeConstantTruePredMemberOnBufferMaterialize(mat, predName, /*updateStreamOperand=*/true);
+         for (auto& [member, ref] : mat.getMapping().getMapping()) {
+            if (mm.getName(member) == predName) predRefs.push_back(ref);
+         }
+      }
+      if (predRefs.size() >= 2) {
+         insertResidualFilterUnionAfterPredicates(mat.getStream(), predRefs);
+      }
+      std::string unionPredName = ("filter_pred$" + llvm::Twine(unionSlot)).str();
+      materializeConstantTruePredMemberOnBufferMaterialize(mat, unionPredName, /*updateStreamOperand=*/true);
+
+      syncMaterializeMappingsToActualBufferTypes(synthetic);
+      synchronizeExecutionStepPortTypes(synthetic, nullptr);
+   }
+}
+
+void alignConsumerScanRefsBufferCacheGetWithFilterPreds(
+   mlir::ModuleOp consumer, uint64_t cacheKey, subop::StateMembersAttr producerMembers,
+   llvm::ArrayRef<unsigned> predSlots,
+   unsigned consumerReuseSlot) {
+   if (predSlots.empty()) return;
+   assert(producerMembers && "scan_refs buffer cache_get alignment requires producer layout");
+   auto* ctx = consumer.getContext();
+   unsigned unionSlot = filterPredUnionSlotForQueryIndices(predSlots);
+   subop::Member predMember = makeOrGetPredMemberForSlot(ctx, consumerReuseSlot);
+
+   consumer.walk([&](subop::CacheGetOp get) {
+      if (static_cast<uint64_t>(get.getKey()) != cacheKey) return;
+      auto bufTy = mlir::dyn_cast<subop::BufferType>(get.getResult().getType());
+      if (!bufTy) return;
+      subop::StateMembersAttr targetMembers =
+         joinBufferMembersWithFilterPredSlots(ctx, subop::BufferType::get(ctx, producerMembers), predSlots, unionSlot);
+      llvm::DenseMap<subop::Member, subop::Member> memberRemap;
+      llvm::ArrayRef<subop::Member> oldMembers = bufTy.getMembers().getMembers();
+      llvm::ArrayRef<subop::Member> newMembers = targetMembers.getMembers();
+      assert(oldMembers.size() <= newMembers.size() &&
+             "scan_refs buffer consumer layout may only append predicate members");
+      for (size_t i = 0; i < oldMembers.size(); ++i) memberRemap[oldMembers[i]] = newMembers[i];
+      ModuleReuseInfo reuse = collectModuleReuseInfo(consumer);
+      applyBufferLayoutToSsaClosure(consumer, {get.getResult()}, targetMembers, reuse);
+      syncMaterializeMappingsToActualBufferTypes(consumer);
+      synchronizeExecutionStepPortTypes(consumer, nullptr);
+
+      mlir::Value root = get.getResult();
+      consumer.walk([&](subop::ScanRefsOp scan) {
+         mlir::Value scanned = peelBlockArgsToEnclosingOperands(scan.getState());
+         if (canonicalizeStateValueForReuse(scanned) != canonicalizeStateValueForReuse(root)) return;
+         auto scanBufTy = mlir::dyn_cast<subop::BufferType>(scan.getState().getType());
+         if (!scanBufTy) return;
+         auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
+         auto ref = scan.getRef();
+         ref.getColumn().type = subop::EntryRefType::get(ctx, mlir::cast<subop::State>(scanBufTy));
+         scan.setRefAttr(ref);
+         tuples::ColumnRefAttr entryRef = cm.createRef(&scan.getRef().getColumn());
+         insertProbePredFilterImmediatelyAfterScanProducer(scan.getOperation(), scan.getRes(), entryRef,
+                                                           predMember);
+      });
+      consumer.walk([&](subop::GatherOp gather) {
+         auto refTy = mlir::dyn_cast<subop::EntryRefType>(gather.getRef().getColumn().type);
+         if (!refTy || refTy.getState() != subop::BufferType::get(ctx, targetMembers)) return;
+         llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> pairs;
+         bool changed = false;
+         for (auto [member, col] : gather.getMapping().getMapping()) {
+            subop::Member outMember = member;
+            if (auto it = memberRemap.find(member); it != memberRemap.end()) {
+               outMember = it->second;
+               changed |= outMember != member;
+            }
+            pairs.push_back({outMember, col});
+         }
+         if (changed) gather.setMappingAttr(subop::ColumnDefMemberMappingAttr::get(ctx, pairs));
+      });
+   });
+   synchronizeExecutionStepPortTypes(consumer, nullptr);
+}
+
 void extendSyntheticJoinBuffersWithInheritedMixedPreds(
    mlir::ModuleOp synthetic, llvm::ArrayRef<CacheTarget> targetsInSynthetic,
    CachedJoinBufferLayoutsByKey* outLayouts,
@@ -7919,6 +8276,8 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
       else
          inheritedDeps = inheritedMixedCacheDepsInBuildStep(buildStep);
       if (inheritedDeps.empty()) continue;
+      if (consumerSlotByCacheKeyAndQuery)
+         inheritSlotMapForSyntheticTarget(target.cacheKey, inheritedDeps, *consumerSlotByCacheKeyAndQuery);
       llvm::SmallVector<unsigned, 8> predSlots = inheritedMixedPredSlotsInBuildStep(buildStep);
       llvm::SmallVector<unsigned, 8> consumerSlots =
          consumerSlotsForCacheKey(target.cacheKey, consumerSlotByCacheKeyAndQuery);
@@ -7933,10 +8292,9 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
       sortUniqueSlots(predSlots);
       unsigned unionSlot = filterPredUnionSlotForQueryIndices(predSlots);
       if (outInheritedDepsByCacheKey) (*outInheritedDepsByCacheKey)[target.cacheKey] = inheritedDeps;
-      if (consumerSlotByCacheKeyAndQuery)
-         inheritSlotMapForSyntheticTarget(target.cacheKey, inheritedDeps, *consumerSlotByCacheKeyAndQuery);
       subop::MaterializeOp mat = findJoinBufferMaterializeInStep(buildStep);
       assert(mat && "inherited mixed pred target must materialize a join buffer");
+      auto& cm = synthetic.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
       bool layoutAlreadyHasPreds = false;
       bool layoutContainsRequiredPreds = false;
       if (outLayouts) {
@@ -7997,9 +8355,6 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
          }
          assert(predMember && "inherited mixed pred target buffer must contain predicate member");
 
-         llvm::SmallVector<tuples::ColumnRefAttr, 4> refs;
-         if (tuples::ColumnRefAttr existing = materializedColumnForMember(mat, predMember))
-            refs.push_back(existing);
          llvm::SmallVector<tuples::ColumnRefAttr, 4> upstreamRefs;
          if (consumerSlotByCacheKeyAndQuery) {
             upstreamRefs = threadMappedUpstreamMixedPredColumnsToMaterializeStream(
@@ -8007,6 +8362,11 @@ void extendSyntheticJoinBuffersWithInheritedMixedPreds(
          }
          assert(consumerSlotByCacheKeyAndQuery &&
                 "inherited mixed pred rewrite requires explicit slot mapping");
+         llvm::SmallVector<tuples::ColumnRefAttr, 4> refs;
+         if (tuples::ColumnRefAttr existing = materializedColumnForMember(mat, predMember)) {
+            if (upstreamRefs.empty() || !isReuseGeneratedUpstreamPredicateColumn(existing, cm))
+               refs.push_back(existing);
+         }
          refs.append(upstreamRefs.begin(), upstreamRefs.end());
          if (refs.empty()) {
             llvm_unreachable("inherited mixed pred target must materialize upstream predicate");
