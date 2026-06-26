@@ -17,6 +17,7 @@ MODES = [
     "reuse_on_bloom_off",
     "reuse_on_bloom_on_no_hiv_disjoint",
     "reuse_on_bloom_on_no_aggregate_disjoint",
+    "reuse_on_bloom_on_no_disjoint",
 ]
 
 
