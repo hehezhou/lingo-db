@@ -1618,6 +1618,21 @@ static ResidualMaterializeStreamTrace traceResidualFilterOnMaterializeStream(
    return traceResidualFilterOnStream(step, mat.getOperation(), mat.getStream());
 }
 
+static bool residualFilterSourceStateEligible(mlir::Value sourceState) {
+   if (!sourceState) return false;
+   sourceState = canonicalizeStateValueDeep(sourceState);
+   mlir::Type sourceType = sourceState.getType();
+   if (!isStateType(sourceType)) return false;
+   if (mlir::isa<subop::ExternalHashIndexType>(sourceType)) return false;
+   return true;
+}
+
+static bool residualTraceHasUniqueEligibleSource(const ResidualMaterializeStreamTrace& trace) {
+   if ((!trace.filter && !trace.relaxedMixedScan) || !trace.sourceState) return false;
+   if (trace.split || trace.unsupported || !trace.scanLike) return false;
+   return residualFilterSourceStateEligible(trace.sourceState);
+}
+
 static subop::MaterializeOp findUniqueMaterializeForStatesInStep(
    subop::ExecutionStepOp step, const llvm::DenseSet<mlir::Value>& states, bool& multiple) {
    subop::MaterializeOp found;
@@ -1728,9 +1743,8 @@ struct StepDagHasher {
       return mlir::isa_and_nonnull<subop::HashIndexedViewType, subop::ResultTableType>(targetStateType);
    }
 
-   bool sourceAllowsResidualFilterSkip(mlir::Value sourceState) const {
-      if (!sourceState) return false;
-      return true;
+   bool sourceAllowsResidualFilterSkip(const ResidualMaterializeStreamTrace& trace) const {
+      return residualTraceHasUniqueEligibleSource(trace);
    }
 
    subop::MemberManager& memberManagerForType(mlir::Type t) const {
@@ -1940,7 +1954,7 @@ struct StepDagHasher {
          }
          if (itDs != externalDatasourceByTableState->end() &&
              mlir::isa<subop::TableType, subop::SharedTableType>(state.getType())) {
-            h = hashCombineU64(h, hashExternalLeaf(state));
+            h = hashCombineU64(h, hashString("external_table_column"));
             h = hashCombineU64(h, hashString(itDs->second.tableName));
             llvm::StringRef memberName = memberManager->getName(member);
             std::string memberNameSan = sanitizeBaseName(memberName);
@@ -1948,7 +1962,6 @@ struct StepDagHasher {
             for (const auto& m : itDs->second.mapping) {
                if (m.memberName == memberName || sanitizeBaseName(m.memberName) == memberNameSan) {
                   h = hashCombineU64(h, hashString(m.identifier));
-                  h = hashCombineU64(h, hashString(normalizeMappingMemberName(m.memberName)));
                   found = true;
                   break;
                }
@@ -2194,7 +2207,7 @@ struct StepDagHasher {
       ResidualMaterializeStreamTrace trace = traceResidualFilterOnMaterializeStream(step, mat);
       if (trace.split || trace.unsupported || !trace.filter) return false;
       if (trace.filter != filter) return false;
-      if (!sourceAllowsResidualFilterSkip(trace.sourceState)) return false;
+      if (!sourceAllowsResidualFilterSkip(trace)) return false;
       if (trace.predMap) {
          if (!filterPredicateColumnsOnlyFromSourceState(trace.predMap, trace.filter, trace.sourceState)) return false;
          upstreamStream = trace.predMap.getStream();
@@ -2212,7 +2225,7 @@ struct StepDagHasher {
       ResidualMaterializeStreamTrace trace = traceResidualFilterOnMaterializeStream(step, mat);
       if (trace.split || trace.unsupported || !trace.relaxedMixedScan) return false;
       if (trace.scanLike != scan.getOperation()) return false;
-      if (!sourceAllowsResidualFilterSkip(trace.sourceState)) return false;
+      if (!sourceAllowsResidualFilterSkip(trace)) return false;
       relaxedResidualSourceScanLike = trace.scanLike;
       return true;
    }
@@ -2238,6 +2251,48 @@ struct StepDagHasher {
       }
       ColumnSource mapSource = combineColumnSources(inputSources);
       bindRegionArgs(map.getFn(), inputHashes);
+      auto sourceForPassthroughValue = [&](mlir::Value value) -> ColumnSource {
+         auto sourceForBlockArg = [&](auto&& self, mlir::BlockArgument arg) -> ColumnSource {
+            mlir::Block* block = arg.getOwner();
+            mlir::Region* region = block ? block->getParent() : nullptr;
+            mlir::Operation* parent = region ? region->getParentOp() : nullptr;
+            unsigned idx = arg.getArgNumber();
+            if (auto argMap = mlir::dyn_cast_or_null<subop::MapOp>(parent)) {
+               if (argMap == map && idx < inputSources.size()) return inputSources[idx];
+               return ColumnSource{};
+            }
+            if (auto nested = mlir::dyn_cast_or_null<subop::NestedMapOp>(parent)) {
+               if (idx == 0) return ColumnSource{};
+               unsigned paramIdx = idx - 1;
+               assert(paramIdx < nested.getParameters().size() && "nested_map block arg must match a parameter");
+               auto ref = mlir::cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(
+                  nested.getParameters()[paramIdx]);
+               return columnSourceFor(ref);
+            }
+            if (auto nestedGroup = mlir::dyn_cast_or_null<subop::NestedExecutionGroupOp>(parent)) {
+               if (idx >= nestedGroup.getNumOperands()) return ColumnSource{};
+               if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(nestedGroup.getOperand(idx)))
+                  return self(self, ba);
+               return ColumnSource{};
+            }
+            if (auto stepOp = mlir::dyn_cast_or_null<subop::ExecutionStepOp>(parent)) {
+               if (idx >= stepOp.getNumOperands()) return ColumnSource{};
+               if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(stepOp.getOperand(idx)))
+                  return self(self, ba);
+               return ColumnSource{};
+            }
+            if (auto group = mlir::dyn_cast_or_null<subop::ExecutionGroupOp>(parent)) {
+               if (idx >= group.getNumOperands()) return ColumnSource{};
+               if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(group.getOperand(idx)))
+                  return self(self, ba);
+               return ColumnSource{};
+            }
+            return ColumnSource{};
+         };
+         if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value))
+            return sourceForBlockArg(sourceForBlockArg, arg);
+         return ColumnSource{};
+      };
 
       auto ret = mlir::cast<tuples::ReturnOp>(map.getFn().front().getTerminator());
       assert(ret.getNumOperands() == map.getComputedCols().size() &&
@@ -2245,17 +2300,35 @@ struct StepDagHasher {
       uint64_t regionH = hashRegion(map.getFn());
       llvm::SmallVector<uint64_t, 8> sortedInputHashes(inputHashes.begin(), inputHashes.end());
       llvm::sort(sortedInputHashes);
+      struct PendingColumnDefinition {
+         lingodb::compiler::dialect::tuples::ColumnDefAttr def;
+         uint64_t hash;
+         ColumnSource source;
+      };
+      llvm::SmallVector<PendingColumnDefinition, 8> pendingDefinitions;
+      pendingDefinitions.reserve(map.getComputedCols().size());
       for (size_t i = 0; i < map.getComputedCols().size(); ++i) {
          auto def = mlir::cast<lingodb::compiler::dialect::tuples::ColumnDefAttr>(map.getComputedCols()[i]);
+         mlir::Value retValue = ret.getOperand(i);
+         if (mlir::isa<mlir::BlockArgument>(retValue)) {
+            ColumnSource source = sourceForPassthroughValue(retValue);
+            uint64_t passthroughH = hashValue(retValue);
+            pendingDefinitions.push_back({def, passthroughH,
+                                          source.kind == ColumnSource::Kind::Unknown ? mapSource : source});
+            continue;
+         }
          uint64_t colH = hashString("map_column");
          colH = hashCombineU64(colH, hashOpName(*map.getOperation()));
          colH = hashCombineU64(colH, upstream);
          colH = hashCombineU64(colH, regionH);
-         colH = hashCombineU64(colH, hashValue(ret.getOperand(i)));
+         colH = hashCombineU64(colH, hashValue(retValue));
          for (uint64_t inH : sortedInputHashes) colH = hashCombineU64(colH, inH);
          colH = hashCombineU64(colH, hashMlirType(def.getColumn().type));
-         defineColumn(def, colH);
-         defineColumnSource(def, mapSource);
+         pendingDefinitions.push_back({def, colH, mapSource});
+      }
+      for (const PendingColumnDefinition& pending : pendingDefinitions) {
+         defineColumn(pending.def, pending.hash);
+         defineColumnSource(pending.def, pending.source);
       }
       return upstream;
    }
@@ -2657,7 +2730,7 @@ struct StepDagHasher {
    uint64_t hashValue(mlir::Value v) {
       if (auto itRegion = regionValueHashByValue.find(v); itRegion != regionValueHashByValue.end())
          return itRegion->second;
-      v = canonicalizeStateValueDeep(v);
+      if (!mlir::isa<mlir::BlockArgument>(v)) v = canonicalizeStateValueDeep(v);
       if (auto itRegion = regionValueHashByValue.find(v); itRegion != regionValueHashByValue.end())
          return itRegion->second;
       if (auto it = memo.find(v); it != memo.end()) return it->second;
@@ -2666,6 +2739,49 @@ struct StepDagHasher {
       memo[v] = 0;
       uint64_t h = 0;
       if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+         mlir::Block* block = ba.getOwner();
+         mlir::Region* region = block ? block->getParent() : nullptr;
+         mlir::Operation* parent = region ? region->getParentOp() : nullptr;
+         unsigned idx = ba.getArgNumber();
+         if (auto nested = mlir::dyn_cast_or_null<subop::NestedMapOp>(parent)) {
+            if (idx == 0) {
+               h = hashValue(nested.getStream());
+               regionValueHashByValue[ba] = h;
+               memo[v] = h;
+               return h;
+            }
+            unsigned paramIdx = idx - 1;
+            assert(paramIdx < nested.getParameters().size() && "nested_map block arg must match a parameter");
+            (void)hashValue(nested.getStream());
+            auto ref = mlir::cast<lingodb::compiler::dialect::tuples::ColumnRefAttr>(
+               nested.getParameters()[paramIdx]);
+            h = hashColumnRef(ref);
+            regionValueHashByValue[ba] = h;
+            memo[v] = h;
+            return h;
+         }
+         if (auto nestedGroup = mlir::dyn_cast_or_null<subop::NestedExecutionGroupOp>(parent)) {
+            assert(idx < nestedGroup.getNumOperands() && "nested_execution_group block arg must match an input");
+            h = hashValue(nestedGroup.getOperand(idx));
+            regionValueHashByValue[ba] = h;
+            memo[v] = h;
+            return h;
+         }
+         if (auto step = mlir::dyn_cast_or_null<subop::ExecutionStepOp>(parent)) {
+            assert(idx < step.getNumOperands() && "execution_step block arg must match an operand");
+            h = hashValue(step.getOperand(idx));
+            regionValueHashByValue[ba] = h;
+            memo[v] = h;
+            return h;
+         }
+         if (auto group = mlir::dyn_cast_or_null<subop::ExecutionGroupOp>(parent)) {
+            if (idx < group.getNumOperands()) {
+               h = hashValue(group.getOperand(idx));
+               regionValueHashByValue[ba] = h;
+               memo[v] = h;
+               return h;
+            }
+         }
          mlir::Value state = canonicalizeStateValueDeep(ba);
          if (isTargetConstructionState(state)) {
             h = hashTargetConstructionState(state.getType());
@@ -2731,6 +2847,40 @@ struct StepDagHasher {
       return false;
    }
 
+   uint64_t hashLockWriterRoot(subop::LockOp lock, mlir::Value writtenState) {
+      uint64_t streamH = hashValue(lock.getStream());
+      uint64_t h = hashCombineU64(hashOpName(*lock.getOperation()), streamH);
+      h = hashCombineU64(h, hashColumnRef(lock.getRef()));
+
+      auto& block = lock.getNested().front();
+      mlir::BlockArgument streamArg;
+      uint64_t oldHash = 0;
+      bool hadOldHash = false;
+      if (block.getNumArguments() > 0) {
+         streamArg = block.getArgument(0);
+         auto itOld = regionValueHashByValue.find(streamArg);
+         if (itOld != regionValueHashByValue.end()) {
+            oldHash = itOld->second;
+            hadOldHash = true;
+         }
+         regionValueHashByValue[streamArg] = streamH;
+      }
+
+      block.walk([&](mlir::Operation* nestedOp) {
+         if (mlir::isa<subop::ExecutionStepOp>(nestedOp)) return;
+         if (!operationWritesTargetState(*nestedOp, writtenState)) return;
+         h = hashCombineU64(h, hashOp(*nestedOp));
+      });
+
+      if (streamArg) {
+         if (hadOldHash)
+            regionValueHashByValue[streamArg] = oldHash;
+         else
+            regionValueHashByValue.erase(streamArg);
+      }
+      return h;
+   }
+
    uint64_t hashStepWriterRoots() {
       llvm::DenseMap<mlir::Value, RWFlags> rw = analyzeStepStateRWWithNested(step);
       mlir::Value writtenState;
@@ -2744,7 +2894,17 @@ struct StepDagHasher {
       uint64_t h = 0;
       step.walk([&](mlir::Operation* op) {
          if (mlir::isa<subop::ExecutionStepOp>(op)) return;
+         if (!mlir::isa<subop::LockOp>(op)) {
+            for (mlir::Operation* parent = op->getParentOp();
+                 parent && parent != step.getOperation(); parent = parent->getParentOp()) {
+               if (mlir::isa<subop::LockOp>(parent)) return;
+            }
+         }
          if (!operationWritesTargetState(*op, writtenState)) return;
+         if (auto lock = mlir::dyn_cast<subop::LockOp>(op)) {
+            h = hashCombineU64(h, hashLockWriterRoot(lock, writtenState));
+            return;
+         }
          h = hashCombineU64(h, hashOp(*op));
       });
       return h;
@@ -3281,15 +3441,6 @@ static bool isScanRefsOnlyBufferReuseTarget(mlir::Value state, const ModuleMatch
       auto itFlag = itRw->second.find(canon);
       assert(itFlag != itRw->second.end() && "buffer read step must mention the buffer");
       if (itFlag->second.write) return false;
-      for (auto& kv : itRw->second) {
-         if (!kv.second.write) continue;
-         mlir::Type writeTy = kv.first.getType();
-         if (mlir::isa<subop::BufferType, subop::HashIndexedViewType>(writeTy)) continue;
-         if (auto tl = mlir::dyn_cast<subop::ThreadLocalType>(writeTy)) {
-            if (mlir::isa<subop::BufferType>(tl.getWrapped())) continue;
-         }
-         return false;
-      }
       auto itStep = module.stepByIndex.find(stepIdx);
       assert(itStep != module.stepByIndex.end() && "buffer read step must resolve");
       if (!bufferPureReadStepUsesOnlyScanRefs(canon, itStep->second)) return false;
@@ -3367,7 +3518,7 @@ static ConstructionResidualFilterSummary constructionResidualFilterSummary(
       }
       if ((!trace.filter && !trace.relaxedMixedScan) || !trace.sourceState || trace.split) continue;
       out.any = true;
-      if (trace.unsupported) continue;
+      if (!residualTraceHasUniqueEligibleSource(trace)) continue;
       out.supported = true;
       out.complex |= trace.complex;
    }

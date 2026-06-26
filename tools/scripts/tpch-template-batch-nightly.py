@@ -37,6 +37,19 @@ def mismatch_indices(hashes: List[str], ref_hashes: List[str]) -> List[int]:
     return out
 
 
+def reuse_count_category_mismatch_indices(record: Dict[str, Any]) -> List[int]:
+    total = record.get("reuse_targets_no_table")
+    union = record.get("reuse_targets_union_no_table")
+    build_step = record.get("reuse_targets_build_step_no_table")
+    if not (isinstance(total, list) and isinstance(union, list) and isinstance(build_step, list)):
+        return []
+    n = min(len(total), len(union), len(build_step))
+    out = [i for i in range(n) if total[i] != union[i] + build_step[i]]
+    if len(total) != len(union) or len(total) != len(build_step):
+        out.extend(range(n, max(len(total), len(union), len(build_step))))
+    return out
+
+
 def geo_mean(values: List[float]) -> Optional[float]:
     values = [v for v in values if v > 0]
     if not values:
@@ -65,6 +78,9 @@ def build_summary(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         rowset_mismatch_runs = sum(1 for r in rows if r.get("rowset_mismatches_vs_reuse_off"))
         exact_mismatch_runs = sum(1 for r in rows if r.get("exact_mismatches_vs_reuse_off"))
         reference_missing_runs = sum(1 for r in rows if r.get("reference_missing"))
+        reuse_count_category_mismatch_runs = sum(
+            1 for r in rows if r.get("reuse_count_category_mismatches")
+        )
         reuse_counts = [
             sum(r["reuse_targets_no_table"])
             for r in ok_rows
@@ -91,6 +107,7 @@ def build_summary(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "rowset_mismatch_runs": rowset_mismatch_runs,
                 "exact_mismatch_runs": exact_mismatch_runs,
                 "reference_missing_runs": reference_missing_runs,
+                "reuse_count_category_mismatch_runs": reuse_count_category_mismatch_runs,
                 "total_time_geo_mean_ms": geo_mean(times),
                 "total_time_median_ms": statistics.median(times) if times else None,
                 "reuse_count_no_table_median_sum": statistics.median(reuse_counts) if reuse_counts else None,
@@ -110,6 +127,7 @@ def annotate_mismatches(records: List[Dict[str, Any]]) -> None:
         r.setdefault("rowset_mismatches_vs_reuse_off", [])
         r.setdefault("order_only_mismatches_vs_reuse_off", [])
         r.setdefault("reference_missing", False)
+        r["reuse_count_category_mismatches"] = reuse_count_category_mismatch_indices(r)
         if r.get("mode") == "reuse_off" and r.get("returncode") == 0:
             refs[(r["db_label"], r["template"], r["batch_size"], r["rep"])] = r
     for r in records:

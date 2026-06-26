@@ -180,6 +180,7 @@ struct PayloadColumnSpec {
    mlir::Type colType;
    bool isJoinKey = false;
    llvm::SmallVector<unsigned, 4> queryIndices;
+   llvm::DenseMap<unsigned, subop::Member> sourceMemberByQueryIndex;
    bool fromExternalTable = false;
    unsigned stableOrder = 0;
 };
@@ -497,6 +498,7 @@ static void collectPayloadFromMaterialize(
          spec.semanticKey = columnSemanticKey(scope, leaf);
          spec.semanticHash = payloadColumnIdentityHash(colRef, columnHashes);
       }
+      if (ownerQueryIndex) spec.sourceMemberByQueryIndex[*ownerQueryIndex] = member;
       insertPayloadColumnSpec(out, std::move(spec), ownerQueryIndex);
    }
 }
@@ -609,17 +611,6 @@ static std::optional<ResolvedExternalTableScan> resolveExternalTableScanForDonor
    return resolved;
 }
 
-static unsigned countUnionPayloadLeavesOnTable(llvm::ArrayRef<PayloadColumnSpec> payloadColumns,
-                                               subop::TableType tableTy, subop::MemberManager& mm) {
-   unsigned overlap = 0;
-   for (const PayloadColumnSpec& spec : payloadColumns) {
-      unsigned qIdx = 0;
-      if (parseFilterPredLayoutSemanticKey(spec.semanticKey, qIdx)) continue;
-      if (tableMemberForIdentifier(tableTy, mm, spec.leaf)) ++overlap;
-   }
-   return overlap;
-}
-
 static void insertPayloadColumnSpec(llvm::DenseMap<uint64_t, PayloadColumnSpec>& unionCols,
                                     PayloadColumnSpec spec,
                                     std::optional<unsigned> ownerQueryIndex) {
@@ -629,49 +620,17 @@ static void insertPayloadColumnSpec(llvm::DenseMap<uint64_t, PayloadColumnSpec>&
       if (!llvm::is_contained(existing.queryIndices, *ownerQueryIndex))
          existing.queryIndices.push_back(*ownerQueryIndex);
    };
+   auto mergeSpec = [&](PayloadColumnSpec& existing, const PayloadColumnSpec& incoming) {
+      markSide(existing);
+      existing.isJoinKey |= incoming.isJoinKey;
+      existing.fromExternalTable |= incoming.fromExternalTable;
+      for (const auto& entry : incoming.sourceMemberByQueryIndex)
+         existing.sourceMemberByQueryIndex.try_emplace(entry.first, entry.second);
+   };
 
    auto it = unionCols.find(spec.semanticHash);
    if (it != unionCols.end()) {
-      markSide(it->second);
-      it->second.isJoinKey |= spec.isJoinKey;
-      it->second.fromExternalTable |= spec.fromExternalTable;
-      return;
-   }
-
-   for (auto existingIt = unionCols.begin(), e = unionCols.end(); existingIt != e; ++existingIt) {
-      PayloadColumnSpec& existing = existingIt->second;
-      unsigned predIdx = 0;
-      if (parseFilterPredLayoutSemanticKey(existing.semanticKey, predIdx)) continue;
-      if (existing.semanticKey != spec.semanticKey) continue;
-      if (existing.colType != spec.colType) continue;
-      markSide(existing);
-      existing.isJoinKey |= spec.isJoinKey;
-      existing.fromExternalTable |= spec.fromExternalTable;
-      return;
-   }
-
-   llvm::StringRef specLeaf = normalizeColumnIdentifier(spec.leaf);
-   for (auto existingIt = unionCols.begin(), e = unionCols.end(); existingIt != e; ++existingIt) {
-      PayloadColumnSpec& existing = existingIt->second;
-      unsigned predIdx = 0;
-      if (parseFilterPredLayoutSemanticKey(existing.semanticKey, predIdx)) continue;
-      if (normalizeColumnIdentifier(existing.leaf) != specLeaf) continue;
-      if (existing.colType != spec.colType) continue;
-      if (!spec.fromExternalTable && !existing.fromExternalTable) continue;
-
-      if (existing.fromExternalTable && !spec.fromExternalTable) {
-         markSide(existing);
-         existing.isJoinKey |= spec.isJoinKey;
-         return;
-      }
-
-      for (unsigned queryIndex : existing.queryIndices)
-         if (!llvm::is_contained(spec.queryIndices, queryIndex)) spec.queryIndices.push_back(queryIndex);
-      spec.isJoinKey |= existing.isJoinKey;
-      spec.stableOrder = existing.stableOrder;
-      markSide(spec);
-      unionCols.erase(existingIt);
-      unionCols.try_emplace(spec.semanticHash, std::move(spec));
+      mergeSpec(it->second, spec);
       return;
    }
 
@@ -680,79 +639,19 @@ static void insertPayloadColumnSpec(llvm::DenseMap<uint64_t, PayloadColumnSpec>&
    unionCols.try_emplace(spec.semanticHash, std::move(spec));
 }
 
-static subop::ScanRefsOp findTableScanForPayloadLeaf(subop::ExecutionStepOp buildStep, llvm::StringRef leaf,
-                                                   subop::MemberManager& mm) {
+static subop::ScanRefsOp findUniqueTableScanRefsInStep(subop::ExecutionStepOp buildStep) {
    subop::ScanRefsOp found;
-   buildStep.walk([&](subop::ScanRefsOp scanOp) {
-      if (found) return;
-      auto tableTy = mlir::dyn_cast<subop::TableType>(scanOp.getState().getType());
-      if (!tableTy) return;
-      if (tableMemberForIdentifier(tableTy, mm, leaf)) found = scanOp;
-   });
-   return found;
-}
-
-static subop::ScanRefsOp findDonorTableScanInUnionPlan(subop::ExecutionStepOp buildStep,
-                                                       const JoinBufferUnionPlan& plan,
-                                                       const ModuleReuseInfo& reuse) {
-   (void)reuse;
-   auto& mm = buildStep.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   subop::ScanRefsOp bestScan;
-   unsigned bestOverlap = 0;
-   buildStep.walk([&](subop::ScanRefsOp scanOp) {
-      auto tableTy = mlir::dyn_cast<subop::TableType>(scanOp.getState().getType());
-      if (!tableTy) return;
-      unsigned overlap = countUnionPayloadLeavesOnTable(plan.payloadColumns, tableTy, mm);
-      if (overlap > bestOverlap) {
-         bestOverlap = overlap;
-         bestScan = scanOp;
-      }
-   });
-   return bestScan;
-}
-
-static void ingestExternalTableColumnsFromBuildStepScan(subop::ExecutionStepOp buildStep,
-                                                        const ModuleReuseInfo& reuse,
-                                                        llvm::DenseMap<uint64_t, PayloadColumnSpec>& unionCols) {
-   llvm::SmallVector<PayloadColumnSpec, 16> unionSpecs;
-   unionSpecs.reserve(unionCols.size());
-   for (auto& it : unionCols) unionSpecs.push_back(it.second);
-
-   auto& mm = buildStep.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   bool sawTableScan = false;
+   bool multiple = false;
    buildStep.walk([&](subop::ScanRefsOp scanOp) {
       if (!mlir::isa<subop::TableType>(scanOp.getState().getType())) return;
-      sawTableScan = true;
-
-      llvm::StringRef tableName;
-      ExternalDatasourceProperty ds;
-      bool haveDs = false;
-      subop::TableType tableTy;
-      if (!resolveScannedTableExternal(buildStep, scanOp.getState(), reuse, tableName, ds, haveDs, tableTy) ||
-          !haveDs) {
+      if (found && found != scanOp) {
+         multiple = true;
          return;
       }
-      if (countUnionPayloadLeavesOnTable(unionSpecs, tableTy, mm) == 0) return;
-
-      for (const PayloadColumnSpec& existing : unionSpecs) {
-         unsigned predIdx = 0;
-         if (parseFilterPredLayoutSemanticKey(existing.semanticKey, predIdx)) continue;
-         llvm::StringRef leaf = normalizeColumnIdentifier(existing.leaf);
-         if (!tableMemberForIdentifier(tableTy, mm, leaf)) continue;
-         PayloadColumnSpec spec;
-         spec.scope = tableName.str();
-         spec.leaf = leaf.str();
-         spec.colType = memberTypeForIdentifier(tableTy, mm, leaf);
-         assert(spec.colType && "external table mapping column must exist on scanned table type");
-         spec.semanticKey = columnSemanticKey(spec.scope, spec.leaf);
-         spec.semanticHash = existing.semanticHash;
-         spec.isJoinKey = existing.isJoinKey;
-         spec.queryIndices = existing.queryIndices;
-         spec.fromExternalTable = true;
-         insertPayloadColumnSpec(unionCols, std::move(spec));
-	      }
-	   });
-   (void)sawTableScan;
+      found = scanOp;
+   });
+   if (multiple) return {};
+   return found;
 }
 
 static void mergePeerExternalFromBuildStepScan(ExternalDatasourceProperty& merged, bool& haveMerged,
@@ -864,7 +763,6 @@ static JoinBufferUnionPlan buildUnionPlan(mlir::Value hivA, mlir::Value hivB, co
          predSpec.stableOrder = nextPayloadStableOrder(unionCols);
          unionCols.try_emplace(predSpec.semanticHash, predSpec);
       }
-      ingestExternalTableColumnsFromBuildStepScan(buildStep, reuse, unionCols);
    };
    ingestHiv(hivA, reuseA, modA, queryIndexA);
    ingestHiv(hivB, reuseB, modB, queryIndexB);
@@ -1037,6 +935,7 @@ static llvm::DenseSet<unsigned> residualPredicateInputIndices(subop::MapOp peerM
 static subop::Member sourceMemberForIdentifier(mlir::Type sourceStateType,
                                                subop::MemberManager& mm,
                                                llvm::StringRef identifier);
+static std::optional<ResidualTableFilter> findScanLikeSourceInBuildStep(subop::ExecutionStepOp step);
 
 static bool filterConditionsComeFromGather(subop::FilterOp filter, subop::GatherOp gather) {
    llvm::DenseSet<const void*> gatheredCols;
@@ -1341,8 +1240,9 @@ static void ensureSyntheticMapHasPeerInputs(subop::ExecutionStepOp syntheticBuil
    auto& peerCm = peerMap.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    auto synthResidual = findResidualTableFilterInBuildStep(syntheticBuild);
-   assert(synthResidual && "residual filter rewrite: synthetic build must have a scan-like source");
-   assert(sourceValueMembersForResidualGather(synthResidual->sourceStateType) &&
+   std::optional<ResidualTableFilter> source = synthResidual ? synthResidual : findScanLikeSourceInBuildStep(syntheticBuild);
+   assert(source && "residual filter rewrite: synthetic build must have a scan-like source");
+   assert(sourceValueMembersForResidualGather(source->sourceStateType) &&
           "residual filter rewrite: synthetic source must expose members");
    llvm::DenseSet<unsigned> usedInputs = residualPredicateInputIndices(peerMap, peerFilter);
 
@@ -1356,7 +1256,7 @@ static void ensureSyntheticMapHasPeerInputs(subop::ExecutionStepOp syntheticBuil
       std::string semantic = columnSemanticKey(scope, leaf);
       mlir::Type inputType = cloneTypeToContext(peerRef.getColumn().type, ctx);
       if (findCompatibleMapInputIndex(syntheticMap, semantic, leaf, inputType, synthCm)) continue;
-      subop::Member member = sourceMemberForIdentifier(synthResidual->sourceStateType, mm, leaf);
+      subop::Member member = sourceMemberForIdentifier(source->sourceStateType, mm, leaf);
       assert(member && "residual filter rewrite: synthetic scan-like source must contain peer predicate input");
       tuples::ColumnDefAttr def = synthCm.createDef(scope, leaf);
       def.getColumn().type = cloneTypeToContext(mm.getType(member), ctx);
@@ -1367,7 +1267,7 @@ static void ensureSyntheticMapHasPeerInputs(subop::ExecutionStepOp syntheticBuil
 
    mlir::OpBuilder b(syntheticMap);
    auto gather = b.create<subop::GatherOp>(
-      syntheticMap.getLoc(), syntheticMap.getStream(), synthResidual->sourceRef,
+      syntheticMap.getLoc(), syntheticMap.getStream(), source->sourceRef,
       subop::ColumnDefMemberMappingAttr::get(ctx, gatherPairs));
    syntheticMap->setOperand(0, gather.getRes());
    for (tuples::ColumnRefAttr ref : newInputs)
@@ -1905,12 +1805,27 @@ static void enqueueTupleStreamSourceForBlockArgument(mlir::BlockArgument arg,
    if (arg.getArgNumber() < parent->getNumOperands()) worklist.push_back(parent->getOperand(arg.getArgNumber()));
 }
 
-static std::optional<subop::LookupOp> findUniqueUpstreamLookupOpInReuse(mlir::Value value,
-                                                                        bool& multiple) {
+static bool lookupProducesColumn(subop::LookupOp lookup, tuples::ColumnRefAttr column) {
+   return column && &lookup.getRef().getColumn() == &column.getColumn();
+}
+
+static void recordUniqueLookup(subop::LookupOp lookup, std::optional<subop::LookupOp>& found,
+                               bool& multiple) {
+   if (found && found->getOperation() != lookup.getOperation()) {
+      multiple = true;
+      found = std::nullopt;
+      return;
+   }
+   found = lookup;
+}
+
+static std::optional<subop::LookupOp>
+findUniqueLookupProducingColumnOnStream(mlir::Value rootStream, tuples::ColumnRefAttr column,
+                                        bool& multiple) {
    multiple = false;
    std::optional<subop::LookupOp> found;
    llvm::DenseSet<void*> seen;
-   llvm::SmallVector<mlir::Value, 8> worklist{value};
+   llvm::SmallVector<mlir::Value, 8> worklist{rootStream};
    while (!worklist.empty()) {
       mlir::Value cur = worklist.pop_back_val();
       if (!cur || !seen.insert(cur.getAsOpaquePointer()).second) continue;
@@ -1921,11 +1836,60 @@ static std::optional<subop::LookupOp> findUniqueUpstreamLookupOpInReuse(mlir::Va
       mlir::Operation* def = cur.getDefiningOp();
       if (!def) continue;
       if (auto lookup = mlir::dyn_cast<subop::LookupOp>(def)) {
-         if (found && found->getOperation() != lookup.getOperation()) {
-            multiple = true;
-            return std::nullopt;
+         if (lookupProducesColumn(lookup, column)) {
+            recordUniqueLookup(lookup, found, multiple);
+            if (multiple) return std::nullopt;
          }
-         found = lookup;
+         worklist.push_back(lookup.getStream());
+         continue;
+      }
+      for (mlir::Value operand : def->getOperands()) {
+         if (mlir::isa<tuples::TupleStreamType>(operand.getType())) worklist.push_back(operand);
+      }
+   }
+   return found;
+}
+
+static std::optional<subop::LookupOp> findUniqueUpstreamLookupOpInReuse(mlir::Value value,
+                                                                        bool& multiple) {
+   multiple = false;
+   std::optional<subop::LookupOp> found;
+   llvm::DenseSet<void*> seen;
+   llvm::SmallVector<mlir::Value, 8> worklist{value};
+   while (!worklist.empty()) {
+      mlir::Value cur = worklist.pop_back_val();
+      if (!cur || !seen.insert(cur.getAsOpaquePointer()).second) continue;
+      if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(cur)) {
+         if (auto nested = mlir::dyn_cast<subop::NestedMapOp>(arg.getOwner()->getParentOp())) {
+            if (arg.getArgNumber() == 0) {
+               worklist.push_back(nested.getStream());
+               continue;
+            }
+            unsigned paramIdx = arg.getArgNumber() - 1;
+            if (paramIdx < nested.getParameters().size()) {
+               auto param = mlir::dyn_cast<tuples::ColumnRefAttr>(nested.getParameters()[paramIdx]);
+               bool nestedMultiple = false;
+               std::optional<subop::LookupOp> lookup =
+                  findUniqueLookupProducingColumnOnStream(nested.getStream(), param, nestedMultiple);
+               if (nestedMultiple) {
+                  multiple = true;
+                  return std::nullopt;
+               }
+               if (lookup) {
+                  recordUniqueLookup(*lookup, found, multiple);
+                  if (multiple) return std::nullopt;
+               }
+               continue;
+            }
+         }
+         enqueueTupleStreamSourceForBlockArgument(arg, worklist);
+         continue;
+      }
+      mlir::Operation* def = cur.getDefiningOp();
+      if (!def) continue;
+      if (auto lookup = mlir::dyn_cast<subop::LookupOp>(def)) {
+         recordUniqueLookup(lookup, found, multiple);
+         if (multiple) return std::nullopt;
          continue;
       }
       if (auto scanList = mlir::dyn_cast<subop::ScanListOp>(def)) {
@@ -2096,13 +2060,6 @@ static subop::HashIndexedViewType asLocalHivLayoutType(mlir::Type type) {
       return nullptr;
 }
 
-static bool localHivLayoutsSame(subop::HashIndexedViewType a, subop::HashIndexedViewType b) {
-   if (!a || !b) return false;
-   return a.getKeyMembers().getMembers() == b.getKeyMembers().getMembers() &&
-          a.getValueMembers().getMembers() == b.getValueMembers().getMembers() &&
-          a.getCompareHashForLookup() == b.getCompareHashForLookup();
-}
-
 static bool localHivLayoutHasFilterPredMember(mlir::MLIRContext* ctx,
                                               subop::HashIndexedViewType layout) {
    if (!layout) return false;
@@ -2115,6 +2072,7 @@ static bool localHivLayoutHasFilterPredMember(mlir::MLIRContext* ctx,
 
 struct DirectMixedDep {
    uint64_t cacheKey;
+   mlir::Value state;
    subop::HashIndexedViewType layout;
 };
 
@@ -2126,25 +2084,30 @@ static llvm::SmallVector<DirectMixedDep, 4> directMixedDepsForBuildStep(subop::E
       if (!key || !seenKeys.insert(*key).second) continue;
       auto layout = asLocalHivLayoutType(input.getType());
       if (!localHivLayoutHasFilterPredMember(buildStep.getContext(), layout)) continue;
-      deps.push_back(DirectMixedDep{*key, layout});
+      deps.push_back(DirectMixedDep{*key, canonicalizeStateValueForReuse(input), layout});
    }
    return deps;
 }
 
-static uint64_t directDepKeyForScanList(subop::ScanListOp scanList,
-                                        llvm::ArrayRef<DirectMixedDep> directDeps) {
-   auto ler = mlir::dyn_cast<subop::LookupEntryRefType>(scanList.getElem().getColumn().type);
-   assert(ler && "mixed inherited pred scan_list must expose entry refs");
-   auto scanLayout = asLocalHivLayoutType(ler.getState());
-   assert(scanLayout && "mixed inherited pred scan_list must scan an HIV-like state");
+static std::optional<uint64_t> directDepKeyForScanList(subop::ScanListOp scanList,
+                                                       llvm::ArrayRef<DirectMixedDep> directDeps) {
+   bool multipleLookups = false;
+   std::optional<subop::LookupOp> lookup = findUniqueUpstreamLookupOpInReuse(scanList.getList(), multipleLookups);
+   assert(!multipleLookups && "mixed inherited pred scan_list must have one upstream lookup");
+   if (!lookup) return std::nullopt;
+   mlir::Value scanState = canonicalizeStateValueForReuse(
+      peelBlockArgsToEnclosingOperands(lookup->getState()));
+   auto scanKey = cacheGetKeyForStepResult(scanState);
+   if (!scanKey) return std::nullopt;
    std::optional<uint64_t> found;
    for (const DirectMixedDep& dep : directDeps) {
-      if (!localHivLayoutsSame(dep.layout, scanLayout)) continue;
+      if (dep.cacheKey != *scanKey) continue;
+      assert(canonicalizeStateValueForReuse(dep.state) == scanState &&
+             "mixed inherited pred scan_list cache dep must map to the same state value");
       assert(!found && "mixed inherited pred scan_list must match one direct cache dep");
       found = dep.cacheKey;
    }
-   assert(found && "mixed inherited pred scan_list must match a direct cache dep");
-   return *found;
+   return found;
 }
 
 static llvm::SmallVector<tuples::ColumnRefAttr, 4>
@@ -2191,11 +2154,12 @@ threadMappedUpstreamMixedPredColumnsToMaterializeStream(
       if (!ler) continue;
       auto scannedLayout = asLocalHivLayoutType(ler.getState());
       if (!localHivLayoutHasFilterPredMember(ctx, scannedLayout)) continue;
-      uint64_t depKey = directDepKeyForScanList(scanList, directDeps);
-      auto itWantedSlots = wantedSlotsByDep.find(depKey);
+      std::optional<uint64_t> depKey = directDepKeyForScanList(scanList, directDeps);
+      if (!depKey) continue;
+      auto itWantedSlots = wantedSlotsByDep.find(*depKey);
       if (itWantedSlots == wantedSlotsByDep.end()) continue;
       for (unsigned depSlot : itWantedSlots->second) {
-         std::string key = (llvm::Twine(depKey) + ":" + llvm::Twine(depSlot)).str();
+         std::string key = (llvm::Twine(*depKey) + ":" + llvm::Twine(depSlot)).str();
          if (!emitted.insert(key).second) continue;
          std::string predName = ("filter_pred$" + llvm::Twine(depSlot)).str();
          subop::Member predMember;
@@ -2574,38 +2538,16 @@ static void collectSemanticHashToMemberFromMaterialize(
    }
 }
 
-static std::string stableTypeKey(mlir::Type type) {
-   std::string out;
-   llvm::raw_string_ostream os(out);
-   type.print(os);
-   return out;
-}
-
 static void alignMaterializedPayloadMembersToUnionPlan(
    subop::MaterializeOp mat, const JoinBufferUnionPlan& plan, subop::MemberManager& mm,
    const llvm::DenseMap<const void*, uint64_t>& columnHashes) {
-   auto& cm = mat.getContext()->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    llvm::DenseMap<uint64_t, subop::Member> targetMemberBySemanticHash;
-   llvm::StringMap<subop::Member> targetMemberBySemanticKey;
-   llvm::StringMap<subop::Member> targetMemberByLeafAndType;
    llvm::StringMap<subop::Member> targetMemberByName;
-   llvm::StringSet<> ambiguousLeafAndType;
    assert(plan.payloadColumns.size() == plan.payloadMembers.size());
    for (size_t i = 0; i < plan.payloadColumns.size(); ++i) {
       const PayloadColumnSpec& spec = plan.payloadColumns[i];
       targetMemberBySemanticHash[spec.semanticHash] = plan.payloadMembers[i];
-      targetMemberBySemanticKey[spec.semanticKey] = plan.payloadMembers[i];
       targetMemberByName[mm.getName(plan.payloadMembers[i])] = plan.payloadMembers[i];
-      unsigned predIdx = 0;
-      if (parseFilterPredLayoutSemanticKey(spec.semanticKey, predIdx)) continue;
-      std::string leafKey =
-         (normalizeColumnIdentifier(spec.leaf) + "\x1f" + stableTypeKey(spec.colType)).str();
-      if (targetMemberByLeafAndType.contains(leafKey)) {
-         targetMemberByLeafAndType.erase(leafKey);
-         ambiguousLeafAndType.insert(leafKey);
-      } else if (!ambiguousLeafAndType.contains(leafKey)) {
-         targetMemberByLeafAndType[leafKey] = plan.payloadMembers[i];
-      }
    }
 
    bool changed = false;
@@ -2615,8 +2557,7 @@ static void alignMaterializedPayloadMembersToUnionPlan(
    for (auto& [member, colRef] : mat.getMapping().getMapping()) {
       subop::Member outMember = member;
       llvm::StringRef memName = mm.getName(member);
-      if (member != plan.linkMember && member != plan.hashMember && !isJoinBufferInternalMemberName(memName)) {
-         auto [scope, leaf] = cm.getName(&colRef.getColumn());
+         if (member != plan.linkMember && member != plan.hashMember && !isJoinBufferInternalMemberName(memName)) {
          bool resolved = false;
          auto tryUseTarget = [&](subop::Member candidate) -> bool {
             if (!candidate) return false;
@@ -2632,27 +2573,10 @@ static void alignMaterializedPayloadMembersToUnionPlan(
                (void)tryUseTarget(itPred->second);
          }
          if (outMember == member) {
-            std::string semKey = columnSemanticKey(scope, leaf);
-            if (auto itSem = targetMemberBySemanticKey.find(semKey); itSem != targetMemberBySemanticKey.end()) {
-               if (!tryUseTarget(itSem->second))
-                  llvm_unreachable("join superset: semantic payload member type must match materialized column");
-            }
-         }
-         if (outMember == member) {
-            std::string leafKey = (normalizeColumnIdentifier(leaf) + "\x1f" +
-                                   stableTypeKey(colRef.getColumn().type)).str();
-            if (auto itLeaf = targetMemberByLeafAndType.find(leafKey);
-                itLeaf != targetMemberByLeafAndType.end()) {
-               (void)tryUseTarget(itLeaf->second);
-            }
-         }
-         if (outMember == member) {
-            auto itHash = columnHashes.find(&colRef.getColumn());
-            if (itHash != columnHashes.end()) {
-               auto it = targetMemberBySemanticHash.find(itHash->second);
-               if (it != targetMemberBySemanticHash.end()) {
-                  (void)tryUseTarget(it->second);
-               }
+            auto hash = payloadColumnIdentityHash(colRef, columnHashes);
+            auto it = targetMemberBySemanticHash.find(hash);
+            if (it != targetMemberBySemanticHash.end()) {
+               (void)tryUseTarget(it->second);
             }
          }
          assert(resolved &&
@@ -2674,25 +2598,6 @@ static void assignPayloadMembersForPlan(subop::MemberManager& mm, lingodb::compi
    llvm::DenseMap<uint64_t, subop::Member> bySemanticHash;
    collectSemanticHashToMemberFromMaterialize(matOp, plan.linkMember, plan.hashMember, mm, columnHashes,
                                               bySemanticHash);
-   llvm::StringMap<subop::Member> bySemanticKey;
-   llvm::StringMap<subop::Member> byLeafAndType;
-   llvm::StringSet<> ambiguousLeafAndType;
-   for (auto& [member, colRef] : matOp.getMapping().getMapping()) {
-      llvm::StringRef memName = mm.getName(member);
-      if (member == plan.linkMember || member == plan.hashMember || isJoinBufferInternalMemberName(memName))
-         continue;
-      if (mm.getType(member) != colRef.getColumn().type) continue;
-      auto [scope, leaf] = cm.getName(&colRef.getColumn());
-      bySemanticKey.try_emplace(columnSemanticKey(scope, leaf), member);
-      std::string leafKey =
-         (normalizeColumnIdentifier(leaf) + "\x1f" + stableTypeKey(colRef.getColumn().type)).str();
-      if (byLeafAndType.contains(leafKey)) {
-         byLeafAndType.erase(leafKey);
-         ambiguousLeafAndType.insert(leafKey);
-      } else if (!ambiguousLeafAndType.contains(leafKey)) {
-         byLeafAndType[leafKey] = member;
-      }
-   }
    plan.payloadMembers.clear();
    plan.payloadMembers.reserve(plan.payloadColumns.size());
    llvm::SmallVector<subop::Member, 8> existingPayloadMembers;
@@ -2728,13 +2633,6 @@ static void assignPayloadMembersForPlan(subop::MemberManager& mm, lingodb::compi
          plan.payloadMembers.push_back(candidate);
          return true;
       };
-      if (auto itSem = bySemanticKey.find(spec.semanticKey); itSem != bySemanticKey.end()) {
-         if (tryUseMember(itSem->second)) continue;
-      }
-      std::string leafKey = (normalizeColumnIdentifier(spec.leaf) + "\x1f" + stableTypeKey(slotTy)).str();
-      if (auto itLeaf = byLeafAndType.find(leafKey); itLeaf != byLeafAndType.end()) {
-         if (tryUseMember(itLeaf->second)) continue;
-      }
       auto it = bySemanticHash.find(spec.semanticHash);
       if (it != bySemanticHash.end()) {
          if (tryUseMember(it->second)) continue;
@@ -3031,18 +2929,6 @@ static void syncMaterializeMappingsToBufferMembers(mlir::ModuleOp module, subop:
                if (auto it = validByName.find(predName); it != validByName.end()) canon = it->second;
             }
          }
-         if (!canon) {
-            llvm::SmallVector<subop::Member, 2> candidates;
-            for (subop::Member target : targetMembers.getMembers()) {
-               if (usedTargetMembers.contains(target)) continue;
-               llvm::StringRef targetName = mm.getName(target);
-               if (targetName.starts_with("link$") || targetName.starts_with("hash$") ||
-                   parseFilterPredMemberSlot(targetName))
-                  continue;
-               if (mm.getType(target) == pr.second.getColumn().type) candidates.push_back(target);
-            }
-            if (candidates.size() == 1) canon = candidates[0];
-         }
          assert(canon && "materialize mapping must resolve to a member of the target buffer layout");
          usedTargetMembers.insert(canon);
          pairs.push_back({canon, pr.second});
@@ -3052,7 +2938,6 @@ static void syncMaterializeMappingsToBufferMembers(mlir::ModuleOp module, subop:
 }
 
 static void syncMaterializeMappingsToActualBufferTypes(mlir::ModuleOp module) {
-   auto& mm = module.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    module.walk([&](subop::MaterializeOp mat) {
       mlir::Value actualState = peelBlockArgsToEnclosingOperands(mat.getState());
       subop::BufferType bufTy = getInnerBufferTypeForMaterializeState(actualState.getType());
@@ -3062,32 +2947,15 @@ static void syncMaterializeMappingsToActualBufferTypes(mlir::ModuleOp module) {
                                                   bufTy.getMembers().getMembers().end());
       llvm::DenseSet<subop::Member> usedMembers;
 
-      bool changed = false;
       llvm::SmallVector<subop::RefMappingPairT> pairs;
       pairs.reserve(mat.getMapping().getMapping().size());
       for (auto& pr : mat.getMapping().getMapping()) {
          subop::Member member = pr.first;
-         if (!bufferMembers.contains(member) || usedMembers.contains(member)) {
-            llvm::SmallVector<subop::Member, 2> candidates;
-            for (subop::Member target : bufTy.getMembers().getMembers()) {
-               if (usedMembers.contains(target)) continue;
-               llvm::StringRef targetName = mm.getName(target);
-               if (targetName.starts_with("link$") || targetName.starts_with("hash$") ||
-                   parseFilterPredMemberSlot(targetName))
-                  continue;
-               if (mm.getType(target) == pr.second.getColumn().type) candidates.push_back(target);
-            }
-            if (candidates.size() == 1) {
-               member = candidates[0];
-               changed = true;
-            }
-         }
          assert(bufferMembers.contains(member) && "materialize mapping must target the buffer layout");
          assert(!usedMembers.contains(member) && "materialize mapping must not write the same member twice");
          usedMembers.insert(member);
          pairs.push_back({member, pr.second});
       }
-      if (changed) mat.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(mat.getContext(), pairs));
    });
 }
 
@@ -3307,10 +3175,6 @@ static subop::Member tableMemberForIdentifier(subop::TableType tableTy, subop::M
       if (stripMemberSuffix(mm.getName(m)) == id) return m;
    }
    return {};
-}
-
-static llvm::StringRef semanticKeyLeaf(llvm::StringRef semanticKey) {
-   return semanticKey.split('\x1f').second;
 }
 
 /// Propagate a widened \c !subop.table type along SSA values and \c execution_step operand/block-arg ports.
@@ -3899,18 +3763,6 @@ static void syncGatherMembersToMixedHivLayouts(mlir::ModuleOp module, const llvm
                oldToNew[oldMember] = it->second;
             }
          }
-         for (auto& [oldMember, semantic] : layout.oldMemberSemantic) {
-            if (oldToNew.contains(oldMember)) continue;
-            mlir::Type oldTy = mm.getType(oldMember);
-            subop::Member onlySameType;
-            unsigned matches = 0;
-            for (subop::Member candidate : layout.newNonPredMembers) {
-               if (mm.getType(candidate) != oldTy) continue;
-               onlySameType = candidate;
-               ++matches;
-            }
-            if (matches == 1) oldToNew[oldMember] = onlySameType;
-         }
       }
 
       step.walk([&](subop::GatherOp gather) {
@@ -4002,7 +3854,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
                                          const ModuleReuseInfo& reuseSynthetic,
                                          llvm::ArrayRef<std::pair<mlir::ModuleOp, mlir::Value>> peerHivs,
                                          llvm::ArrayRef<const ModuleReuseInfo*> peerReuses,
-                                         const llvm::DenseMap<const void*, uint64_t>& columnHashes) {
+                                         llvm::DenseMap<const void*, uint64_t>& columnHashes) {
    assert(peerHivs.size() == peerReuses.size() && "join superset: peer HIVs and reuse metadata must align");
    mlir::Block& body = buildStep.getSubOps().front();
    auto* ctx = synthetic.getContext();
@@ -4011,45 +3863,14 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    auto& mm = subDialect->getMemberManager();
    auto& cm = tupleDialect->getColumnManager();
 
-   subop::ScanRefsOp scanOp = findDonorTableScanInUnionPlan(buildStep, plan, reuseSynthetic);
+   subop::ScanRefsOp scanOp = findUniqueTableScanRefsInStep(buildStep);
    if (!scanOp) {
-      for (const PayloadColumnSpec& spec : plan.payloadColumns) {
-         unsigned predIdx = 0;
-         if (parseFilterPredLayoutSemanticKey(spec.semanticKey, predIdx)) continue;
-         scanOp = findTableScanForPayloadLeaf(buildStep, spec.leaf, mm);
-         if (scanOp) break;
-      }
+      assert(!llvm::any_of(plan.payloadColumns, [](const PayloadColumnSpec& spec) {
+                unsigned predIdx = 0;
+                return !parseFilterPredLayoutSemanticKey(spec.semanticKey, predIdx);
+             }) && "join superset: payload union table rewrite requires a unique table scan source");
+      return;
    }
-   if (!scanOp) {
-      buildStep.walk([&](subop::ScanRefsOp candidate) {
-         if (scanOp) return;
-         if (!mlir::isa<subop::TableType>(candidate.getState().getType())) return;
-         llvm::StringRef donorTableName;
-         ExternalDatasourceProperty ds;
-         bool haveDs = false;
-         subop::TableType donorTableTy;
-         if (!resolveScannedTableExternal(buildStep, candidate.getState(), reuseSynthetic, donorTableName, ds,
-                                          haveDs, donorTableTy) ||
-             !haveDs)
-            return;
-         for (const PayloadColumnSpec& spec : plan.payloadColumns) {
-            unsigned predIdx = 0;
-            if (parseFilterPredLayoutSemanticKey(spec.semanticKey, predIdx)) continue;
-            for (size_t pi = 0; pi < peerHivs.size(); ++pi) {
-               auto [peerMod, peerHiv] = peerHivs[pi];
-               if (!peerMod || !peerHiv) continue;
-               const ModuleReuseInfo& reusePeer = *peerReuses[pi];
-               subop::ExecutionStepOp peerBuild = findJoinBufferBuildStepForHiv(peerMod, peerHiv, reusePeer);
-               if (!peerBuild) continue;
-               if (columnTypeForIdentifierFromPeerBuildScan(peerBuild, reusePeer, donorTableName, spec.leaf)) {
-                  scanOp = candidate;
-                  return;
-               }
-            }
-         }
-      });
-   }
-   if (!scanOp) return;
 
    auto rewriteDonorExternalTableForUnion = [&]() {
       mlir::Value tableState = scanOp.getState();
@@ -4128,11 +3949,12 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    subop::MapOp hashMapOp = findJoinHashMapBeforeMaterialize(body, matOp);
    assert(hashMapOp);
 
-   auto appendMaterializeMapping = [&](subop::Member bufMem, tuples::ColumnDefAttr colDef) {
+   auto appendMaterializeMapping = [&](subop::Member bufMem, tuples::ColumnDefAttr colDef, uint64_t semanticHash) {
       llvm::SmallVector<subop::RefMappingPairT> matPairs;
       for (auto pr : matOp.getMapping().getMapping()) matPairs.push_back(pr);
       matPairs.push_back({bufMem, cm.createRef(&colDef.getColumn())});
       matOp.setMappingAttr(subop::ColumnRefMemberMappingAttr::get(ctx, matPairs));
+      columnHashes[&colDef.getColumn()] = semanticHash;
    };
 
    auto isPayloadMaterialized = [&](const PayloadColumnSpec& spec) {
@@ -4141,12 +3963,11 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
       for (auto& [member, colRef] : matOp.getMapping().getMapping()) {
          if (member == plan.linkMember || member == plan.hashMember) continue;
          if (colRef.getColumn().type != cloneTypeToContext(spec.colType, ctx)) continue;
-         auto [scope, leaf] = cm.getName(&colRef.getColumn());
-         if (columnSemanticKey(scope, leaf) == spec.semanticKey) return true;
-         if (normalizeColumnIdentifier(leaf) == normalizeColumnIdentifier(spec.leaf) &&
-             !isPred) {
-            return true;
+         if (isPred) {
+            if (parseFilterPredMemberSlot(mm.getName(member)) == predIdx) return true;
+            continue;
          }
+         if (payloadColumnIdentityHash(colRef, columnHashes) == spec.semanticHash) return true;
       }
       return false;
    };
@@ -4154,8 +3975,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
    auto appendUnionPayloadGather = [&](const PayloadColumnSpec& spec, subop::Member bufMem) {
       assert(!spec.scope.empty() && "join superset: payload column scope required");
 
-      subop::ScanRefsOp specScan = findTableScanForPayloadLeaf(buildStep, spec.leaf, mm);
-      if (!specScan) specScan = scanOp;
+      subop::ScanRefsOp specScan = scanOp;
       subop::TableType tableTy = mlir::dyn_cast<subop::TableType>(specScan.getState().getType());
       assert(tableTy && "join superset: table type required for payload column gather");
       subop::Member tableMem = tableMemberForIdentifier(tableTy, mm, spec.leaf);
@@ -4181,7 +4001,7 @@ static void patchBufferBuildStepForUnion(mlir::ModuleOp synthetic, subop::Execut
       auto newGather =
          gb.create<subop::GatherOp>(mlir::UnknownLoc::get(ctx), gatherTy, mapStream, gatherRef, mapping);
       matOp->setOperand(0, newGather.getRes());
-      appendMaterializeMapping(bufMem, colDef);
+      appendMaterializeMapping(bufMem, colDef, spec.semanticHash);
       return true;
    };
 
@@ -4603,6 +4423,10 @@ static CachedJoinBufferLayout layoutFromUnionPlan(subop::HashIndexedViewType pro
       const PayloadColumnSpec& spec = plan.payloadColumns[planIdx];
       unsigned unionIdx = appendPayloadLayoutSlot(out, spec.semanticKey, producerMember,
                                                   plan.payloadMemberTypes[planIdx]);
+      for (const auto& sourceMember : spec.sourceMemberByQueryIndex) {
+         if (sourceMember.second != producerMember)
+            out.probeGatherMemberRemap[sourceMember.second] = producerMember;
+      }
       for (unsigned queryIndex : spec.queryIndices) {
          out.querySemanticKeysById[queryIndex].push_back(spec.semanticKey);
          out.querySlotInUnionById[queryIndex].push_back(unionIdx);
@@ -5010,6 +4834,7 @@ static uint64_t aggregatePayloadHashForInfo(llvm::StringRef semanticKey,
    assert(sourceColumn && "aggregate payload must have a source column identity hash");
    uint64_t h = hashPayloadString("aggregate_payload");
    h = combinePayloadHash(h, hashPayloadString(kind));
+   h = combinePayloadHash(h, hashPayloadString(semanticKey));
    return combinePayloadHash(h, payloadColumnIdentityHash(sourceColumn, columnHashes));
 }
 
@@ -6011,23 +5836,16 @@ static void appendMixedAggregateQueryIdKey(
    appendAggregateLookupKey(lookup, qidRef);
 }
 
-static std::string aggregatePayloadSemanticTypeKey(llvm::StringRef semanticKey, mlir::Type type) {
-   return (semanticKey + "\x1f" + mlirTypeToString(type)).str();
-}
-
 struct AggregateProducerPayloadIndex {
    llvm::DenseMap<uint64_t, AggregatePayloadMemberInfo> byHash;
-   llvm::StringSet<> semanticTypeKeys;
    unsigned nextSlot = 0;
 
    bool containsEquivalentPayload(const AggregatePayloadMemberInfo& payload) const {
-      return byHash.contains(payload.semanticHash) ||
-             semanticTypeKeys.contains(aggregatePayloadSemanticTypeKey(payload.semanticKey, payload.type));
+      return byHash.contains(payload.semanticHash);
    }
 
    void record(const AggregatePayloadMemberInfo& payload, subop::MemberManager& mm) {
       byHash[payload.semanticHash] = payload;
-      semanticTypeKeys.insert(aggregatePayloadSemanticTypeKey(payload.semanticKey, payload.type));
       if (auto slot = parseAggregateValueSlot(mm.getName(payload.member))) nextSlot = std::max(nextSlot, *slot + 1);
    }
 };
@@ -6440,12 +6258,6 @@ static void alignScanListAndProbeUsesInBlock(subop::ScanListOp scanList, subop::
             if (auto it = semKeyToMember.find(sem->second); it != semKeyToMember.end()) return it->second;
          }
       }
-      if (!isPayloadMemberSlotName(leaf)) {
-         llvm::StringRef wantLeaf = normalizeColumnIdentifier(leaf);
-         for (const auto& e : semKeyToMember) {
-            if (normalizeColumnIdentifier(semanticKeyLeaf(e.getKey())) == wantLeaf) return e.getValue();
-         }
-      }
       return useMem;
    };
 
@@ -6770,21 +6582,6 @@ struct ConsumerColumnBinding {
    mlir::Type columnType;
 };
 
-/// Match union payload semantic key to a consumer probe/build member by normalized column leaf.
-static std::optional<subop::Member> findConsumerMemberForPayloadSlotByLeaf(
-   llvm::StringRef semanticKey, const llvm::StringMap<ConsumerColumnBinding>& semanticToConsumer) {
-   llvm::StringRef wantLeaf = normalizeColumnIdentifier(semanticKeyLeaf(semanticKey));
-   std::optional<subop::Member> found;
-   unsigned matches = 0;
-   for (const auto& entry : semanticToConsumer) {
-      if (normalizeColumnIdentifier(semanticKeyLeaf(entry.getKey())) != wantLeaf) continue;
-      found = entry.second.member;
-      ++matches;
-   }
-   if (matches == 1) return found;
-   return std::nullopt;
-}
-
 static std::optional<subop::Member> findConsumerMemberByName(llvm::StringRef name,
                                                              subop::HashIndexedViewType consumerHivBeforeAlign) {
    if (!consumerHivBeforeAlign) return std::nullopt;
@@ -6888,46 +6685,25 @@ static void remapClosureGathersToAlignedConsumerHiv(mlir::ModuleOp consumer,
           itRemap != consumerLayout.probeGatherMemberRemap.end()) {
          return itRemap->second;
       }
-      if (hivMemberSet.contains(useMem)) return useMem;
-      if (auto it = hivMemberByName.find(mm.getName(useMem)); it != hivMemberByName.end()) return it->second;
       if (auto byScope = probeMemberSemantic.find(refScope); byScope != probeMemberSemantic.end()) {
          if (auto sem = byScope->second.find(useMem); sem != byScope->second.end()) {
             if (auto it = semKeyToMember.find(sem->second); it != semKeyToMember.end()) return it->second;
          }
       }
+      if (hivMemberSet.contains(useMem)) return useMem;
+      if (auto it = hivMemberByName.find(mm.getName(useMem)); it != hivMemberByName.end()) return it->second;
       if (auto it = semanticToConsumer.find(semKey); it != semanticToConsumer.end()) {
          if (hivMemberSet.contains(it->second.member)) return it->second.member;
          if (auto bn = hivMemberByName.find(mm.getName(it->second.member)); bn != hivMemberByName.end()) {
             return bn->second;
          }
       }
-      if (!isPayloadMemberSlotName(leaf)) {
-         llvm::StringRef wantLeaf = normalizeColumnIdentifier(leaf);
-         for (const auto& e : semKeyToMember) {
-            if (normalizeColumnIdentifier(semanticKeyLeaf(e.getKey())) == wantLeaf) return e.getValue();
-         }
-         for (const auto& e : semanticToConsumer) {
-            if (normalizeColumnIdentifier(semanticKeyLeaf(e.getKey())) == wantLeaf) {
-               if (hivMemberSet.contains(e.second.member)) return e.second.member;
-               if (auto bn = hivMemberByName.find(mm.getName(e.second.member)); bn != hivMemberByName.end()) {
-                  return bn->second;
-               }
-            }
-         }
-      } else if (isJoinProbeCompilerScope(scope)) {
+      if (isPayloadMemberSlotName(leaf) && isJoinProbeCompilerScope(scope)) {
          // Probe gathers name columns `@lookup_u_*::@member$N`; map pre-union consumer slots via semantics.
          for (const auto& e : semanticToConsumer) {
             if (e.second.member != useMem) continue;
             if (auto it = semKeyToMember.find(e.getKey()); it != semKeyToMember.end()) return it->second;
          }
-      }
-      if (isJoinProbeCompilerScope(scope) && isPayloadMemberSlotName(leaf) && !hivMemberSet.contains(useMem)) {
-         mlir::Type wantTy = mm.getType(useMem);
-         llvm::SmallVector<subop::Member, 4> sameTyInAligned;
-         for (subop::Member m : alignedHiv.getValueMembers().getMembers()) {
-            if (mm.getType(m) == wantTy) sameTyInAligned.push_back(m);
-         }
-         if (sameTyInAligned.size() == 1) return sameTyInAligned[0];
       }
       return useMem;
    };
@@ -7021,22 +6797,8 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
    llvm::StringMap<subop::Member> assignedBySemantic;
    llvm::DenseSet<subop::Member> assignedMembers;
    llvm::StringSet<> assignedMemberNames;
-   llvm::DenseMap<subop::Member, subop::Member> probeGatherMemberRemap;
+   llvm::DenseMap<subop::Member, subop::Member> probeGatherMemberRemap = layout.probeGatherMemberRemap;
    assert(layout.payloadSemanticKeys.size() == layout.payloadMembers.size());
-
-   llvm::SmallVector<subop::Member, 8> oldNonPredValueMembers;
-   if (consumerHivBeforeAlign) {
-      for (subop::Member m : consumerHivBeforeAlign.getValueMembers().getMembers()) {
-         if (parseFilterPredMemberSlot(mm.getName(m))) continue;
-         oldNonPredValueMembers.push_back(m);
-      }
-   }
-   unsigned unionNonPredValueMembers = 0;
-   for (llvm::StringRef semKey : layout.payloadSemanticKeys) {
-      unsigned predIdx = 0;
-      if (!parseFilterPredLayoutSemanticKey(semKey, predIdx)) ++unionNonPredValueMembers;
-   }
-   unsigned nonPredPayloadIndex = 0;
 
    auto ensureConsumerMember = [&](std::optional<subop::Member> reused, mlir::Type producerSlotTy) -> subop::Member {
       if (reused) {
@@ -7052,6 +6814,39 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
       mlir::Type slotTy = cloneTypeToContext(producerSlotTy, ctx);
       return allocUnusedPayloadMemberSlot(mm, slotTy, nextSlot);
    };
+   auto recordProducerPayloadToConsumer = [&](subop::Member producerMem, subop::Member consumerMem) {
+      producerPayloadToConsumer[producerMem] = consumerMem;
+      llvm::SmallVector<subop::Member, 4> eraseRemaps;
+      llvm::SmallVector<std::pair<subop::Member, subop::Member>, 4> translatedRemaps;
+      for (const auto& remap : layout.probeGatherMemberRemap) {
+         if (remap.second != producerMem) continue;
+         if (remap.first == consumerMem) {
+            eraseRemaps.push_back(remap.first);
+         } else {
+            translatedRemaps.push_back({remap.first, consumerMem});
+         }
+      }
+      for (subop::Member key : eraseRemaps) probeGatherMemberRemap.erase(key);
+      for (auto [from, to] : translatedRemaps) probeGatherMemberRemap[from] = to;
+   };
+   auto explicitConsumerMemberFromProbeRemap = [&](subop::Member producerMem,
+                                                   mlir::Type producerSlotTy) -> std::optional<subop::Member> {
+      if (!consumerHivBeforeAlign) return std::nullopt;
+      std::optional<subop::Member> found;
+      for (const auto& remap : layout.probeGatherMemberRemap) {
+         if (remap.second != producerMem) continue;
+         std::optional<subop::Member> consumerMem =
+            findConsumerMemberByName(mm.getName(remap.first), consumerHivBeforeAlign);
+         if (!consumerMem) continue;
+         mlir::Type expectedTy = cloneTypeToContext(producerSlotTy, ctx);
+         if (mm.getType(*consumerMem) != expectedTy)
+            llvm::report_fatal_error("probe gather source member remap type mismatch");
+         if (found && *found != *consumerMem)
+            llvm::report_fatal_error("probe gather source member remap must identify one consumer member");
+         found = *consumerMem;
+      }
+      return found;
+   };
 
    for (size_t i = 0; i < layout.payloadSemanticKeys.size(); ++i) {
       mlir::Type producerSlotTy = layout.payloadColumnTypes[i];
@@ -7065,7 +6860,7 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
          assignedBySemantic[semKey] = consumerMem;
          assignedMembers.insert(consumerMem);
          assignedMemberNames.insert(mm.getName(consumerMem));
-         producerPayloadToConsumer[producerMem] = consumerMem;
+         recordProducerPayloadToConsumer(producerMem, consumerMem);
          continue;
       }
 
@@ -7075,19 +6870,18 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
          assignedBySemantic[semKey] = consumerMem;
          assignedMembers.insert(consumerMem);
          assignedMemberNames.insert(mm.getName(consumerMem));
-         producerPayloadToConsumer[producerMem] = consumerMem;
+         recordProducerPayloadToConsumer(producerMem, consumerMem);
          continue;
       }
 
-      unsigned curNonPredPayloadIndex = nonPredPayloadIndex++;
       bool payloadBelongsToConsumer = consumerQueryHadPayloadColumn(layout, semKey, *consumerReuseQueryIndex);
 
       std::optional<subop::Member> reused;
       if (payloadBelongsToConsumer) {
-         if (auto it = semanticToConsumer.find(semKey); it != semanticToConsumer.end()) {
-            reused = it->second.member;
-         } else {
-            reused = findConsumerMemberForPayloadSlotByLeaf(semKey, semanticToConsumer);
+         reused = explicitConsumerMemberFromProbeRemap(producerMem, producerSlotTy);
+         if (!reused) {
+            auto it = semanticToConsumer.find(semKey);
+            if (it != semanticToConsumer.end()) reused = it->second.member;
          }
          // Probe gathers use @lookup_u_* column defs; reuse the consumer's pre-cache_get HIV slot name
          // only for payloads that already existed in this query. Union-only payloads must get fresh slots.
@@ -7095,11 +6889,6 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
             auto& producerMm =
                producerHiv.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
             reused = findConsumerMemberByName(producerMm.getName(producerMem), consumerHivBeforeAlign);
-            if (!reused && oldNonPredValueMembers.size() == unionNonPredValueMembers &&
-                curNonPredPayloadIndex < oldNonPredValueMembers.size()) {
-               subop::Member oldMember = oldNonPredValueMembers[curNonPredPayloadIndex];
-               if (!assignedMembers.contains(oldMember)) reused = oldMember;
-            }
             if (!reused) {
                llvm::ArrayRef<subop::Member> oldVals = consumerHivBeforeAlign.getValueMembers().getMembers();
                if (consumerReuseQueryIndex) {
@@ -7150,7 +6939,7 @@ static subop::HashIndexedViewType buildConsumerAlignedHivType(mlir::ModuleOp con
       assignedBySemantic[semKey] = consumerMem;
       assignedMembers.insert(consumerMem);
       assignedMemberNames.insert(mm.getName(consumerMem));
-      producerPayloadToConsumer[layout.payloadMembers[i]] = consumerMem;
+      recordProducerPayloadToConsumer(producerMem, consumerMem);
    }
 
    llvm::SmallVector<subop::Member> valueMembers;
@@ -7388,6 +7177,15 @@ void insertSyntheticFilterPredsAfterColumnUnion(
       llvm::SmallVector<unsigned, 2> predQueryIndices;
       for (auto& kv : predMembers) predQueryIndices.push_back(kv.first);
       llvm::sort(predQueryIndices);
+      bool hasUnrestrictedPredSlot = false;
+      for (unsigned qIdx : predQueryIndices) {
+         auto peerFilters = decodeFiltersFromTableScanInExecutionStep(peerBuilds[qIdx]);
+         auto filters = restrictFiltersToTableScanInExecutionStep(buildStep, peerFilters);
+         if (filters.empty()) {
+            hasUnrestrictedPredSlot = true;
+            break;
+         }
+      }
 
       if (predQueryIndices.size() == 2 && predMembers[predQueryIndices[0]] &&
           predMembers[predQueryIndices[1]] && peerBuilds[predQueryIndices[0]] &&
@@ -7433,7 +7231,8 @@ void insertSyntheticFilterPredsAfterColumnUnion(
          if (filters.empty() && materializePredMemberFromUpstreamMixedScanList(buildStep, predName)) {
             continue;
          }
-         insertWriteSidePredIntoBufferConstructionStepForPredMember(buildStep, filters, predName);
+         insertWriteSidePredIntoBufferConstructionStepForPredMember(
+            buildStep, filters, predName, /*allowSharedScanPredicate=*/!hasUnrestrictedPredSlot);
       }
       if (!unionPredMembers.empty()) {
          subop::MaterializeOp mat = findJoinBufferMaterializeInStep(buildStep);
@@ -7445,7 +7244,7 @@ void insertSyntheticFilterPredsAfterColumnUnion(
          }
          if (predRefs.size() >= 2) {
             predRefs = threadPredicateRefsToMaterializeStream(mat, predRefs, cm);
-            if (!streamIsAlreadyUnionFilteredBySharedTableScan(mat.getStream()))
+            if (hasUnrestrictedPredSlot || !streamIsAlreadyUnionFilteredBySharedTableScan(mat.getStream()))
                insertResidualFilterUnionAfterPredicates(mat.getStream(), predRefs);
          }
          for (subop::Member unionPredMember : unionPredMembers) {
@@ -7538,6 +7337,15 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
       llvm::SmallVector<unsigned, 8> predQueryIndices;
       for (auto& kv : predMembers) predQueryIndices.push_back(kv.first);
       llvm::sort(predQueryIndices);
+      bool hasUnrestrictedPredSlot = false;
+      for (unsigned qIdx : predQueryIndices) {
+         auto peerFilters = decodeFiltersFromTableScanInExecutionStep(peerBuilds[qIdx]);
+         auto filters = restrictFiltersToTableScanInExecutionStep(buildStep, peerFilters);
+         if (filters.empty()) {
+            hasUnrestrictedPredSlot = true;
+            break;
+         }
+      }
 
       if (predQueryIndices.size() >= 2) {
          subop::MaterializeOp mat = findJoinBufferMaterializeInStep(buildStep);
@@ -7575,7 +7383,8 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
          if (filters.empty() && materializePredMemberFromUpstreamMixedScanList(buildStep, predName)) {
             continue;
          }
-         insertWriteSidePredIntoBufferConstructionStepForPredMember(buildStep, filters, predName);
+         insertWriteSidePredIntoBufferConstructionStepForPredMember(
+            buildStep, filters, predName, /*allowSharedScanPredicate=*/!hasUnrestrictedPredSlot);
       }
       if (!unionPredMembers.empty()) {
          subop::MaterializeOp mat = findJoinBufferMaterializeInStep(buildStep);
@@ -7587,7 +7396,7 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
          }
          if (predRefs.size() >= 2) {
             predRefs = threadPredicateRefsToMaterializeStream(mat, predRefs, cm);
-            if (!streamIsAlreadyUnionFilteredBySharedTableScan(mat.getStream()))
+            if (hasUnrestrictedPredSlot || !streamIsAlreadyUnionFilteredBySharedTableScan(mat.getStream()))
                insertResidualFilterUnionAfterPredicates(mat.getStream(), predRefs);
          }
          for (subop::Member unionPredMember : unionPredMembers) {
@@ -8165,10 +7974,11 @@ void extendSyntheticScanRefsBuffersWithFilterPredsForGroups(
             if (mm.getName(member) == predName) predRefs.push_back(ref);
          }
       }
-      if (predRefs.size() >= 2) {
+      if (!predRefs.empty()) {
          insertResidualFilterUnionAfterPredicates(mat.getStream(), predRefs);
       }
       std::string unionPredName = ("filter_pred$" + llvm::Twine(unionSlot)).str();
+      // The synthetic stream was filtered by the slot predicates above; this marker is true only for kept rows.
       materializeConstantTruePredMemberOnBufferMaterialize(mat, unionPredName, /*updateStreamOperand=*/true);
 
       syncMaterializeMappingsToActualBufferTypes(synthetic);
@@ -8440,6 +8250,7 @@ void extendSyntheticAggregateHashTablesToPayloadUnionForGroups(
       auto itG = groupByKey.find(t.cacheKey);
       if (itG == groupByKey.end()) continue;
       const CrossQueryStateMatchGroup& group = *itG->second;
+      if (group.requiresSplitMaterialize) continue;
       if (!mlir::isa<subop::PreAggrHtType>(t.state.getType())) continue;
       assert(group.entries.size() >= 2 && "aggregate union group must have at least two entries");
       llvm::SmallVector<AggregateUnionGroupInput, 8> groupInputs =
