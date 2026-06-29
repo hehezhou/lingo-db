@@ -14,16 +14,35 @@
 #include <arrow/table.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <random>
 #include <ranges>
 #include <shared_mutex>
+#include <string_view>
+#include <thread>
 namespace {
 namespace utility = lingodb::utility;
 static utility::Tracer::Event processMorsel("TableScan", "morsel", false);
 
 static utility::Tracer::Event processMorselSingle("TableScan", "single morsel", false);
+
+static bool scanLatencySimulationEnabled() {
+   static bool enabled = [] {
+      const char* v = std::getenv("LINGODB_SCAN_LATENCY_SIM");
+      return v && v[0] != '\0' && std::string_view(v) != "0" && std::string_view(v) != "false" &&
+             std::string_view(v) != "off" && std::string_view(v) != "no";
+   }();
+   return enabled;
+}
+
+static void simulateScanLatency(size_t rowsBeforeFilter) {
+   if (!scanLatencySimulationEnabled() || rowsBeforeFilter == 0) return;
+   constexpr uint64_t kScanLatencyNsPerRow = 100;
+   std::this_thread::sleep_for(std::chrono::nanoseconds(rowsBeforeFilter * kScanLatencyNsPerRow));
+}
 
 std::vector<lingodb::runtime::LingoDBTable::TableChunk> loadTable(std::string name) {
    auto inputFile = arrow::io::ReadableFile::Open(name).ValueOrDie();
@@ -409,6 +428,7 @@ class ScanBatchesTask : public lingodb::scheduler::TaskWithImplicitContext {
       auto [selVec1, selVec2] = selVecs[lingodb::scheduler::currentWorkerId()];
       size_t begin = splitSize * unitId;
       size_t len = std::min(begin + splitSize, chunk.getNumRows()) - begin;
+      simulateScanLatency(len);
       size_t workerId = lingodb::scheduler::currentWorkerId();
       BatchView& batchView = exportPredicateResults
                                  ? static_cast<BatchView&>(sharedBatchInfos[workerId])
@@ -569,6 +589,7 @@ class ScanBatchesSingleThreadedTask : public lingodb::scheduler::TaskWithImplici
          utility::Tracer::Trace trace(processMorselSingle);
          for (size_t start = 0; start < batch.getNumRows(); start += BatchView::maxBatchSize) {
             size_t len = std::min(BatchView::maxBatchSize, batch.getNumRows() - start);
+            simulateScanLatency(len);
             batchView.offset = start;
             batchView.length = len;
             for (size_t i = 0; i < colIds.size(); i++) {
