@@ -966,6 +966,17 @@ def CombineTupleOp : SubOperator_Op<"combine_tuple", [Pure,SubOperator]> {
     let assemblyFormat = [{  $stream `,` $right attr-dict }];
 }
 
+def MiniBufferOp : SubOperator_Op<"mini_buffer", [SubOperator]> {
+    let summary = "buffer tuples and execute downstream region in batches";
+
+    let arguments = (ins TupleStream:$stream, I64Attr:$buffer_size);
+    let regions = (region SizedRegion<1>:$region);
+    let assemblyFormat = [{ $stream `size` $buffer_size $region attr-dict }];
+    let extraClassDeclaration = [{
+        mlir::Operation* cloneSubOp(mlir::OpBuilder& builder, mlir::IRMapping& mapping, lingodb::compiler::dialect::subop::ColumnMapping& columnMapping);
+    }];
+}
+
 //===----------------------------------------------------------------------===//
 // Control-Flow
 //===----------------------------------------------------------------------===//

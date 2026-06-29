@@ -53,6 +53,8 @@ struct CrossQueryStateMatchEntry {
    /// Logical reuse slot used for per-subgroup filter_pred/query_id materialization. This is usually the
    /// query id, but identical-filter subgroups intentionally share one slot.
    unsigned reuseSlot = std::numeric_limits<unsigned>::max();
+   bool hasResidualTableFilter = false;
+   bool hasComplexResidualTableFilter = false;
 };
 
 struct CrossQueryStateMatchGroup {

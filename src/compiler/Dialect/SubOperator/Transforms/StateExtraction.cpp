@@ -407,10 +407,20 @@ static mlir::Value canonicalizeStateValueDeep(mlir::Value v) {
 
 llvm::SmallVector<subop::Member> getMembersForStateValue(mlir::Value v) {
    auto t = v.getType();
+   if (auto shared = mlir::dyn_cast_or_null<subop::SharedTableType>(t)) {
+      llvm::SmallVector<subop::Member> members = shared.getTableMembers().getMembers();
+      llvm::append_range(members, shared.getPredicateMembers().getMembers());
+      return members;
+   }
    if (auto s = mlir::dyn_cast_or_null<subop::State>(t)) {
       return s.getMembers().getMembers();
    }
    if (auto tl = mlir::dyn_cast_or_null<subop::ThreadLocalType>(t)) {
+      if (auto shared = mlir::dyn_cast_or_null<subop::SharedTableType>(tl.getWrapped())) {
+         llvm::SmallVector<subop::Member> members = shared.getTableMembers().getMembers();
+         llvm::append_range(members, shared.getPredicateMembers().getMembers());
+         return members;
+      }
       if (auto s = mlir::dyn_cast_or_null<subop::State>(tl.getWrapped())) {
          return s.getMembers().getMembers();
       }
@@ -3203,6 +3213,9 @@ struct StateMatchProfile {
    /// Predicate member names used when this state's construction scans an upstream MixedHIV.
    /// Different slots mean the candidate observes different logical row subsets; keep them apart.
    std::string mixedHivLookupPredFingerprint;
+   /// Semantic probe-key columns used by consumers of this HIV. This distinguishes same-table
+   /// aliases that are built the same way but feed different join roles.
+   std::string consumerLookupKeyFingerprint;
    /// Aggregate hash-table group-key identity. Payloads are intentionally excluded from aggregate matching.
    std::string aggregateGroupKeyFingerprint;
    /// A scan-like source -> ... -> map(predicate) -> filter residual stream filter was observed
@@ -3275,9 +3288,7 @@ static bool profileHasRelaxedConstructionParts(const StateMatchProfile& p) {
 
 static bool profileCanUseDirectConstructionBucket(const StateMatchProfile& p) {
    if (mlir::isa<subop::BufferType>(p.value.getType()))
-      return llvm::any_of(p.depTokensSorted, [](llvm::StringRef tok) { return tok.starts_with("cache:"); }) &&
-             !p.mixedHivLookupPredFingerprint.empty() &&
-             !llvm::StringRef(p.mixedHivLookupPredFingerprint).contains("union:");
+      return llvm::any_of(p.depTokensSorted, [](llvm::StringRef tok) { return tok.starts_with("cache:"); });
    if (!profileHasRelaxedConstructionParts(p)) return true;
    assert(profileHasSingleConstructionSink(p) && "eligible relaxed profile must have one construction sink");
    return mlir::isa<subop::HashIndexedViewType, subop::BufferType>(p.value.getType());
@@ -3290,9 +3301,7 @@ static bool profileCanUseForcedSplitMaterializeBucket(
    assert(profileHasSingleConstructionSink(p) && "eligible split-materialize profile must have one construction sink");
    if (!profileHasRelaxedConstructionParts(p)) return false;
    if (mlir::isa<subop::BufferType>(p.value.getType()))
-      return llvm::any_of(p.depTokensSorted, [](llvm::StringRef tok) { return tok.starts_with("cache:"); }) &&
-             !p.mixedHivLookupPredFingerprint.empty() &&
-             !llvm::StringRef(p.mixedHivLookupPredFingerprint).contains("union:");
+      return llvm::any_of(p.depTokensSorted, [](llvm::StringRef tok) { return tok.starts_with("cache:"); });
    return !hasPreAggrCacheDependency(p);
 }
 
@@ -3316,6 +3325,84 @@ struct StateConstructionMatchHashes {
    std::string storedValueMembersFingerprint;
    std::string mixedHivLookupPredFingerprint;
 };
+
+static bool collectProducerMapInputsForColumn(mlir::Value stream,
+                                              tuples::ColumnRefAttr target,
+                                              llvm::SmallVectorImpl<tuples::ColumnRefAttr>& inputs) {
+   mlir::Value cur = stream;
+   llvm::DenseSet<void*> seen;
+   while (cur && seen.insert(cur.getAsOpaquePointer()).second) {
+      mlir::Operation* def = cur.getDefiningOp();
+      if (!def) return false;
+      if (auto map = mlir::dyn_cast<subop::MapOp>(def)) {
+         bool produced = false;
+         for (mlir::Attribute attr : map.getComputedCols()) {
+            auto defAttr = mlir::dyn_cast<tuples::ColumnDefAttr>(attr);
+            if (!defAttr) continue;
+            if (&defAttr.getColumn() == &target.getColumn()) {
+               produced = true;
+               break;
+            }
+         }
+         if (produced) {
+            for (mlir::Attribute attr : map.getInputCols()) {
+               if (auto ref = mlir::dyn_cast<tuples::ColumnRefAttr>(attr)) inputs.push_back(ref);
+            }
+            return !inputs.empty();
+         }
+         cur = map.getStream();
+         continue;
+      }
+      if (auto filter = mlir::dyn_cast<subop::FilterOp>(def)) {
+         cur = filter.getStream();
+         continue;
+      }
+      if (auto gather = mlir::dyn_cast<subop::GatherOp>(def)) {
+         cur = gather.getStream();
+         continue;
+      }
+      if (auto rename = mlir::dyn_cast<subop::RenamingOp>(def)) {
+         cur = rename.getStream();
+         continue;
+      }
+      return false;
+   }
+   return false;
+}
+
+static std::string consumerLookupKeyFingerprintForState(
+   mlir::ModuleOp moduleOp,
+   mlir::Value state,
+   lingodb::compiler::dialect::tuples::ColumnManager& columnManager) {
+   mlir::Value canon = canonicalizeStateValueDeep(state);
+   llvm::SmallVector<std::string, 8> parts;
+   moduleOp.walk([&](subop::LookupOp lookup) {
+      mlir::Value lookupState = canonicalizeStateValueDeep(resolveStateOperandThroughNestedRegions(lookup.getState()));
+      if (lookupState != canon) return;
+      llvm::SmallVector<std::string, 4> keyParts;
+      for (mlir::Attribute keyAttr : lookup.getKeys()) {
+         auto keyRef = mlir::dyn_cast<tuples::ColumnRefAttr>(keyAttr);
+         if (!keyRef) continue;
+         llvm::SmallVector<tuples::ColumnRefAttr, 4> inputs;
+         if (!collectProducerMapInputsForColumn(lookup.getStream(), keyRef, inputs)) continue;
+         for (tuples::ColumnRefAttr input : inputs) {
+            auto [scope, leaf] = columnManager.getName(&input.getColumn());
+            keyParts.push_back(sanitizeScopeName(scope) + "." + sanitizeBaseName(leaf));
+         }
+      }
+      if (keyParts.empty()) return;
+      llvm::sort(keyParts);
+      std::string part = "lookup_key:";
+      for (llvm::StringRef p : keyParts) {
+         if (!part.ends_with(":")) part.push_back(',');
+         part += p;
+      }
+      parts.push_back(std::move(part));
+   });
+   llvm::sort(parts);
+   parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
+   return joinSortedStrings(parts);
+}
 
 static std::optional<unsigned> parseFilterPredMemberSlotLocal(llvm::StringRef name) {
    if (!name.consume_front("filter_pred$")) return std::nullopt;
@@ -3458,6 +3545,35 @@ static void collectStateAndShadowConstructionStates(
                                       });
 }
 
+static void collectHivSourceConstructionStates(
+   mlir::Value state, const ModuleMatchAndReuseAnalysis& module,
+   llvm::DenseSet<mlir::Value>& out) {
+   mlir::Value canon = canonicalizeStateValueDeep(state);
+   if (!mlir::isa<subop::HashIndexedViewType>(canon.getType())) return;
+   auto itW = module.reuse.writerStepsByState.find(canon);
+   assert(itW != module.reuse.writerStepsByState.end() &&
+          "hash_indexed_view residual summary target must have a writer step");
+   bool found = false;
+   for (subop::ExecutionStepOp step : itW->second) {
+      step.walk([&](subop::CreateHashIndexedView hiv) {
+         if (canonicalizeStateValueDeep(hiv.getResult()) != canon) return;
+         out.insert(canonicalizeStateValueDeep(hiv.getSource()));
+         found = true;
+      });
+   }
+   assert(found && "hash_indexed_view residual summary target must be produced by create_hash_indexed_view");
+}
+
+static void collectResidualConstructionStates(
+   mlir::Value state, const ModuleMatchAndReuseAnalysis& module,
+   llvm::DenseSet<mlir::Value>& out) {
+   collectStateAndShadowConstructionStates(state, module, out);
+   llvm::SmallVector<mlir::Value, 8> states(out.begin(), out.end());
+   for (mlir::Value constructionState : states) {
+      collectHivSourceConstructionStates(constructionState, module, out);
+   }
+}
+
 struct ConstructionResidualFilterSummary {
    bool any = false;
    bool supported = false;
@@ -3501,26 +3617,38 @@ static ConstructionResidualFilterSummary constructionResidualFilterSummary(
    const llvm::DenseMap<int, subop::ExecutionStepOp>& stepByIndex) {
    ConstructionResidualFilterSummary out;
    llvm::DenseSet<mlir::Value> constructionStates;
-   collectStateAndShadowConstructionStates(state, module, constructionStates);
+   collectResidualConstructionStates(state, module, constructionStates);
+   llvm::DenseSet<mlir::Operation*> seenSteps;
+   auto analyzeStep = [&](subop::ExecutionStepOp step) {
+      if (!seenSteps.insert(step.getOperation()).second) return;
+      bool multiple = false;
+      subop::MaterializeOp mat = findUniqueMaterializeForStatesInStep(step, constructionStates, multiple);
+      ResidualMaterializeStreamTrace trace;
+      if (mat && !multiple) {
+         trace = traceResidualFilterOnMaterializeStream(step, mat);
+      } else {
+         multiple = false;
+         subop::ReduceOp reduce = findUniqueReduceForStatesInStep(step, constructionStates, multiple);
+         if (!reduce || multiple) return;
+         trace = traceResidualFilterOnStream(step, reduce.getOperation(), reduce.getStream());
+      }
+      if ((!trace.filter && !trace.relaxedMixedScan) || !trace.sourceState || trace.split) return;
+      out.any = true;
+      if (!residualTraceHasUniqueEligibleSource(trace)) return;
+      out.supported = true;
+      out.complex |= trace.complex;
+   };
    for (int si : constructionStepIndices) {
       auto itS = stepByIndex.find(si);
       assert(itS != stepByIndex.end());
-      bool multiple = false;
-      subop::MaterializeOp mat = findUniqueMaterializeForStatesInStep(itS->second, constructionStates, multiple);
-      ResidualMaterializeStreamTrace trace;
-      if (mat && !multiple) {
-         trace = traceResidualFilterOnMaterializeStream(itS->second, mat);
-      } else {
-         multiple = false;
-         subop::ReduceOp reduce = findUniqueReduceForStatesInStep(itS->second, constructionStates, multiple);
-         if (!reduce || multiple) continue;
-         trace = traceResidualFilterOnStream(itS->second, reduce.getOperation(), reduce.getStream());
+      analyzeStep(itS->second);
+   }
+   for (mlir::Value constructionState : constructionStates) {
+      auto itW = module.reuse.writerStepsByState.find(canonicalizeStateValueDeep(constructionState));
+      if (itW == module.reuse.writerStepsByState.end()) continue;
+      for (subop::ExecutionStepOp step : itW->second) {
+         analyzeStep(step);
       }
-      if ((!trace.filter && !trace.relaxedMixedScan) || !trace.sourceState || trace.split) continue;
-      out.any = true;
-      if (!residualTraceHasUniqueEligibleSource(trace)) continue;
-      out.supported = true;
-      out.complex |= trace.complex;
    }
    return out;
 }
@@ -3965,6 +4093,8 @@ llvm::SmallVector<StateMatchProfile, 128> buildStateMatchProfiles(
          prof.mixedHivLookupPredFingerprint = std::move(hashes.mixedHivLookupPredFingerprint);
          if (mlir::isa<subop::HashIndexedViewType>(state.getType())) {
             assert(!prof.storedValueMembersFingerprint.empty());
+            prof.consumerLookupKeyFingerprint =
+               consumerLookupKeyFingerprintForState(moduleOp, state, tupDialect->getColumnManager());
             module.reuse.joinBuildStoredValueMembersByState[state] = prof.storedValueMembersFingerprint;
          } else if (mlir::isa<subop::PreAggrHtType>(state.getType())) {
             prof.aggregateGroupKeyFingerprint = aggregateGroupKeyFingerprint(
@@ -5259,13 +5389,27 @@ buildDisjointExactFilterClusterEmission(
    llvm::ArrayRef<ExactFilterSubgroup> subgroups,
    const DisjointExactFilterSubgroupCluster& cluster) {
    DisjointExactFilterClusterEmission out;
+   unsigned nextSlot = 0;
    for (unsigned localSlot = 0; localSlot < cluster.subgroupIndices.size(); ++localSlot) {
       const ExactFilterSubgroup& subgroup = subgroups[cluster.subgroupIndices[localSlot]];
+      unsigned subgroupSlot = nextSlot++;
+      bool perMemberSlots = !subgroup.simpleFilters.empty() &&
+         llvm::any_of(subgroup.members, [](const StateMatchProfile* p) {
+            return p->hasResidualTableFilter || p->hasComplexResidualTableFilter;
+         });
       out.keySuffix += "@@filter_subgroup=" + std::to_string(localSlot) + ":" +
                        std::to_string(static_cast<size_t>(llvm::hash_value(llvm::StringRef(subgroup.fingerprint))));
+      bool firstMember = true;
       for (const StateMatchProfile* p : subgroup.members) {
          out.members.push_back(p);
-         out.slotByProfile[p] = localSlot;
+         if (!perMemberSlots) {
+            out.slotByProfile[p] = subgroupSlot;
+         } else if (firstMember) {
+            out.slotByProfile[p] = subgroupSlot;
+            firstMember = false;
+         } else {
+            out.slotByProfile[p] = nextSlot++;
+         }
       }
    }
    if (cluster.subgroupIndices.size() == 1 && out.members.size() < 2) return std::nullopt;
@@ -5554,7 +5698,15 @@ static bool decomposeExactFilterDisjointClustersAndEmit(
       std::optional<DisjointExactFilterClusterEmission> emission =
          buildDisjointExactFilterClusterEmission(subgroups, cluster);
       if (!emission) continue;
-      bool mixedReuse = allowMixedReuse && cluster.subgroupIndices.size() > 1;
+      bool hasResidualFiltersWithSimpleFilters = llvm::any_of(cluster.subgroupIndices, [&](unsigned subgroupIdx) {
+         const ExactFilterSubgroup& subgroup = subgroups[subgroupIdx];
+         return !subgroup.simpleFilters.empty() &&
+            llvm::any_of(subgroup.members, [](const StateMatchProfile* p) {
+               return p->hasResidualTableFilter || p->hasComplexResidualTableFilter;
+            });
+      });
+      bool mixedReuse = allowMixedReuse &&
+         (cluster.subgroupIndices.size() > 1 || hasResidualFiltersWithSimpleFilters);
       emitCluster(emission->members, emission->keySuffix, emission->slotByProfile, mixedReuse);
       emittedAny = true;
    }
@@ -5587,13 +5739,12 @@ static void appendMatchGroupCacheDeps(CrossQueryStateMatchGroup& group,
 
 static bool hivMatchGroupNeedsFilterPredReuse(
    llvm::ArrayRef<const StateMatchProfile*> members,
-   llvm::function_ref<bool(const StateMatchProfile&)> hasSimpleMatchFilters) {
-   for (const StateMatchProfile* p : members) {
-      if (p->hasResidualTableFilter || p->hasComplexResidualTableFilter) return true;
-      if (hasSimpleMatchFilters(*p)) return true;
-      if (profileHasCacheDependencyToken(*p)) return true;
-   }
-   return false;
+   llvm::function_ref<bool(const StateMatchProfile&)> hasSimpleMatchFilters,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile) {
+   return llvm::any_of(members, [&](const StateMatchProfile* p) {
+      return hasSimpleMatchFilters(*p) || p->hasResidualTableFilter || p->hasComplexResidualTableFilter ||
+             (profileHasCacheDependencyToken(*p) && !mixedPredFingerprintForProfile(*p).empty());
+   });
 }
 
 static void appendCrossQueryMatchGroup(
@@ -5603,7 +5754,8 @@ static void appendCrossQueryMatchGroup(
    llvm::StringRef keySuffix,
    llvm::function_ref<std::string(const StateMatchProfile&)> keyForSeed,
    MatchGroupEmitOptions options,
-   llvm::function_ref<bool(const StateMatchProfile&)> hasSimpleMatchFilters) {
+   llvm::function_ref<bool(const StateMatchProfile&)> hasSimpleMatchFilters,
+   llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile) {
    assert(members.size() >= 2 && "singleton clusters must not be materialized as reuse groups");
    std::string k = keyForSeed(keySeed);
    k.append(keySuffix.data(), keySuffix.size());
@@ -5624,7 +5776,8 @@ static void appendCrossQueryMatchGroup(
 
    bool needsFilterPredReuse = options.enableFilterPredReuse;
    if (needsFilterPredReuse && allHiv)
-      needsFilterPredReuse = hivMatchGroupNeedsFilterPredReuse(members, hasSimpleMatchFilters);
+      needsFilterPredReuse = hivMatchGroupNeedsFilterPredReuse(members, hasSimpleMatchFilters,
+                                                               mixedPredFingerprintForProfile);
    group.enableFilterPredReuse = needsFilterPredReuse;
    if (allHiv && needsFilterPredReuse) group.requiresJoinLayoutUnion = true;
    if (group.requiresSplitMaterialize) {
@@ -5640,7 +5793,9 @@ static void appendCrossQueryMatchGroup(
          assert(itSlot != options.reuseSlotByProfile->end() && "subgrouped match entry must have a reuse slot");
          reuseSlot = itSlot->second;
       }
-      group.entries.push_back(CrossQueryStateMatchEntry{p->queryId, p->value, reuseSlot});
+      group.entries.push_back(CrossQueryStateMatchEntry{p->queryId, p->value, reuseSlot,
+                                                        p->hasResidualTableFilter,
+                                                        p->hasComplexResidualTableFilter});
       ctx.matchedStates.insert(p->value);
    }
    ctx.out.push_back(std::move(group));
@@ -5709,11 +5864,11 @@ static void emitClusteredCrossQueryMatchGroup(
    assert(members.size() >= 2 && "match group emission requires at least two members");
 
    auto emitMatchGroup = [&](llvm::ArrayRef<const StateMatchProfile*> groupedMembers,
-                             const StateMatchProfile& keySeed,
-                             llvm::StringRef keySuffix,
-                             MatchGroupEmitOptions options) {
+      const StateMatchProfile& keySeed,
+      llvm::StringRef keySuffix,
+      MatchGroupEmitOptions options) {
       appendCrossQueryMatchGroup(emitContext, groupedMembers, keySeed, keySuffix, keyForSeed, options,
-                                 hasSimpleFiltersForProfile);
+                                 hasSimpleFiltersForProfile, mixedPredFingerprintForProfile);
    };
 
    const bool allHiv = matchGroupProfilesAllHiv(members);
@@ -5876,6 +6031,11 @@ static std::string mixedLookupSuffixForCacheDependentProfile(
    return "@@mixed_lookup=" + mixedPredFingerprintForProfile(profile);
 }
 
+static std::string consumerLookupKeySuffix(const StateMatchProfile& profile) {
+   if (profile.consumerLookupKeyFingerprint.empty()) return "";
+   return "@@consumer_lookup=" + profile.consumerLookupKeyFingerprint;
+}
+
 static bool profileHasPreAggrCacheDependency(
    const StateMatchProfile& profile,
    const llvm::DenseMap<int, const QueryMatchModel*>& modelByQueryId) {
@@ -6010,12 +6170,13 @@ static std::string constructionMatchKey(
    llvm::function_ref<std::string(const StateMatchProfile&)> mixedPredFingerprintForProfile) {
    return joinedDependencyTokens(profile.depTokensSorted) + "@@type=" + profile.typeFingerprintStr +
           "@@h=" + std::to_string(profile.constructionHash) +
-          mixedLookupSuffixForCacheDependentProfile(profile, mixedPredFingerprintForProfile);
+          mixedLookupSuffixForCacheDependentProfile(profile, mixedPredFingerprintForProfile) +
+          consumerLookupKeySuffix(profile);
 }
 
 static std::string relaxedHivMatchKey(const StateMatchProfile& profile) {
    return joinedDependencyTokens(profile.depTokensSorted) + "@@type=" + profile.typeFingerprintStr +
-          "@@hiv_relaxed";
+          "@@hiv_relaxed" + consumerLookupKeySuffix(profile);
 }
 
 static std::string splitMaterializeMatchKey(const StateMatchProfile& profile) {

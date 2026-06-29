@@ -234,9 +234,7 @@ class StoreOpLowering : public OpConversionPattern<util::StoreOp> {
    using OpConversionPattern<util::StoreOp>::OpConversionPattern;
    LogicalResult matchAndRewrite(util::StoreOp op, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       Value elementPtr = adaptor.getRef();
-      mlir::Type elemType = llvmTypeForOpaqueI8RefCell(op.getRef().getType().getElementType(), getContext());
-      if (!elemType)
-         elemType = typeConverter->convertType(op.getRef().getType().getElementType());
+      mlir::Type elemType = typeConverter->convertType(op.getVal().getType());
       if (adaptor.getIdx()) {
          elementPtr = rewriter.create<LLVM::GEPOp>(op->getLoc(), elementPtr.getType(), elemType, elementPtr, adaptor.getIdx());
       }
@@ -249,9 +247,7 @@ class LoadOpLowering : public OpConversionPattern<util::LoadOp> {
    using OpConversionPattern<util::LoadOp>::OpConversionPattern;
    LogicalResult matchAndRewrite(util::LoadOp op, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       Value elementPtr = adaptor.getRef();
-      mlir::Type elemType = llvmTypeForOpaqueI8RefCell(op.getRef().getType().getElementType(), getContext());
-      if (!elemType)
-         elemType = typeConverter->convertType(op.getRef().getType().getElementType());
+      mlir::Type elemType = typeConverter->convertType(op.getVal().getType());
       if (adaptor.getIdx()) {
          elementPtr = rewriter.create<LLVM::GEPOp>(op->getLoc(), elementPtr.getType(), elemType, elementPtr, adaptor.getIdx());
       }

@@ -446,11 +446,15 @@ class RuntimeCallLowering : public OpConversionPattern<db::RuntimeCall> {
          result = implFn(rewriter, adaptor.getArgs(), runtimeCallOp.getArgs().getTypes(), runtimeCallOp->getNumResults() == 1 ? runtimeCallOp->getResultTypes()[0] : mlir::Type(), typeConverter, runtimeCallOp->getLoc());
       }
 
-      if (runtimeCallOp->getNumResults() == 0) {
-         rewriter.eraseOp(runtimeCallOp);
-      } else {
-         rewriter.replaceOp(runtimeCallOp, result);
-      }
+	      if (runtimeCallOp->getNumResults() == 0) {
+	         rewriter.eraseOp(runtimeCallOp);
+	      } else {
+	         if (mlir::isa<db::NullableType>(runtimeCallOp.getRes().getType()) &&
+	             result.getType() != typeConverter->convertType(runtimeCallOp.getRes().getType())) {
+	            result = packNullable(rewriter, runtimeCallOp->getLoc(), nullptr, result);
+	         }
+	         rewriter.replaceOp(runtimeCallOp, result);
+	      }
       return success();
    }
 };
@@ -809,12 +813,18 @@ class ConstantLowering : public OpConversionPattern<db::ConstantOp> {
       return {typeConstant, param1, param2};
    }
 
-   public:
-   using OpConversionPattern<db::ConstantOp>::OpConversionPattern;
-   LogicalResult matchAndRewrite(db::ConstantOp constantOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
-      auto type = constantOp.getType();
-      auto stdType = typeConverter->convertType(type);
-      auto [arrowType, param1, param2] = convertTypeToArrow(type);
+	   public:
+	   using OpConversionPattern<db::ConstantOp>::OpConversionPattern;
+	   LogicalResult matchAndRewrite(db::ConstantOp constantOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
+	      auto type = constantOp.getType();
+	      auto stdType = typeConverter->convertType(type);
+	      auto parseType = type;
+	      bool nullableConstant = false;
+	      if (auto nullableType = mlir::dyn_cast_or_null<db::NullableType>(type)) {
+	         parseType = nullableType.getType();
+	         nullableConstant = true;
+	      }
+	      auto [arrowType, param1, param2] = convertTypeToArrow(parseType);
       std::variant<int64_t, double, std::string> parseArg;
       if (auto integerAttr = mlir::dyn_cast_or_null<IntegerAttr>(constantOp.getValue())) {
          parseArg = integerAttr.getInt();
@@ -826,30 +836,59 @@ class ConstantLowering : public OpConversionPattern<db::ConstantOp> {
          return failure();
       }
       auto parseResult = lingodb::compiler::support::parse(parseArg, arrowType, param1, param2);
-      if (auto intType = mlir::dyn_cast_or_null<IntegerType>(stdType)) {
-         if (auto decimalType = mlir::dyn_cast_or_null<db::DecimalType>(type)) {
-            auto [low, high] = lingodb::compiler::support::parseDecimal(std::get<std::string>(parseResult), decimalType.getS());
-            std::vector<uint64_t> parts = {low, high};
-            rewriter.replaceOpWithNewOp<arith::ConstantOp>(constantOp, stdType, rewriter.getIntegerAttr(stdType, APInt(mlir::cast<mlir::IntegerType>(stdType).getWidth(), parts)));
-            return success();
-         } else {
-            if (mlir::isa<db::CharType>(type)) {
-               parseResult = lingodb::compiler::support::toI64(parseResult);
-            }
-            rewriter.replaceOpWithNewOp<arith::ConstantOp>(constantOp, stdType, rewriter.getIntegerAttr(stdType, std::get<int64_t>(parseResult)));
-            return success();
-         }
-      } else if (auto floatType = mlir::dyn_cast_or_null<FloatType>(stdType)) {
-         rewriter.replaceOpWithNewOp<arith::ConstantOp>(constantOp, stdType, rewriter.getFloatAttr(stdType, std::get<double>(parseResult)));
-         return success();
-      } else if (mlir::isa<util::VarLen32Type>(stdType)) {
-         std::string str = std::get<std::string>(parseResult);
+	      auto replaceWithConstant = [&](mlir::Value rawValue) {
+	         if (nullableConstant && rawValue.getType() != stdType) {
+	            rawValue = packNullable(rewriter, constantOp->getLoc(), nullptr, rawValue);
+	         }
+	         rewriter.replaceOp(constantOp, rawValue);
+	      };
+	      if (auto intType = mlir::dyn_cast_or_null<IntegerType>(stdType)) {
+	         if (auto decimalType = mlir::dyn_cast_or_null<db::DecimalType>(parseType)) {
+	            auto [low, high] = lingodb::compiler::support::parseDecimal(std::get<std::string>(parseResult), decimalType.getS());
+	            std::vector<uint64_t> parts = {low, high};
+	            replaceWithConstant(rewriter.create<arith::ConstantOp>(constantOp->getLoc(), stdType, rewriter.getIntegerAttr(stdType, APInt(mlir::cast<mlir::IntegerType>(stdType).getWidth(), parts))));
+	            return success();
+	         } else {
+	            if (mlir::isa<db::CharType>(parseType)) {
+	               parseResult = lingodb::compiler::support::toI64(parseResult);
+	            }
+	            replaceWithConstant(rewriter.create<arith::ConstantOp>(constantOp->getLoc(), stdType, rewriter.getIntegerAttr(stdType, std::get<int64_t>(parseResult))));
+	            return success();
+	         }
+	      } else if (auto floatType = mlir::dyn_cast_or_null<FloatType>(stdType)) {
+	         replaceWithConstant(rewriter.create<arith::ConstantOp>(constantOp->getLoc(), stdType, rewriter.getFloatAttr(stdType, std::get<double>(parseResult))));
+	         return success();
+	      } else if (mlir::isa<util::VarLen32Type>(stdType)) {
+	         std::string str = std::get<std::string>(parseResult);
 
-         rewriter.replaceOpWithNewOp<util::CreateConstVarLen>(constantOp, util::VarLen32Type::get(rewriter.getContext()), rewriter.getStringAttr(str));
-         return success();
-      } else {
-         return failure();
-      }
+	         replaceWithConstant(rewriter.create<util::CreateConstVarLen>(constantOp->getLoc(), util::VarLen32Type::get(rewriter.getContext()), rewriter.getStringAttr(str)));
+	         return success();
+	      } else if (nullableConstant) {
+	         if (auto tupleType = mlir::dyn_cast_or_null<TupleType>(stdType)) {
+	            auto payloadType = tupleType.getType(1);
+	            mlir::Value rawValue;
+	            if (auto intType = mlir::dyn_cast_or_null<IntegerType>(payloadType)) {
+	               if (auto decimalType = mlir::dyn_cast_or_null<db::DecimalType>(parseType)) {
+	                  auto [low, high] = lingodb::compiler::support::parseDecimal(std::get<std::string>(parseResult), decimalType.getS());
+	                  std::vector<uint64_t> parts = {low, high};
+	                  rawValue = rewriter.create<arith::ConstantOp>(constantOp->getLoc(), payloadType, rewriter.getIntegerAttr(payloadType, APInt(mlir::cast<mlir::IntegerType>(payloadType).getWidth(), parts)));
+	               } else {
+	                  if (mlir::isa<db::CharType>(parseType)) {
+	                     parseResult = lingodb::compiler::support::toI64(parseResult);
+	                  }
+	                  rawValue = rewriter.create<arith::ConstantOp>(constantOp->getLoc(), payloadType, rewriter.getIntegerAttr(payloadType, std::get<int64_t>(parseResult)));
+	               }
+	            } else if (auto floatType = mlir::dyn_cast_or_null<FloatType>(payloadType)) {
+	               rawValue = rewriter.create<arith::ConstantOp>(constantOp->getLoc(), payloadType, rewriter.getFloatAttr(payloadType, std::get<double>(parseResult)));
+	            }
+	            if (rawValue) {
+	               replaceWithConstant(rawValue);
+	               return success();
+	            }
+	         }
+	      } else {
+	         return failure();
+	      }
       return failure();
    }
 };

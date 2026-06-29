@@ -33,6 +33,9 @@ struct ExternalDatasourceProperty {
    /// Shared-scan clauses are pushed down like OR clauses, and a scan_refs containing
    /// `filter_pred$N` can read the Nth clause result directly from the scan.
    std::vector<std::vector<runtime::FilterDescription>> sharedPredicateClauses{};
+   /// Optional logical slot number for each physical shared predicate clause.
+   /// When empty, physical slot `i` maps to `filter_pred$i`.
+   std::vector<uint64_t> sharedPredicateSlots{};
    std::string index;
    std::string indexType;
 
@@ -44,11 +47,12 @@ struct ExternalDatasourceProperty {
       serializer.writeProperty(4, indexType);
       serializer.writeProperty(5, orFilterClauses);
       serializer.writeProperty(6, sharedPredicateClauses);
+      serializer.writeProperty(7, sharedPredicateSlots);
    }
    bool operator==(const ExternalDatasourceProperty& other) const {
       return other.index == index && other.indexType == indexType && other.mapping == mapping && other.tableName == tableName &&
          other.filterDescriptions == filterDescriptions && other.orFilterClauses == orFilterClauses &&
-         other.sharedPredicateClauses == sharedPredicateClauses;
+         other.sharedPredicateClauses == sharedPredicateClauses && other.sharedPredicateSlots == sharedPredicateSlots;
    }
 
    static ExternalDatasourceProperty deserialize(lingodb::utility::Deserializer& deserializer) {
@@ -72,6 +76,14 @@ struct ExternalDatasourceProperty {
             deserializer.readSerializedPayload<std::vector<std::vector<runtime::FilterDescription>>>();
          utility::marker_t end = deserializer.readMarker();
          assert(end == 6 && "Expected sharedPredicateClauses property end marker");
+         (void)end;
+         next = deserializer.readMarker();
+      }
+      if (next == 7) {
+         prop.sharedPredicateSlots =
+            deserializer.readSerializedPayload<std::vector<uint64_t>>();
+         utility::marker_t end = deserializer.readMarker();
+         assert(end == 7 && "Expected sharedPredicateSlots property end marker");
          (void)end;
       } else {
          deserializer.pushBackMarker(next);

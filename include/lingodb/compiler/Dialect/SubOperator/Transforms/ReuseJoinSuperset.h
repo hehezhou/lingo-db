@@ -181,7 +181,8 @@ void insertSyntheticFilterPredsAfterColumnUnionForGroups(
    llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
    llvm::ArrayRef<CacheTarget> targetsInSynthetic,
    const CachedJoinBufferLayoutsByKey& layoutsByKey,
-   const ClonedJoinBufferBuildSitesByKey& buildSites);
+   const ClonedJoinBufferBuildSitesByKey& buildSites,
+   const llvm::DenseMap<uint64_t, llvm::DenseMap<unsigned, unsigned>>* consumerSlotByCacheKeyAndQuery = nullptr);
 
 /// Retag cached HIV probe closures to MixedHIV so scan_list applies the stored filter_pred$N slot directly.
 void applyProbePredFiltersForConsumerClosures(mlir::ModuleOp consumer,

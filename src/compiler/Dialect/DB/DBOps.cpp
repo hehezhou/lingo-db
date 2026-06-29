@@ -108,6 +108,9 @@ mlir::Type getAdaptedDecimalTypeAfterMulDiv(mlir::MLIRContext* context, int prec
 } // namespace
 OpFoldResult db::ConstantOp::fold(db::ConstantOp::FoldAdaptor adaptor) {
    auto type = getType();
+   if (mlir::isa<db::NullableType>(type)) {
+      return {};
+   }
    auto [arrowType, param1, param2] = convertTypeToArrow(type);
    std::variant<int64_t, double, std::string> parseArg;
    if (auto integerAttr = mlir::dyn_cast_or_null<IntegerAttr>(getValue())) {

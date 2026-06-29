@@ -20,6 +20,7 @@ add_mlir_dialect_library(MLIRSubOperator
         Transforms/SplitIntoExecutionSteps.cpp
         Transforms/InlineNestedMapPass.cpp
         Transforms/FinalizePass.cpp
+        Transforms/InsertMiniBufferPass.cpp
         Transforms/PrepareForLowering.cpp
         Transforms/CommonPipelineElimination.cpp
         Transforms/StateExtraction.cpp

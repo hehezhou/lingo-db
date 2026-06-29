@@ -1612,6 +1612,12 @@ mlir::Operation* subop::GenerateOp::cloneSubOp(mlir::OpBuilder& builder, mlir::I
    mapResults(mapping, this->getOperation(), newOp.getOperation());
    return newOp;
 }
+mlir::Operation* subop::MiniBufferOp::cloneSubOp(mlir::OpBuilder& builder, mlir::IRMapping& mapping, subop::ColumnMapping& columnMapping) {
+   auto newOp = builder.create<MiniBufferOp>(this->getLoc(), mapping.lookupOrDefault(getStream()), getBufferSizeAttr());
+   builder.cloneRegionBefore(getRegion(), newOp.getRegion(), newOp.getRegion().begin(), mapping);
+   mapResults(mapping, this->getOperation(), newOp.getOperation());
+   return newOp;
+}
 #define GET_OP_CLASSES
 #include "lingodb/compiler/Dialect/SubOperator/SubOperatorOps.cpp.inc"
 

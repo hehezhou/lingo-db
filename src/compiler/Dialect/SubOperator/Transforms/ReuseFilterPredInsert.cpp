@@ -1150,13 +1150,34 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
                                                    tuples::ColumnRefAttr colRef,
                                                    const runtime::FilterDescription& f) {
    mlir::Value colV = helper.access(colRef, loc);
-   auto emitArithIntConstant = [&](int64_t v) -> mlir::Value {
-      auto itTy = mlir::dyn_cast<mlir::IntegerType>(colV.getType());
+   auto intPredicate = [&]() {
+      using P = lingodb::compiler::dialect::db::DBCmpPredicate;
+      switch (f.op) {
+         case runtime::FilterOp::EQ: return P::eq;
+         case runtime::FilterOp::NEQ: return P::neq;
+         case runtime::FilterOp::LT: return P::lt;
+         case runtime::FilterOp::LTE: return P::lte;
+         case runtime::FilterOp::GT: return P::gt;
+         case runtime::FilterOp::GTE: return P::gte;
+         default: llvm_unreachable("runtime filter IR: unsupported filter op");
+      }
+   };
+   auto emitDbIntCompare = [&](int64_t v) -> mlir::Value {
+      mlir::Type colTy = getBaseType(colV.getType());
+      auto itTy = mlir::dyn_cast<mlir::IntegerType>(colTy);
       assert(itTy && "runtime filter IR: int64 literal requires integer column type");
-      return rb.create<mlir::arith::ConstantOp>(loc, rb.getIntegerAttr(itTy, v));
+      auto rhs = rb.create<lingodb::compiler::dialect::db::ConstantOp>(loc, colV.getType(),
+                                                                       rb.getIntegerAttr(itTy, v));
+      auto cmp = rb.create<lingodb::compiler::dialect::db::CmpOp>(loc, intPredicate(), colV, rhs);
+      return deriveDbPredicateTruthValue(rb, loc, cmp);
    };
    if (f.op == runtime::FilterOp::NOTNULL) {
-      return rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+      if (!mlir::isa<lingodb::compiler::dialect::db::NullableType>(colV.getType()))
+         return rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+      mlir::Value isNull =
+         rb.create<lingodb::compiler::dialect::db::IsNullOp>(loc, rb.getI1Type(), colV);
+      mlir::Value one = rb.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+      return rb.create<mlir::arith::XOrIOp>(loc, isNull, one);
    }
    if (f.op == runtime::FilterOp::IN) {
       if (std::holds_alternative<std::vector<int64_t>>(f.values)) {
@@ -1164,8 +1185,7 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
          assert(!vals.empty() && "runtime filter IR: IN requires a non-empty value list");
          mlir::Value acc;
          for (int64_t v : vals) {
-            mlir::Value c = emitArithIntConstant(v);
-            mlir::Value eq = rb.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, colV, c);
+            mlir::Value eq = emitDbIntCompare(v);
             acc = acc ? rb.create<mlir::arith::OrIOp>(loc, acc, eq) : eq;
          }
          return acc;
@@ -1204,19 +1224,7 @@ static mlir::Value emitRuntimeFilterPredicateValue(mlir::OpBuilder& rb, mlir::Lo
    }
    if (std::holds_alternative<int64_t>(f.value)) {
       int64_t v = std::get<int64_t>(f.value);
-      mlir::Value c = emitArithIntConstant(v);
-      using P = mlir::arith::CmpIPredicate;
-      P p = P::eq;
-      switch (f.op) {
-         case runtime::FilterOp::EQ: p = P::eq; break;
-         case runtime::FilterOp::NEQ: p = P::ne; break;
-         case runtime::FilterOp::LT: p = P::slt; break;
-         case runtime::FilterOp::LTE: p = P::sle; break;
-         case runtime::FilterOp::GT: p = P::sgt; break;
-         case runtime::FilterOp::GTE: p = P::sge; break;
-         default: llvm_unreachable("runtime filter IR: unsupported filter op");
-      }
-      return rb.create<mlir::arith::CmpIOp>(loc, p, colV, c);
+      return emitDbIntCompare(v);
    }
    if (std::holds_alternative<std::string>(f.value)) {
       auto s = std::get<std::string>(f.value);
@@ -1311,8 +1319,8 @@ mlir::Value materializeRuntimeFiltersAsSubopFilter(mlir::OpBuilder& b,
    helper.buildBlock(b, [&](mlir::OpBuilder& rb) {
       mlir::Value acc;
       for (auto& f : filters) {
-         if (f.op == runtime::FilterOp::NOTNULL) continue;
          tuples::ColumnRefAttr col = lookupRuntimeFilterColumn(colByName, f.columnName);
+         if (!col && f.op == runtime::FilterOp::NOTNULL) continue;
          assert(col && "delay_filter: missing filter column in gathered columns");
          mlir::Value pred = emitRuntimeFilterPredicateValue(rb, loc, helper, col, f);
          acc = acc ? rb.create<lingodb::compiler::dialect::db::AndOp>(loc, mlir::ValueRange{acc, pred}) : pred;
@@ -1358,8 +1366,8 @@ materializeRuntimeFiltersAsPredicateColumn(mlir::OpBuilder& b,
    helper.buildBlock(b, [&](mlir::OpBuilder& rb) {
       mlir::Value acc;
       for (auto& f : filters) {
-         if (f.op == runtime::FilterOp::NOTNULL) continue;
          tuples::ColumnRefAttr col = lookupRuntimeFilterColumn(colByName, f.columnName);
+         if (!col && f.op == runtime::FilterOp::NOTNULL) continue;
          assert(col && "delay_filter_pred: missing filter column in gathered columns");
          mlir::Value pred = emitRuntimeFilterPredicateValue(rb, loc, helper, col, f);
          acc = acc ? rb.create<lingodb::compiler::dialect::db::AndOp>(loc, mlir::ValueRange{acc, pred}) : pred;
@@ -1513,6 +1521,31 @@ static subop::StateMembersAttr tableEntryPredicateMembers(mlir::Type type) {
    return subop::StateMembersAttr::get(type.getContext(), {});
 }
 
+static llvm::StringRef stripRuntimeFilterColumnSuffix(llvm::StringRef s) {
+   size_t pos = s.find('$');
+   if (pos == llvm::StringRef::npos) return s;
+   return s.take_front(pos);
+}
+
+static subop::Member findTableMemberForRuntimeFilter(subop::ScanRefsOp scanOp,
+                                                     const runtime::FilterDescription& f) {
+   auto tableMembers = tableScanDataMembers(scanOp.getState().getType());
+   auto& mm = scanOp->getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   for (auto m : tableMembers.getMembers()) {
+      if (stripRuntimeFilterColumnSuffix(mm.getName(m)) == f.columnName) return m;
+   }
+   return {};
+}
+
+static bool runtimeFilterNeedsColumnForScan(subop::ScanRefsOp scanOp,
+                                            const runtime::FilterDescription& f) {
+   subop::Member mem = findTableMemberForRuntimeFilter(scanOp, f);
+   assert(mem && "runtime filter references a column outside the table scan");
+   if (f.op != runtime::FilterOp::NOTNULL) return true;
+   auto& mm = scanOp->getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   return mlir::isa<lingodb::compiler::dialect::db::NullableType>(mm.getType(mem));
+}
+
 llvm::SmallVector<runtime::FilterDescription, 8>
 restrictFiltersToTableScanInExecutionStep(ExecutionStepOp step,
                                           llvm::ArrayRef<runtime::FilterDescription> filters) {
@@ -1521,17 +1554,11 @@ restrictFiltersToTableScanInExecutionStep(ExecutionStepOp step,
 
    auto tableMembers = tableScanDataMembers(scanOp.getState().getType());
    auto& mm = step.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   auto stripSuffix = [](llvm::StringRef s) -> llvm::StringRef {
-      size_t pos = s.find('$');
-      if (pos == llvm::StringRef::npos) return s;
-      return s.take_front(pos);
-   };
-
    llvm::SmallVector<runtime::FilterDescription, 8> out;
    for (const auto& f : filters) {
       bool onTable = false;
       for (auto m : tableMembers.getMembers()) {
-         if (stripSuffix(mm.getName(m)) == f.columnName) {
+         if (stripRuntimeFilterColumnSuffix(mm.getName(m)) == f.columnName) {
             onTable = true;
             break;
          }
@@ -1557,27 +1584,14 @@ static subop::MaterializeOp findBufferMaterializeForPredMember(subop::ExecutionS
 
 static void extendTableScanRefTypesForFilters(subop::ScanRefsOp scanOp,
                                               llvm::ArrayRef<runtime::FilterDescription> filters) {
-   auto tableMembers = tableScanDataMembers(scanOp.getState().getType());
-   auto stripSuffix = [](llvm::StringRef s) -> llvm::StringRef {
-      size_t pos = s.find('$');
-      if (pos == llvm::StringRef::npos) return s;
-      return s.take_front(pos);
-   };
    auto refDef = scanOp.getRef();
    llvm::SmallVector<subop::Member> cols =
       tableEntryDataMembers(refDef.getColumn().type).getMembers();
    llvm::DenseSet<subop::Member> have;
    for (auto m : cols) have.insert(m);
-   auto& mm = scanOp->getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    for (auto& f : filters) {
-      if (f.op == runtime::FilterOp::NOTNULL) continue;
-      subop::Member mem;
-      for (auto m : tableMembers.getMembers()) {
-         if (stripSuffix(mm.getName(m)) == f.columnName) {
-            mem = m;
-            break;
-         }
-      }
+      if (!runtimeFilterNeedsColumnForScan(scanOp, f)) continue;
+      subop::Member mem = findTableMemberForRuntimeFilter(scanOp, f);
       assert(mem && "write_pred: could not find table member for filter column");
       if (have.insert(mem).second) cols.push_back(mem);
    }
@@ -1674,8 +1688,37 @@ static void addSharedPredicateClauseForScan(subop::ScanRefsOp scanOp, llvm::Stri
    ds.orFilterClauses.clear();
    if (ds.sharedPredicateClauses.size() < predMembers.getMembers().size())
       ds.sharedPredicateClauses.resize(predMembers.getMembers().size());
+   if (ds.sharedPredicateSlots.size() < predMembers.getMembers().size()) {
+      size_t oldSize = ds.sharedPredicateSlots.size();
+      ds.sharedPredicateSlots.resize(predMembers.getMembers().size());
+      for (size_t i = oldSize; i < ds.sharedPredicateSlots.size(); ++i)
+         ds.sharedPredicateSlots[i] = i;
+   }
    std::vector<runtime::FilterDescription> filterVec(filters.begin(), filters.end());
    ds.sharedPredicateClauses[*localSlot] = std::move(filterVec);
+   if (std::optional<unsigned> parsedSlot = parseFilterPredMemberSlot(predMemberName))
+      ds.sharedPredicateSlots[*localSlot] = *parsedSlot;
+   ge.setDescrAttr(mlir::StringAttr::get(ge.getContext(), lingodb::utility::serializeToHexString(ds)));
+}
+
+static void clearPushdownFiltersForScan(subop::ScanRefsOp scanOp) {
+   subop::GetExternalOp ge = resolveGetExternalForScanRefs(scanOp);
+   auto ds = lingodb::utility::deserializeFromHexString<runtime::ExternalDatasourceProperty>(ge.getDescr());
+   ds.filterDescriptions.clear();
+   ds.orFilterClauses.clear();
+   auto predMembers = tableScanPredicateMembers(scanOp.getState().getType()).getMembers();
+   ds.sharedPredicateClauses.clear();
+   ds.sharedPredicateSlots.clear();
+   if (!predMembers.empty()) {
+      ds.sharedPredicateClauses.resize(predMembers.size());
+      auto& mm = scanOp.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+      ds.sharedPredicateSlots.reserve(predMembers.size());
+      for (subop::Member member : predMembers) {
+         std::optional<unsigned> slot = parseFilterPredMemberSlot(mm.getName(member));
+         assert(slot && "shared predicate member must be named filter_pred$N");
+         ds.sharedPredicateSlots.push_back(*slot);
+      }
+   }
    ge.setDescrAttr(mlir::StringAttr::get(ge.getContext(), lingodb::utility::serializeToHexString(ds)));
 }
 
@@ -1720,26 +1763,14 @@ static subop::GatherOp insertFilterColumnGatherRightAfterScan(
    auto* ctx = scanOp.getContext();
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
    auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
-   auto tableMembers = tableScanDataMembers(scanOp.getState().getType());
-   auto stripSuffix = [](llvm::StringRef s) -> llvm::StringRef {
-      size_t pos = s.find('$');
-      if (pos == llvm::StringRef::npos) return s;
-      return s.take_front(pos);
-   };
 
    llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>> mappingPairs;
    llvm::StringMap<bool> seenCols;
    for (auto& f : filters) {
-      if (f.op == runtime::FilterOp::NOTNULL) continue;
+      if (!runtimeFilterNeedsColumnForScan(scanOp, f)) continue;
       if (seenCols.contains(f.columnName)) continue;
       seenCols[f.columnName] = true;
-      subop::Member mem;
-      for (auto m : tableMembers.getMembers()) {
-         if (stripSuffix(mm.getName(m)) == f.columnName) {
-            mem = m;
-            break;
-         }
-      }
+      subop::Member mem = findTableMemberForRuntimeFilter(scanOp, f);
       assert(mem && "write_pred: could not find table member for filter column");
       std::string scope = cm.getUniqueScope("reuse_write_pred_col");
       tuples::ColumnDefAttr def = cm.createDef(scope, f.columnName);
@@ -1805,7 +1836,9 @@ std::pair<mlir::Value, tuples::ColumnRefAttr> materializeRuntimeFiltersAsPredica
    mlir::Value predStream;
    tuples::ColumnDefAttr predDef;
    bool needsColumnGather =
-      llvm::any_of(filters, [](const runtime::FilterDescription& f) { return f.op != runtime::FilterOp::NOTNULL; });
+      llvm::any_of(filters, [&](const runtime::FilterDescription& f) {
+         return runtimeFilterNeedsColumnForScan(scanOp, f);
+      });
    if (!needsColumnGather) {
       mlir::OpBuilder b(scanOp);
       b.setInsertionPointAfter(scanOp);
@@ -1853,7 +1886,9 @@ std::pair<mlir::Value, tuples::ColumnRefAttr> materializeRuntimeFilterClausesAsI
    mlir::Value stream = scanOp.getRes();
    llvm::DenseMap<llvm::StringRef, tuples::ColumnRefAttr> colByName;
    bool needsColumnGather =
-      llvm::any_of(allFilters, [](const runtime::FilterDescription& f) { return f.op != runtime::FilterOp::NOTNULL; });
+      llvm::any_of(allFilters, [&](const runtime::FilterDescription& f) {
+         return runtimeFilterNeedsColumnForScan(scanOp, f);
+      });
    if (needsColumnGather) {
       subop::GatherOp gather = insertFilterColumnGatherRightAfterScan(scanOp, allFilters);
       assert(gather && "id column insertion requires gathered filter columns");
@@ -1881,8 +1916,8 @@ std::pair<mlir::Value, tuples::ColumnRefAttr> materializeRuntimeFilterClausesAsI
       for (auto it = restrictedClauses.rbegin(); it != restrictedClauses.rend(); ++it) {
          mlir::Value pred;
          for (const runtime::FilterDescription& f : it->filters) {
-            if (f.op == runtime::FilterOp::NOTNULL) continue;
             tuples::ColumnRefAttr col = lookupRuntimeFilterColumn(colByName, f.columnName);
+            if (!col && f.op == runtime::FilterOp::NOTNULL) continue;
             assert(col && "id column insertion missing filter column");
             mlir::Value one = emitRuntimeFilterPredicateValue(rb, loc, helper, col, f);
             pred = pred ? rb.create<lingodb::compiler::dialect::db::AndOp>(loc, mlir::ValueRange{pred, one}) : one;
@@ -1935,7 +1970,9 @@ void insertWriteSidePredIntoHashMapConstructionStep(ExecutionStepOp step,
    excludeOps.push_back(scanOp.getOperation());
 
    bool needsColumnGather =
-      llvm::any_of(filters, [](const runtime::FilterDescription& f) { return f.op != runtime::FilterOp::NOTNULL; });
+      llvm::any_of(filters, [&](const runtime::FilterDescription& f) {
+         return runtimeFilterNeedsColumnForScan(scanOp, f);
+      });
    if (!needsColumnGather) {
       mlir::OpBuilder pb(scanOp);
       pb.setInsertionPointAfter(scanOp);
@@ -2086,12 +2123,13 @@ void materializeConstantTruePredMemberOnBufferMaterialize(subop::MaterializeOp m
 
 void insertWriteSidePredIntoBufferConstructionStepForPredMember(
    ExecutionStepOp step, llvm::ArrayRef<runtime::FilterDescription> filters, llvm::StringRef predMemberName,
-   bool allowSharedScanPredicate) {
+   bool allowSharedScanPredicate, bool clearScanPushdown) {
    llvm::SmallVector<runtime::FilterDescription, 8> restricted =
       restrictFiltersToTableScanInExecutionStep(step, filters);
-   filters = restricted;
+   if (!allowSharedScanPredicate) filters = restricted;
    subop::ScanRefsOp scanOp = findTableScanRefsInStep(step);
    assert(scanOp && "write_pred_buf: expected a scan_refs over table");
+   if (clearScanPushdown) clearPushdownFiltersForScan(scanOp);
    subop::MaterializeOp matOp = findBufferMaterializeForPredMember(step, predMemberName);
    assert(matOp && "write_pred_buf: expected materialize into join buffer with filter_pred member");
 
@@ -2116,30 +2154,30 @@ void insertWriteSidePredIntoBufferConstructionStepForPredMember(
    excludeOps.push_back(scanOp.getOperation());
    bool rewiredByHelper = false;
 
-   if (filters.empty()) {
+   if (allowSharedScanPredicate) {
+      addSharedPredicateClauseForScan(scanOp, predMemberName, filters);
+      std::tie(predStream, predDef) = gatherSharedPredicateColumnAfterScan(scanOp, predMemberName);
+      if (mlir::Operation* predGather = predStream.getDefiningOp()) excludeOps.push_back(predGather);
+   } else if (filters.empty()) {
       mlir::OpBuilder pb(scanOp);
       pb.setInsertionPointAfter(scanOp);
       std::tie(predStream, predDef) =
          materializeConstantTruePredColumnOnStream(pb, scanOp.getLoc(), scanOp.getRes(), predMemberName);
    } else {
       bool needsColumnGather =
-         llvm::any_of(filters, [](const runtime::FilterDescription& f) { return f.op != runtime::FilterOp::NOTNULL; });
+         llvm::any_of(filters, [&](const runtime::FilterDescription& f) {
+            return runtimeFilterNeedsColumnForScan(scanOp, f);
+         });
       if (!needsColumnGather) {
          mlir::OpBuilder pb(scanOp);
          pb.setInsertionPointAfter(scanOp);
          std::tie(predStream, predDef) =
             materializeConstantTruePredColumnOnStream(pb, scanOp.getLoc(), scanOp.getRes(), predMemberName);
       } else {
-         if (allowSharedScanPredicate) {
-            addSharedPredicateClauseForScan(scanOp, predMemberName, filters);
-            std::tie(predStream, predDef) = gatherSharedPredicateColumnAfterScan(scanOp, predMemberName);
-            if (mlir::Operation* predGather = predStream.getDefiningOp()) excludeOps.push_back(predGather);
-         } else {
-            std::tie(predStream, predRef) =
-               materializeRuntimeFiltersAsPredicateColumnAfterScanRefs(scanOp, filters, predMemberName,
-                                                                       /*rewireDownstreamUses=*/true);
-            rewiredByHelper = true;
-         }
+         std::tie(predStream, predRef) =
+            materializeRuntimeFiltersAsPredicateColumnAfterScanRefs(scanOp, filters, predMemberName,
+                                                                    /*rewireDownstreamUses=*/true);
+         rewiredByHelper = true;
       }
    }
    if (mlir::Operation* predMap = predStream.getDefiningOp()) excludeOps.push_back(predMap);
@@ -2311,14 +2349,28 @@ void ensureJoinBufferFilterPredMaterializeMappings(mlir::ModuleOp module) {
    }
 }
 
-static bool probeScanStreamAlreadyPredFiltered(mlir::Value scanStream) {
+static bool probeScanStreamAlreadyPredFiltered(mlir::Value scanStream, subop::Member predMember) {
    for (mlir::OpOperand& use : scanStream.getUses()) {
       auto gatherOp = mlir::dyn_cast<subop::GatherOp>(use.getOwner());
       if (!gatherOp || gatherOp.getStream() != scanStream) continue;
+      tuples::ColumnRefAttr predRef;
+      for (auto [member, def] : gatherOp.getMapping().getMapping()) {
+         if (member != predMember) continue;
+         predRef = scanStream.getContext()
+                      ->getLoadedDialect<tuples::TupleStreamDialect>()
+                      ->getColumnManager()
+                      .createRef(&def.getColumn());
+         break;
+      }
+      if (!predRef) continue;
       for (mlir::OpOperand& gUse : gatherOp.getRes().getUses()) {
          auto filterOp = mlir::dyn_cast<subop::FilterOp>(gUse.getOwner());
          if (!filterOp || filterOp.getStream() != gatherOp.getRes()) continue;
-         if (filterOp.getFilterSemantic() == subop::FilterSemantic::all_true) return true;
+         if (filterOp.getFilterSemantic() != subop::FilterSemantic::all_true) continue;
+         for (mlir::Attribute attr : filterOp.getConditions()) {
+            auto ref = mlir::dyn_cast<tuples::ColumnRefAttr>(attr);
+            if (ref && ref.getColumnPtr() == predRef.getColumnPtr()) return true;
+         }
       }
    }
    return false;
@@ -2326,7 +2378,7 @@ static bool probeScanStreamAlreadyPredFiltered(mlir::Value scanStream) {
 
 void insertProbePredFilterImmediatelyAfterScanProducer(mlir::Operation* anchorOp, mlir::Value scanStream,
                                                        tuples::ColumnRefAttr entryRef, subop::Member predMember) {
-   if (probeScanStreamAlreadyPredFiltered(scanStream)) return;
+   if (probeScanStreamAlreadyPredFiltered(scanStream, predMember)) return;
 
    auto* ctx = anchorOp->getContext();
    auto& cm = ctx->getLoadedDialect<tuples::TupleStreamDialect>()->getColumnManager();
@@ -2612,7 +2664,6 @@ void materializeRuntimeFiltersAtCacheGetUses(mlir::Value cached,
 
       bool anyMissing = false;
       for (auto& f : decodedFilters) {
-         if (f.op == runtime::FilterOp::NOTNULL) continue;
          if (colByName.contains(f.columnName)) continue;
          anyMissing = true;
          break;
@@ -2630,6 +2681,7 @@ void materializeRuntimeFiltersAtCacheGetUses(mlir::Value cached,
          }
          assert(scanOp && "delay_filter: missing filter columns but could not find scan_refs before gather");
          auto tableMembers = tableScanDataMembers(scanOp.getState().getType());
+         (void)tableMembers;
          assert(tableMembers && "delay_filter: scan_refs state must be table-like");
 
          llvm::StringRef reusedScope = "delay_filter";
@@ -2642,22 +2694,10 @@ void materializeRuntimeFiltersAtCacheGetUses(mlir::Value cached,
 
          auto& mm = gatherOp->getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
          llvm::SmallVector<std::pair<subop::Member, tuples::ColumnDefAttr>, 8> extra;
-         auto stripSuffix = [](llvm::StringRef s) -> llvm::StringRef {
-            size_t pos = s.find('$');
-            if (pos == llvm::StringRef::npos) return s;
-            return s.take_front(pos);
-         };
          for (auto& f : decodedFilters) {
-            if (f.op == runtime::FilterOp::NOTNULL) continue;
             if (colByName.contains(f.columnName)) continue;
 
-            subop::Member mem;
-            for (auto m : tableMembers.getMembers()) {
-               if (stripSuffix(mm.getName(m)) == f.columnName) {
-                  mem = m;
-                  break;
-               }
-            }
+            subop::Member mem = findTableMemberForRuntimeFilter(scanOp, f);
             assert(mem && "delay_filter: could not find table member for filter column");
 
             tuples::ColumnDefAttr def = cm.createDef(reusedScope.str(), f.columnName);

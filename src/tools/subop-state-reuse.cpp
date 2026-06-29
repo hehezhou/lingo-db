@@ -340,12 +340,15 @@ static bool lowerFromSubOpLayer(mlir::ModuleOp subopModule, const char* snapshot
 
    // From SubOp layer (after PrepareLoweringPass) to imperative lowering.
    {
+      snap("before-lower-subop", subopModule);
       mlir::PassManager lowerSubOpPm(subopModule.getContext());
       lowerSubOpPm.enableVerifier(true);
       lowerSubOpPm.addPass(subop::createLowerSubOpPass());
-      lowerSubOpPm.addPass(lingodb::compiler::createCanonicalizerPass());
       lowerSubOpPm.addPass(mlir::createCSEPass());
-      if (failed(lowerSubOpPm.run(subopModule))) return false;
+      if (failed(lowerSubOpPm.run(subopModule))) {
+         snap("lower-subop-failed", subopModule);
+         return false;
+      }
    }
    snap("before-lower-db", subopModule);
 

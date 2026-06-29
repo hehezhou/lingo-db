@@ -33,6 +33,9 @@ void subop::registerSubOpTransformations() {
       return subop::createFinalizePass();
    });
    ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+      return subop::createInsertMiniBufferPass();
+   });
+   ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
       return subop::createSplitIntoExecutionStepsPass();
    });
    ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
