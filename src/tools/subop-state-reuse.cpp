@@ -76,6 +76,21 @@ static bool envFlagEnabled(const char* envVar) {
           s.equals_insensitive("on");
 }
 
+static unsigned parseUnsignedOrDie(llvm::StringRef text, llvm::StringRef optionName) {
+   unsigned value = 0;
+   if (text.getAsInteger(10, value)) {
+      llvm::errs() << kToolName << ": invalid unsigned value for " << optionName << ": " << text << "\n";
+      std::abort();
+   }
+   return value;
+}
+
+static unsigned envUnsignedOrZero(const char* envVar) {
+   const char* v = std::getenv(envVar);
+   if (!v || v[0] == '\0') return 0;
+   return parseUnsignedOrDie(v, envVar);
+}
+
 /// Elapsed milliseconds since \p start (same pattern as `LLVMBackends.cpp`).
 static double millisSince(std::chrono::high_resolution_clock::time_point start) {
    auto end = std::chrono::high_resolution_clock::now();
@@ -541,6 +556,7 @@ static SubOpExecuteTiming executeFromSubOpLayer(mlir::ModuleOp subopModule,
 struct SubOpStateReuseOptions {
    bool skipReuseRewrite = false;
    bool analysisOnly = false;
+   unsigned reuseMaxIterations = 0;
    bool skipExecute = false;
    bool captureResultHashes = false;
    bool printPlan = false;
@@ -607,6 +623,7 @@ static lingodb::compiler::dialect::subop::BatchReuseStateGroupInfo summarizeMatc
    const lingodb::compiler::dialect::subop::CrossQueryStateMatchGroup& group) {
    lingodb::compiler::dialect::subop::BatchReuseStateGroupInfo info;
    info.cacheKey = group.cacheKey;
+   info.rewriteIteration = 1;
    info.enableFilterPredReuse = group.enableFilterPredReuse;
    info.requiresJoinLayoutUnion = group.requiresJoinLayoutUnion;
    info.requiresBufferScanRefsUnion = group.requiresBufferScanRefsUnion;
@@ -721,8 +738,10 @@ static SubOpStateReuseBatchResult runSubOpStateReuseBatch(
    if (!opts.skipReuseRewrite) {
       llvm::SmallVector<mlir::ModuleOp, 8> modules;
       for (auto& r : runs) modules.push_back(r.module);
+      lingodb::compiler::dialect::subop::BatchReuseRewriteOptions rewriteOptions;
+      rewriteOptions.maxIterations = opts.reuseMaxIterations;
       rewriteRes = lingodb::compiler::dialect::subop::rewritePlansWithSyntheticQueryBatch(
-         modules, groups, catalog);
+         modules, groups, catalog, rewriteOptions);
    } else {
       rewriteRes.numTargetsPerQuery.resize(runs.size(), 0);
       rewriteRes.numTargetsNoTablePerQuery.resize(runs.size(), 0);
@@ -1033,6 +1052,7 @@ static llvm::json::Array jsonReuseStateGroups(
    for (const auto& group : groups) {
       llvm::json::Object obj;
       obj["cache_key"] = static_cast<int64_t>(group.cacheKey);
+      obj["rewrite_iteration"] = static_cast<int64_t>(group.rewriteIteration);
       obj["query_indices"] = jsonIntArray(group.queries);
       obj["state_type"] = group.stateType;
       obj["enable_filter_pred_reuse"] = group.enableFilterPredReuse;
@@ -1055,6 +1075,7 @@ static int runQueryBatchMain(int argc, char** argv) {
    std::string dbDir = argv[2];
    std::string mode;
    std::string outPath;
+   unsigned reuseMaxIterations = 0;
    llvm::SmallVector<std::string, 64> queryFiles;
 
    for (int i = 3; i < argc; i++) {
@@ -1067,6 +1088,8 @@ static int runQueryBatchMain(int argc, char** argv) {
          mode = requireValue();
       } else if (arg == "--out") {
          outPath = requireValue();
+      } else if (arg == "--reuse-max-iterations") {
+         reuseMaxIterations = parseUnsignedOrDie(requireValue(), "--reuse-max-iterations");
       } else {
          queryFiles.push_back(arg.str());
       }
@@ -1094,6 +1117,7 @@ static int runQueryBatchMain(int argc, char** argv) {
    SubOpStateReuseOptions opts;
    opts.skipReuseRewrite = mode == "reuse_off";
    opts.analysisOnly = mode == "reuse_analyze";
+   opts.reuseMaxIterations = reuseMaxIterations ? reuseMaxIterations : envUnsignedOrZero("LINGODB_REUSE_MAX_ITERATIONS");
    opts.skipExecute = (std::getenv("LINGODB_SKIP_EXECUTE") != nullptr);
    opts.captureResultHashes = true;
    opts.printPlan = envFlagEnabled("LINGODB_REUSE_PRINT_PLAN");

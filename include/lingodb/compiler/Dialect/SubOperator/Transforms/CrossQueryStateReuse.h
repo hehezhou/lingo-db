@@ -46,6 +46,7 @@ struct ReusePlanRewriteResult {
 
 struct BatchReuseStateGroupInfo {
    uint64_t cacheKey = 0;
+   unsigned rewriteIteration = 0;
    llvm::SmallVector<int, 8> queries;
    bool enableFilterPredReuse = true;
    bool requiresJoinLayoutUnion = false;
@@ -72,6 +73,11 @@ struct BatchReusePlanRewriteResult {
    CachedJoinBufferLayoutsByKey cachedJoinLayouts;
 };
 
+struct BatchReuseRewriteOptions {
+   /// 0 means run to fixed point.
+   unsigned maxIterations = 0;
+};
+
 // Three-stage pipeline:
 // 1) analysis: provided by StateExtraction (collectModuleReuseInfo, buildStateMatchProfiles)
 // 2) match: provided by StateExtraction (collectCrossQueryStateMatchPairs)
@@ -88,7 +94,8 @@ ReusePlanRewriteResult rewritePlansWithSyntheticQuery0(
 BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
    llvm::ArrayRef<mlir::ModuleOp> queries,
    llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
-   lingodb::catalog::Catalog* catalog = nullptr);
+   lingodb::catalog::Catalog* catalog = nullptr,
+   BatchReuseRewriteOptions options = {});
 
 /// \p reuseBeforeMutation must reflect the module **before** `rewriteHashmapTypesInModule` runs on
 /// \p producerModule (when null, it is collected here). Used to skip a redundant full-module scan.

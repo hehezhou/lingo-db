@@ -3145,9 +3145,11 @@ static std::string stringifyMlirType(mlir::Type type) {
 }
 
 static void appendBatchReuseStateGroupInfo(BatchReusePlanRewriteResult& res,
-                                           const CrossQueryStateMatchGroup& group) {
+                                           const CrossQueryStateMatchGroup& group,
+                                           unsigned rewriteIteration) {
    BatchReuseStateGroupInfo info;
    info.cacheKey = group.cacheKey;
+   info.rewriteIteration = rewriteIteration;
    info.enableFilterPredReuse = group.enableFilterPredReuse;
    info.requiresJoinLayoutUnion = group.requiresJoinLayoutUnion;
    info.requiresBufferScanRefsUnion = group.requiresBufferScanRefsUnion;
@@ -5868,7 +5870,8 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
    llvm::ArrayRef<mlir::ModuleOp> queries,
    llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
    lingodb::catalog::Catalog* catalog,
-   const CachedJoinBufferLayoutsByKey* priorJoinLayouts) {
+   const CachedJoinBufferLayoutsByKey* priorJoinLayouts,
+   unsigned rewriteIteration) {
    (void)catalog;
    assert(queries.size() >= 2 && "batch reuse needs at least two queries");
 
@@ -5924,10 +5927,11 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
          registerBatchConsumerTarget(res, targetsByQuery, rewriteCtx, g, e, splitSlot, flags,
                                      decision);
       }
-	   }
-	   llvm::SmallVector<CrossQueryStateMatchGroup, 64> rewriteGroups = std::move(activeRewriteGroups);
-   for (const CrossQueryStateMatchGroup& group : rewriteGroups) appendBatchReuseStateGroupInfo(res, group);
-	   rewriteCtx.inheritSlotsFromGroups(rewriteGroups);
+   }
+   llvm::SmallVector<CrossQueryStateMatchGroup, 64> rewriteGroups = std::move(activeRewriteGroups);
+   for (const CrossQueryStateMatchGroup& group : rewriteGroups)
+      appendBatchReuseStateGroupInfo(res, group, rewriteIteration);
+   rewriteCtx.inheritSlotsFromGroups(rewriteGroups);
 
    for (size_t i = 0; i < targetsByQuery.size(); ++i) {
       res.numTargetsPerQuery[i] = targetsByQuery[i].size();
@@ -6873,16 +6877,19 @@ static void alignSyntheticCacheGetDependenciesToCachedPuts(
 BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatch(
    llvm::ArrayRef<mlir::ModuleOp> queries,
    llvm::ArrayRef<CrossQueryStateMatchGroup> groups,
-   lingodb::catalog::Catalog* catalog) {
+   lingodb::catalog::Catalog* catalog,
+   BatchReuseRewriteOptions options) {
    BatchReusePlanRewriteResult total;
    initBatchReuseCounters(total, queries.size());
 
    llvm::SmallVector<CrossQueryStateMatchGroup, 64> currentGroups(groups.begin(), groups.end());
    CachedJoinBufferLayoutsByKey accumulatedJoinLayouts;
-   for (;;) {
+   for (unsigned iteration = 1;; ++iteration) {
       if (currentGroups.empty()) break;
+      if (options.maxIterations != 0 && iteration > options.maxIterations) break;
       BatchReusePlanRewriteResult one =
-         rewritePlansWithSyntheticQueryBatchOnce(queries, currentGroups, catalog, &accumulatedJoinLayouts);
+         rewritePlansWithSyntheticQueryBatchOnce(queries, currentGroups, catalog, &accumulatedJoinLayouts,
+                                                 iteration);
       bool madeProgress = one.numTargetsSyntheticMapped > 0;
       if (!madeProgress) break;
 
