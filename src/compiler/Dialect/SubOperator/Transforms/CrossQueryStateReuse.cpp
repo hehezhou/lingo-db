@@ -3134,6 +3134,33 @@ static void accumulateBatchReuseCounters(BatchReusePlanRewriteResult& total,
    total.numUnionTargetsSyntheticMappedNoTable += one.numUnionTargetsSyntheticMappedNoTable;
    total.numBuildStepTargetsSyntheticMapped += one.numBuildStepTargetsSyntheticMapped;
    total.numBuildStepTargetsSyntheticMappedNoTable += one.numBuildStepTargetsSyntheticMappedNoTable;
+   total.reuseStateGroups.append(one.reuseStateGroups.begin(), one.reuseStateGroups.end());
+}
+
+static std::string stringifyMlirType(mlir::Type type) {
+   std::string out;
+   llvm::raw_string_ostream os(out);
+   os << type;
+   return out;
+}
+
+static void appendBatchReuseStateGroupInfo(BatchReusePlanRewriteResult& res,
+                                           const CrossQueryStateMatchGroup& group) {
+   BatchReuseStateGroupInfo info;
+   info.cacheKey = group.cacheKey;
+   info.enableFilterPredReuse = group.enableFilterPredReuse;
+   info.requiresJoinLayoutUnion = group.requiresJoinLayoutUnion;
+   info.requiresBufferScanRefsUnion = group.requiresBufferScanRefsUnion;
+   info.requiresSplitMaterialize = group.requiresSplitMaterialize;
+
+   llvm::DenseSet<int> seen;
+   for (const CrossQueryStateMatchEntry& entry : group.entries) {
+      if (entry.query < 0) continue;
+      if (seen.insert(entry.query).second) info.queries.push_back(entry.query);
+      if (info.stateType.empty() && entry.state) info.stateType = stringifyMlirType(entry.state.getType());
+   }
+   llvm::sort(info.queries);
+   if (info.queries.size() >= 2) res.reuseStateGroups.push_back(std::move(info));
 }
 
 static void incrementBatchTargetCategoryCounts(BatchReusePlanRewriteResult& res,
@@ -5899,6 +5926,7 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
       }
 	   }
 	   llvm::SmallVector<CrossQueryStateMatchGroup, 64> rewriteGroups = std::move(activeRewriteGroups);
+   for (const CrossQueryStateMatchGroup& group : rewriteGroups) appendBatchReuseStateGroupInfo(res, group);
 	   rewriteCtx.inheritSlotsFromGroups(rewriteGroups);
 
    for (size_t i = 0; i < targetsByQuery.size(); ++i) {

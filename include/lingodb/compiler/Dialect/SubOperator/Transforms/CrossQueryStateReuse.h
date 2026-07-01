@@ -44,6 +44,16 @@ struct ReusePlanRewriteResult {
    size_t numBuildStepTargetsQuery0MappedNoTable = 0;
 };
 
+struct BatchReuseStateGroupInfo {
+   uint64_t cacheKey = 0;
+   llvm::SmallVector<int, 8> queries;
+   bool enableFilterPredReuse = true;
+   bool requiresJoinLayoutUnion = false;
+   bool requiresBufferScanRefsUnion = false;
+   bool requiresSplitMaterialize = false;
+   std::string stateType;
+};
+
 struct BatchReusePlanRewriteResult {
    mlir::OwningOpRef<mlir::ModuleOp> synthetic;
    llvm::SmallVector<size_t, 8> numTargetsPerQuery;
@@ -58,6 +68,7 @@ struct BatchReusePlanRewriteResult {
    size_t numUnionTargetsSyntheticMappedNoTable = 0;
    size_t numBuildStepTargetsSyntheticMapped = 0;
    size_t numBuildStepTargetsSyntheticMappedNoTable = 0;
+   llvm::SmallVector<BatchReuseStateGroupInfo, 64> reuseStateGroups;
    CachedJoinBufferLayoutsByKey cachedJoinLayouts;
 };
 
