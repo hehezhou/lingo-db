@@ -20,12 +20,22 @@ class DefaultAllocator : public lingodb::runtime::GrowingBufferAllocator {
 
 class GroupAllocator : public lingodb::runtime::GrowingBufferAllocator {
    std::vector<lingodb::runtime::GrowingBuffer*> buffers;
+   size_t permanentBufferCount = 0;
 
    public:
    lingodb::runtime::GrowingBuffer* create(lingodb::runtime::ExecutionContext* executionContext, size_t sizeOfType, size_t initialCapacity) override {
       auto* res = new lingodb::runtime::GrowingBuffer(initialCapacity, sizeOfType);
       buffers.push_back(res);
       return res;
+   }
+   void markPermanentCheckpoint() {
+      permanentBufferCount = buffers.size();
+   }
+   void flushTransientBuffers() {
+      while (buffers.size() > permanentBufferCount) {
+         delete buffers.back();
+         buffers.pop_back();
+      }
    }
    ~GroupAllocator() {
       for (auto* buf : buffers) {
@@ -136,6 +146,8 @@ lingodb::runtime::GrowingBufferAllocator* lingodb::runtime::GrowingBufferAllocat
       auto* newAllocator = new GroupAllocator;
       state.ptr = newAllocator;
       state.freeFn = [](void* ptr) { delete static_cast<GroupAllocator*>(ptr); };
+      state.markPermanentFn = [](void* ptr) { static_cast<GroupAllocator*>(ptr)->markPermanentCheckpoint(); };
+      state.flushTransientFn = [](void* ptr) { static_cast<GroupAllocator*>(ptr)->flushTransientBuffers(); };
       return newAllocator;
    }
 }

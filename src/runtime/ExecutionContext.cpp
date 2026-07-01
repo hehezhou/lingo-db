@@ -21,6 +21,12 @@ void lingodb::runtime::ExecutionContext::setTupleCount(uint32_t id, int64_t tupl
 namespace {
 std::mutex gCachedStatesMutex;
 std::unordered_map<uint64_t, uint8_t*> gCachedStates;
+
+void freeState(const lingodb::runtime::State& state) {
+   if (state.ptr && state.freeFn) {
+      state.freeFn(state.ptr);
+   }
+}
 } // namespace
 
 void lingodb::runtime::ExecutionContext::putCachedState(uint64_t key, uint8_t* ptr) {
@@ -43,6 +49,80 @@ void lingodb::runtime::ExecutionContext::clearAllCachedStates() {
    gCachedStates.clear();
 }
 
+void lingodb::runtime::ExecutionContext::markPermanentMemoryCheckpoint() {
+   permanentMemoryCheckpoint.perWorkerStateSizes.clear();
+   permanentMemoryCheckpoint.perWorkerStateSizes.reserve(perWorkerStates.size());
+   for (const auto& states : perWorkerStates) {
+      permanentMemoryCheckpoint.perWorkerStateSizes.push_back(states.size());
+   }
+
+   permanentMemoryCheckpoint.stringArenaCheckpoints.clear();
+   permanentMemoryCheckpoint.stringArenaCheckpoints.reserve(stringArenas.size());
+   for (const auto& arena : stringArenas) {
+      permanentMemoryCheckpoint.stringArenaCheckpoints.push_back(arena.checkpoint());
+   }
+
+   for (auto& workerAllocators : allocators) {
+      for (auto& [_, state] : workerAllocators) {
+         if (state.ptr && state.markPermanentFn) {
+            state.markPermanentFn(state.ptr);
+         }
+      }
+   }
+   permanentMemoryCheckpoint.allocatorStates = allocators;
+   hasPermanentMemoryCheckpoint = true;
+}
+
+void lingodb::runtime::ExecutionContext::flushTransientMemory() {
+   if (!hasPermanentMemoryCheckpoint) {
+      markPermanentMemoryCheckpoint();
+   }
+
+   results.clear();
+   tupleCounts.clear();
+
+   for (size_t worker = 0; worker < perWorkerStates.size(); ++worker) {
+      size_t checkpointSize = worker < permanentMemoryCheckpoint.perWorkerStateSizes.size()
+                                 ? permanentMemoryCheckpoint.perWorkerStateSizes[worker]
+                                 : 0;
+      auto& states = perWorkerStates[worker];
+      while (states.size() > checkpointSize) {
+         freeState(states.back());
+         states.pop_back();
+      }
+   }
+
+   for (size_t worker = 0; worker < stringArenas.size(); ++worker) {
+      if (worker < permanentMemoryCheckpoint.stringArenaCheckpoints.size()) {
+         stringArenas[worker].rollbackTo(permanentMemoryCheckpoint.stringArenaCheckpoints[worker]);
+      }
+   }
+
+   for (size_t worker = 0; worker < allocators.size(); ++worker) {
+      auto& current = allocators[worker];
+      const auto& checkpoint = permanentMemoryCheckpoint.allocatorStates[worker];
+      for (auto it = current.begin(); it != current.end();) {
+         auto checkpointIt = checkpoint.find(it->first);
+         if (checkpointIt == checkpoint.end()) {
+            freeState(it->second);
+            it = current.erase(it);
+            continue;
+         }
+         const State& checkpointState = checkpointIt->second;
+         if (it->second.ptr != checkpointState.ptr) {
+            freeState(it->second);
+            it->second = checkpointState;
+         } else if (it->second.ptr && it->second.flushTransientFn) {
+            it->second.flushTransientFn(it->second.ptr);
+         }
+         ++it;
+      }
+      for (const auto& [group, checkpointState] : checkpoint) {
+         current.try_emplace(group, checkpointState);
+      }
+   }
+}
+
 lingodb::runtime::ExecutionContext::~ExecutionContext() {
    {
       std::lock_guard<std::mutex> lock(gCachedStatesMutex);
@@ -53,12 +133,12 @@ lingodb::runtime::ExecutionContext::~ExecutionContext() {
    cachedStateKeys.clear();
    for (auto threadLocal : perWorkerStates) {
       for (auto s : threadLocal) {
-         s.freeFn(s.ptr);
+         freeState(s);
       }
    }
    for (auto local : allocators) {
       for (auto a : local) {
-         a.second.freeFn(a.second.ptr);
+         freeState(a.second);
       }
    }
    allocators.clear();

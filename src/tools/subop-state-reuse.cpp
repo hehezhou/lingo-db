@@ -899,12 +899,15 @@ static SubOpStateReuseBatchResult runSubOpStateReuseBatch(
       };
       if (rewriteRes.numTargetsSyntheticMapped > 0) {
          runOne(*rewriteRes.synthetic, "// synthetic batch execute", result.segmentSynthetic, std::nullopt);
+         sharedExecCtx->markPermanentMemoryCheckpoint();
       } else {
          if (opts.verboseTiming) llvm::outs() << "\n// (skip synthetic execute: reuse_targets_synthetic_mapped==0)\n";
+         sharedExecCtx->markPermanentMemoryCheckpoint();
       }
       for (size_t i = 0; i < runs.size(); i++) {
          SubOpExecuteTiming& seg = result.consumerSegments[i];
          runOne(runs[i].module, "// query[" + std::to_string(i) + "] execute", seg, static_cast<unsigned>(i));
+         sharedExecCtx->flushTransientMemory();
       }
    }
 
@@ -932,8 +935,7 @@ static SubOpStateReuseBatchResult runSubOpStateReuseBatch(
    if (opts.verboseTiming) {
       llvm::outs() << "// timing_note: executionTime_ms is run-sql `executionTime` (generated main() only).\n";
       llvm::outs() << "// timing_note: shared ExecutionContext keeps cache_put pointers valid across runs;\n";
-      llvm::outs() << "// timing_note: does not change executionTime; per-run clearResult(0) only. Arena/state\n";
-      llvm::outs() << "// timing_note: may accumulate on the shared context (memory, not timing).\n";
+      llvm::outs() << "// timing_note: consumer transient arena/state memory is flushed after result processing.\n";
 
       printPerRun("lower_imperative", [](const SubOpExecuteTiming& t) { return t.lowerMs; });
       printPerRun("llvm_jit", [](const SubOpExecuteTiming& t) { return t.llvmJitMs(); });

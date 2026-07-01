@@ -4,7 +4,10 @@
 #include <memory>
 #include <optional>
 #include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "ConcurrentMap.h"
 #include "Session.h"
@@ -15,6 +18,11 @@ class Database;
 struct State {
    void* ptr = nullptr;
    std::function<void(void*)> freeFn;
+   std::function<void(void*)> markPermanentFn;
+   std::function<void(void*)> flushTransientFn;
+
+   State() = default;
+   State(void* ptr, std::function<void(void*)> freeFn) : ptr(ptr), freeFn(std::move(freeFn)) {}
 };
 struct Arena {
    static constexpr size_t thresholdDirectAlloc = 16 * 1024; // 16 KiB
@@ -25,6 +33,12 @@ struct Arena {
    size_t remainingBytes = 0;
    // pointer to still free space in current chunk
    uint8_t* currentChunkStart = nullptr;
+
+   struct Checkpoint {
+      size_t numAllocations = 0;
+      size_t remainingBytes = 0;
+      uint8_t* currentChunkStart = nullptr;
+   };
 
    uint8_t* alloc(size_t bytes) {
       //case 1: bytes are larger than threshold, allocate directly
@@ -48,6 +62,19 @@ struct Arena {
       }
    }
 
+   Checkpoint checkpoint() const {
+      return {allocations.size(), remainingBytes, currentChunkStart};
+   }
+
+   void rollbackTo(Checkpoint checkpoint) {
+      while (allocations.size() > checkpoint.numAllocations) {
+         free(allocations.back());
+         allocations.pop_back();
+      }
+      remainingBytes = checkpoint.remainingBytes;
+      currentChunkStart = checkpoint.currentChunkStart;
+   }
+
    ~Arena() {
       for (auto& alloc : allocations) {
          free(alloc);
@@ -65,6 +92,13 @@ class ExecutionContext {
    /// Keys registered via `putCachedState` while this context was current; removed in `~ExecutionContext`
    /// so the global cache does not retain pointers into freed `registerState` storage.
    std::vector<uint64_t> cachedStateKeys;
+   struct MemoryCheckpoint {
+      std::vector<size_t> perWorkerStateSizes;
+      std::vector<Arena::Checkpoint> stringArenaCheckpoints;
+      std::vector<std::unordered_map<size_t, State>> allocatorStates;
+   };
+   MemoryCheckpoint permanentMemoryCheckpoint;
+   bool hasPermanentMemoryCheckpoint = false;
 
    public:
    ExecutionContext(Session& session) : session(session) {
@@ -106,6 +140,8 @@ class ExecutionContext {
    /// Clears the experimental cross-query `cache_put` / `cache_get` map (not scoped to a single
    /// `ExecutionContext`). Call when cached pointers are no longer valid (e.g. end of a tool run).
    static void clearAllCachedStates();
+   void markPermanentMemoryCheckpoint();
+   void flushTransientMemory();
    void registerState(const State& s) {
       perWorkerStates[lingodb::scheduler::currentWorkerId()].push_back(s);
    }
