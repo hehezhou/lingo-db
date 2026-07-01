@@ -11,6 +11,7 @@
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1196,6 +1197,10 @@ static uint64_t hashType(mlir::Type t) {
    t.print(ss);
    ss.flush();
    return static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(s)));
+}
+
+static uint64_t hashStableString(llvm::StringRef s) {
+   return static_cast<uint64_t>(llvm::hash_value(s));
 }
 
 static uint64_t hashOpName(mlir::Operation& op) {
@@ -3021,6 +3026,257 @@ static std::string columnRefSemanticFingerprint(
    return out;
 }
 
+static mlir::Value stripCastLikeForAggregateMatch(mlir::Value v) {
+   for (;;) {
+      mlir::Operation* def = v.getDefiningOp();
+      if (!def) return v;
+      llvm::StringRef name = def->getName().getStringRef();
+      if ((name == "db.cast" || name == "arith.extsi" || name == "arith.extui") &&
+          def->getNumOperands() == 1 && def->getNumResults() == 1) {
+         v = def->getOperand(0);
+         continue;
+      }
+      return v;
+   }
+}
+
+static bool aggregateMatchExprContainsValue(mlir::Value root, mlir::Value needle,
+                                            llvm::DenseSet<void*>& seen) {
+   root = stripCastLikeForAggregateMatch(root);
+   if (root == needle) return true;
+   if (!seen.insert(root.getAsOpaquePointer()).second) return false;
+   mlir::Operation* def = root.getDefiningOp();
+   if (!def) return false;
+   for (mlir::Value operand : def->getOperands()) {
+      if (aggregateMatchExprContainsValue(operand, needle, seen)) return true;
+   }
+   return false;
+}
+
+static bool aggregateMatchExprContainsValue(mlir::Value root, mlir::Value needle) {
+   llvm::DenseSet<void*> seen;
+   return aggregateMatchExprContainsValue(root, needle, seen);
+}
+
+static std::optional<unsigned> findAggregateMatchInputArgIndex(mlir::Value root, mlir::Block& block,
+                                                               unsigned numCols, llvm::DenseSet<void*>& seen) {
+   root = stripCastLikeForAggregateMatch(root);
+   if (!seen.insert(root.getAsOpaquePointer()).second) return std::nullopt;
+   if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(root)) {
+      if (barg.getOwner() == &block && barg.getArgNumber() < numCols) return barg.getArgNumber();
+      return std::nullopt;
+   }
+   mlir::Operation* def = root.getDefiningOp();
+   if (!def) return std::nullopt;
+   for (mlir::Value operand : def->getOperands()) {
+      if (auto idx = findAggregateMatchInputArgIndex(operand, block, numCols, seen)) return idx;
+   }
+   return std::nullopt;
+}
+
+static std::optional<unsigned> findAggregateMatchInputArgIndex(mlir::Value root, mlir::Block& block,
+                                                               unsigned numCols) {
+   llvm::DenseSet<void*> seen;
+   return findAggregateMatchInputArgIndex(root, block, numCols, seen);
+}
+
+enum class AggregateMatchPayloadKind { Identity, Count, Sum, Min, Max, Payload, Unsupported };
+
+static std::optional<AggregateMatchPayloadKind>
+classifyAggregateMatchMinMaxSelect(mlir::Value returned, mlir::Value current, mlir::Value input) {
+   auto select = mlir::dyn_cast_or_null<mlir::arith::SelectOp>(returned.getDefiningOp());
+   if (!select) return std::nullopt;
+   auto cmp = mlir::dyn_cast_or_null<db::CmpOp>(
+      stripCastLikeForAggregateMatch(select.getCondition()).getDefiningOp());
+   if (!cmp) return std::nullopt;
+
+   mlir::Value trueValue = stripCastLikeForAggregateMatch(select.getTrueValue());
+   mlir::Value falseValue = stripCastLikeForAggregateMatch(select.getFalseValue());
+   mlir::Value lhs = stripCastLikeForAggregateMatch(cmp.getLeft());
+   mlir::Value rhs = stripCastLikeForAggregateMatch(cmp.getRight());
+   bool trueIsInput = trueValue == input;
+   bool falseIsCurrent = falseValue == current;
+   bool trueIsCurrent = trueValue == current;
+   bool falseIsInput = falseValue == input;
+   if (!((trueIsInput && falseIsCurrent) || (trueIsCurrent && falseIsInput))) return std::nullopt;
+
+   enum class CmpShape { CurrentLessInput, CurrentGreaterInput, InputLessCurrent, InputGreaterCurrent };
+   std::optional<CmpShape> shape;
+   using P = db::DBCmpPredicate;
+   if (lhs == current && rhs == input) {
+      if (cmp.getPredicate() == P::lt || cmp.getPredicate() == P::lte) shape = CmpShape::CurrentLessInput;
+      if (cmp.getPredicate() == P::gt || cmp.getPredicate() == P::gte) shape = CmpShape::CurrentGreaterInput;
+   } else if (lhs == input && rhs == current) {
+      if (cmp.getPredicate() == P::lt || cmp.getPredicate() == P::lte) shape = CmpShape::InputLessCurrent;
+      if (cmp.getPredicate() == P::gt || cmp.getPredicate() == P::gte) shape = CmpShape::InputGreaterCurrent;
+   }
+   if (!shape) return std::nullopt;
+
+   if (trueIsInput) {
+      if (*shape == CmpShape::CurrentGreaterInput || *shape == CmpShape::InputLessCurrent)
+         return AggregateMatchPayloadKind::Min;
+      if (*shape == CmpShape::CurrentLessInput || *shape == CmpShape::InputGreaterCurrent)
+         return AggregateMatchPayloadKind::Max;
+   } else {
+      if (*shape == CmpShape::CurrentLessInput || *shape == CmpShape::InputGreaterCurrent)
+         return AggregateMatchPayloadKind::Min;
+      if (*shape == CmpShape::CurrentGreaterInput || *shape == CmpShape::InputLessCurrent)
+         return AggregateMatchPayloadKind::Max;
+   }
+   return std::nullopt;
+}
+
+static AggregateMatchPayloadKind classifyAggregateMatchPayloadReturn(subop::ReduceOp reduce, unsigned memberIdx) {
+   assert(!reduce.getRegion().empty() && "aggregate reduce must have update region");
+   mlir::Block& block = reduce.getRegion().front();
+   auto ret = mlir::cast<tuples::ReturnOp>(block.getTerminator());
+   assert(memberIdx < ret.getNumOperands() && "reduce return must align with member list");
+   const unsigned numCols = reduce.getColumns().size();
+   mlir::Value current = block.getArgument(numCols + memberIdx);
+   mlir::Value returned = stripCastLikeForAggregateMatch(ret.getOperand(memberIdx));
+   if (returned == current) return AggregateMatchPayloadKind::Identity;
+
+   if (auto* def = returned.getDefiningOp()) {
+      if (def->getName().getStringRef() == "db.add" && def->getNumOperands() == 2) {
+         mlir::Value lhs = stripCastLikeForAggregateMatch(def->getOperand(0));
+         mlir::Value rhs = stripCastLikeForAggregateMatch(def->getOperand(1));
+         mlir::Value payload = {};
+         if (lhs == current) payload = rhs;
+         if (rhs == current) payload = lhs;
+         if (payload) {
+            if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(payload)) {
+               if (barg.getOwner() == &block && barg.getArgNumber() < numCols)
+                  return AggregateMatchPayloadKind::Sum;
+            }
+            if (payload.getDefiningOp() && payload.getDefiningOp()->getName().getStringRef() == "db.constant")
+               return AggregateMatchPayloadKind::Count;
+         }
+      }
+   }
+
+   if (auto inputIdx = findAggregateMatchInputArgIndex(returned, block, numCols)) {
+      mlir::Value input = block.getArgument(*inputIdx);
+      if (aggregateMatchExprContainsValue(returned, current)) {
+         if (auto kind = classifyAggregateMatchMinMaxSelect(returned, current, input)) return *kind;
+         return AggregateMatchPayloadKind::Unsupported;
+      }
+      return AggregateMatchPayloadKind::Payload;
+   }
+   return AggregateMatchPayloadKind::Unsupported;
+}
+
+static uint64_t hashPrintedMlirAttribute(mlir::Attribute attr) {
+   if (!attr) return 0;
+   std::string s;
+   llvm::raw_string_ostream os(s);
+   attr.print(os);
+   return hashStableString(os.str());
+}
+
+static uint64_t hashPrintedAttrDictSorted(mlir::Operation& op) {
+   llvm::SmallVector<mlir::NamedAttribute, 16> attrs(op.getAttrs().begin(), op.getAttrs().end());
+   llvm::sort(attrs, [](auto a, auto b) { return a.getName().strref() < b.getName().strref(); });
+   uint64_t h = 0;
+   for (mlir::NamedAttribute attr : attrs) {
+      h = hashCombineU64(h, hashStableString(attr.getName().strref().str()));
+      h = hashCombineU64(h, hashPrintedMlirAttribute(attr.getValue()));
+   }
+   return h;
+}
+
+static uint64_t hashAggregateUnsupportedPayloadValue(mlir::Value v, mlir::Block& block, unsigned numCols,
+                                                    mlir::ArrayAttr reduceColumns,
+                                                    tuples::ColumnManager& columnManager,
+                                                    llvm::DenseMap<void*, uint64_t>& memo) {
+   v = stripCastLikeForAggregateMatch(v);
+   if (auto it = memo.find(v.getAsOpaquePointer()); it != memo.end()) return it->second;
+   uint64_t h = hashStableString("aggregate_unsupported_value");
+   memo[v.getAsOpaquePointer()] = h;
+
+   if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+      h = hashCombineU64(h, hashStableString("block_arg"));
+      h = hashCombineU64(h, barg.getArgNumber());
+      if (barg.getOwner() == &block && barg.getArgNumber() < numCols) {
+         auto col = mlir::cast<tuples::ColumnRefAttr>(reduceColumns[barg.getArgNumber()]);
+         h = hashCombineU64(h, hashStableString(columnRefSemanticFingerprint(col, columnManager)));
+      }
+      h = hashCombineU64(h, hashType(v.getType()));
+      memo[v.getAsOpaquePointer()] = h;
+      return h;
+   }
+
+   mlir::Operation* def = v.getDefiningOp();
+   if (!def) {
+      h = hashCombineU64(h, hashStableString("external"));
+      h = hashCombineU64(h, hashType(v.getType()));
+      memo[v.getAsOpaquePointer()] = h;
+      return h;
+   }
+   h = hashCombineU64(h, hashOpName(*def));
+   h = hashCombineU64(h, hashPrintedAttrDictSorted(*def));
+   h = hashCombineU64(h, hashPrintedMlirAttribute(def->getPropertiesAsAttribute()));
+   for (mlir::Type t : def->getResultTypes()) h = hashCombineU64(h, hashType(t));
+   for (mlir::Value operand : def->getOperands())
+      h = hashCombineU64(h, hashAggregateUnsupportedPayloadValue(operand, block, numCols, reduceColumns,
+                                                                 columnManager, memo));
+   memo[v.getAsOpaquePointer()] = h;
+   return h;
+}
+
+static std::string aggregateUnsupportedPayloadFingerprint(mlir::Value aggregateState, const ModuleReuseInfo& reuse,
+                                                         tuples::ColumnManager& columnManager) {
+   auto ht = mlir::cast<subop::PreAggrHtType>(aggregateState.getType());
+   auto fragTy = fragmentTypeForAggregateHt(ht);
+   llvm::SmallVector<mlir::Value, 4> buildStates;
+   buildStates.push_back(canonicalizeStateValueDeep(aggregateState));
+   forEachShadowChainPredecessorValue(canonicalizeStateValueDeep(aggregateState), reuse.mergedFromShadowState,
+                                      [&](mlir::Value shadow) {
+                                         buildStates.push_back(canonicalizeStateValueDeep(shadow));
+                                      });
+
+   llvm::SmallVector<uint64_t, 8> unsupported;
+   for (mlir::Value s : buildStates) {
+      auto it = reuse.writerStepsByState.find(canonicalizeStateValueDeep(s));
+      if (it == reuse.writerStepsByState.end()) continue;
+      for (subop::ExecutionStepOp step : it->second) {
+         step.walk([&](subop::ReduceOp reduce) {
+            bool targetsAggregate = false;
+            step.walk([&](subop::LookupOrInsertOp lookup) {
+               if (lookupOrInsertTargetsAggregateFragment(lookup, fragTy)) targetsAggregate = true;
+            });
+            if (!targetsAggregate) return mlir::WalkResult::advance();
+            mlir::Block& block = reduce.getRegion().front();
+            auto ret = mlir::cast<tuples::ReturnOp>(block.getTerminator());
+            const unsigned numCols = reduce.getColumns().size();
+            for (unsigned i = 0; i < reduce.getMembers().size(); ++i) {
+               if (classifyAggregateMatchPayloadReturn(reduce, i) != AggregateMatchPayloadKind::Unsupported)
+                  continue;
+               llvm::DenseMap<void*, uint64_t> memo;
+               uint64_t h = hashStableString("unsupported_aggregate_payload");
+               auto member = mlir::cast<subop::MemberAttr>(reduce.getMembers()[i]).getMember();
+               h = hashCombineU64(h, hashStableString(typeFingerprint(ht.getContext()
+                                                                    ->getLoadedDialect<subop::SubOperatorDialect>()
+                                                                    ->getMemberManager()
+                                                                    .getType(member))));
+               h = hashCombineU64(h, hashAggregateUnsupportedPayloadValue(
+                                         ret.getOperand(i), block, numCols, reduce.getColumns(), columnManager, memo));
+               unsupported.push_back(h);
+            }
+            return mlir::WalkResult::advance();
+         });
+      }
+   }
+   if (unsupported.empty()) return {};
+   llvm::sort(unsupported);
+   std::string out = "unsupported_payloads=[";
+   for (size_t i = 0; i < unsupported.size(); ++i) {
+      if (i) out.push_back(',');
+      out.append(std::to_string(unsupported[i]));
+   }
+   out.push_back(']');
+   return out;
+}
+
 static std::string aggregateGroupKeyFingerprint(
    mlir::Value aggregateState, const ModuleReuseInfo& reuse, subop::MemberManager& memberManager,
    lingodb::compiler::dialect::tuples::ColumnManager& columnManager) {
@@ -3060,6 +3316,11 @@ static std::string aggregateGroupKeyFingerprint(
    out.append(fingerprintMemberTypesMultiset(memberManager, ht.getKeyMembers().getMembers()));
    out.append(",lock=");
    out.append(ht.getWithLock() ? "1" : "0");
+   std::string unsupportedPayloads = aggregateUnsupportedPayloadFingerprint(aggregateState, reuse, columnManager);
+   if (!unsupportedPayloads.empty()) {
+      out.append(",payload=");
+      out.append(unsupportedPayloads);
+   }
    out.push_back('}');
    return out;
 }

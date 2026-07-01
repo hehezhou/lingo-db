@@ -196,6 +196,78 @@ static uint64_t hashPayloadType(mlir::Type type) {
    return hashPayloadString(os.str());
 }
 
+static uint64_t hashAggregateOpaqueCombine(uint64_t a, uint64_t b) {
+   return static_cast<uint64_t>(llvm::hash_combine(a, b));
+}
+
+static uint64_t hashAggregateOpaqueAttribute(mlir::Attribute attr) {
+   if (!attr) return 0;
+   std::string s;
+   llvm::raw_string_ostream os(s);
+   attr.print(os);
+   return hashPayloadString(os.str());
+}
+
+static uint64_t hashAggregateOpaqueAttrDictSorted(mlir::Operation& op) {
+   llvm::SmallVector<mlir::NamedAttribute, 16> attrs(op.getAttrs().begin(), op.getAttrs().end());
+   llvm::sort(attrs, [](auto a, auto b) { return a.getName().strref() < b.getName().strref(); });
+   uint64_t h = 0;
+   for (mlir::NamedAttribute attr : attrs) {
+      h = hashAggregateOpaqueCombine(h, hashPayloadString(attr.getName().strref()));
+      h = hashAggregateOpaqueCombine(h, hashAggregateOpaqueAttribute(attr.getValue()));
+   }
+   return h;
+}
+
+static std::string sanitizeAggregateOpaqueBaseName(llvm::StringRef name) {
+   auto dollar = name.find('$');
+   llvm::StringRef base = name;
+   if (dollar != llvm::StringRef::npos) base = name.substr(0, dollar);
+   auto pos = base.rfind("_u_");
+   if (pos == llvm::StringRef::npos) return base.str();
+   llvm::StringRef tail = base.substr(pos + 3);
+   if (tail.empty()) return base.str();
+   for (char c : tail)
+      if (c < '0' || c > '9') return base.str();
+   return base.substr(0, pos).str();
+}
+
+static std::string normalizeAggregateOpaqueGeneratedName(llvm::StringRef name) {
+   std::string base = sanitizeAggregateOpaqueBaseName(name);
+   size_t underscore = base.rfind('_');
+   if (underscore == std::string::npos || underscore + 1 >= base.size()) return base;
+   for (char c : llvm::StringRef(base).drop_front(underscore + 1))
+      if (c < '0' || c > '9') return base;
+   return base.substr(0, underscore);
+}
+
+static std::string sanitizeAggregateOpaqueScopeName(llvm::StringRef scope) {
+   auto pos = scope.rfind("_u_");
+   if (pos == llvm::StringRef::npos) return scope.str();
+   llvm::StringRef tail = scope.substr(pos + 3);
+   if (tail.empty()) return scope.str();
+   for (char c : tail)
+      if (c < '0' || c > '9') return scope.str();
+   return scope.substr(0, pos).str();
+}
+
+static std::string aggregateOpaqueTypeFingerprint(mlir::Type type) {
+   std::string out;
+   llvm::raw_string_ostream os(out);
+   type.print(os);
+   return os.str();
+}
+
+static std::string aggregateOpaqueColumnFingerprint(tuples::ColumnRefAttr col, tuples::ColumnManager& cm) {
+   auto [scope, leaf] = cm.getName(&col.getColumn());
+   std::string out = sanitizeAggregateOpaqueScopeName(scope);
+   out.push_back('.');
+   out.append(normalizeAggregateOpaqueGeneratedName(leaf));
+   out.push_back(':');
+   out.append(aggregateOpaqueTypeFingerprint(col.getColumn().type));
+   return out;
+}
+
 static uint64_t payloadSyntheticColumnHash(llvm::StringRef scope, llvm::StringRef leaf, mlir::Type colType) {
    uint64_t h = hashPayloadString("payload_synthetic_column");
    h = combinePayloadHash(h, hashPayloadString(scope));
@@ -5748,6 +5820,60 @@ static std::optional<unsigned> findAggregateInputArgIndex(mlir::Value root, mlir
    return findAggregateInputArgIndex(root, block, numCols, seen);
 }
 
+static uint64_t hashAggregateUnsupportedPayloadValue(mlir::Value v, mlir::Block& block, unsigned numCols,
+                                                    mlir::ArrayAttr reduceColumns,
+                                                    tuples::ColumnManager& cm,
+                                                    llvm::DenseMap<void*, uint64_t>& memo) {
+   v = stripCastLikeForAggregateSemantic(v);
+   if (auto it = memo.find(v.getAsOpaquePointer()); it != memo.end()) return it->second;
+   uint64_t h = hashPayloadString("aggregate_unsupported_value");
+   memo[v.getAsOpaquePointer()] = h;
+
+   if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+      h = hashAggregateOpaqueCombine(h, hashPayloadString("block_arg"));
+      h = hashAggregateOpaqueCombine(h, barg.getArgNumber());
+      if (barg.getOwner() == &block && barg.getArgNumber() < numCols) {
+         auto col = mlir::cast<tuples::ColumnRefAttr>(reduceColumns[barg.getArgNumber()]);
+         h = hashAggregateOpaqueCombine(h, hashPayloadString(aggregateOpaqueColumnFingerprint(col, cm)));
+      }
+      h = hashAggregateOpaqueCombine(h, hashPayloadType(v.getType()));
+      memo[v.getAsOpaquePointer()] = h;
+      return h;
+   }
+
+   mlir::Operation* def = v.getDefiningOp();
+   if (!def) {
+      h = hashAggregateOpaqueCombine(h, hashPayloadString("external"));
+      h = hashAggregateOpaqueCombine(h, hashPayloadType(v.getType()));
+      memo[v.getAsOpaquePointer()] = h;
+      return h;
+   }
+   h = hashAggregateOpaqueCombine(h, hashPayloadString(def->getName().getStringRef()));
+   h = hashAggregateOpaqueCombine(h, hashAggregateOpaqueAttrDictSorted(*def));
+   h = hashAggregateOpaqueCombine(h, hashAggregateOpaqueAttribute(def->getPropertiesAsAttribute()));
+   for (mlir::Type t : def->getResultTypes()) h = hashAggregateOpaqueCombine(h, hashPayloadType(t));
+   for (mlir::Value operand : def->getOperands())
+      h = hashAggregateOpaqueCombine(h, hashAggregateUnsupportedPayloadValue(operand, block, numCols,
+                                                                             reduceColumns, cm, memo));
+   memo[v.getAsOpaquePointer()] = h;
+   return h;
+}
+
+static std::string unsupportedAggregatePayloadSemanticKey(subop::ReduceOp reduce, unsigned memberIdx,
+                                                          tuples::ColumnManager& cm) {
+   mlir::Block& block = reduce.getRegion().front();
+   auto ret = mlir::cast<tuples::ReturnOp>(block.getTerminator());
+   const unsigned numCols = reduce.getColumns().size();
+   llvm::DenseMap<void*, uint64_t> memo;
+   uint64_t h = hashPayloadString("unsupported_aggregate_payload");
+   auto member = mlir::cast<subop::MemberAttr>(reduce.getMembers()[memberIdx]).getMember();
+   auto& mm = reduce->getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
+   h = hashAggregateOpaqueCombine(h, hashPayloadString(aggregateOpaqueTypeFingerprint(mm.getType(member))));
+   h = hashAggregateOpaqueCombine(h, hashAggregateUnsupportedPayloadValue(ret.getOperand(memberIdx), block,
+                                                                          numCols, reduce.getColumns(), cm, memo));
+   return "unsupported:" + std::to_string(h);
+}
+
 enum class AggregatePayloadKind { Identity, Count, Sum, Min, Max, Payload };
 
 static AggregatePayloadKind aggregatePayloadKindForSemantic(llvm::StringRef semanticKey) {
@@ -5756,6 +5882,7 @@ static AggregatePayloadKind aggregatePayloadKindForSemantic(llvm::StringRef sema
    if (semanticKey.starts_with("sum:")) return AggregatePayloadKind::Sum;
    if (semanticKey.starts_with("min:")) return AggregatePayloadKind::Min;
    if (semanticKey.starts_with("max:")) return AggregatePayloadKind::Max;
+   if (semanticKey.starts_with("unsupported:")) return AggregatePayloadKind::Payload;
    return AggregatePayloadKind::Payload;
 }
 
@@ -5842,11 +5969,11 @@ static std::string aggregatePayloadSemanticKeyForReturn(subop::ReduceOp reduce, 
             if (*kind == AggregatePayloadKind::Min) return "min:" + aggregateColumnSemanticKey(col, cm);
             if (*kind == AggregatePayloadKind::Max) return "max:" + aggregateColumnSemanticKey(col, cm);
          }
-         abortAggregateUnionUnsupported("unsupported aggregate payload update expression using current value");
+         return unsupportedAggregatePayloadSemanticKey(reduce, memberIdx, cm);
       }
       return aggregateColumnSemanticKey(col, cm);
    }
-   llvm_unreachable("aggregate union: unsupported reduce payload update expression");
+   return unsupportedAggregatePayloadSemanticKey(reduce, memberIdx, cm);
 }
 
 static subop::PreAggrHtFragmentType fragmentTypeForAggregateHt(subop::PreAggrHtType ht) {
@@ -5883,6 +6010,12 @@ static uint64_t aggregatePayloadHashForInfo(llvm::StringRef semanticKey,
                                             const llvm::DenseMap<const void*, uint64_t>& columnHashes) {
    if (semanticKey == "count:*") return payloadSyntheticColumnHash("aggregate", "count", payloadType);
    if (semanticKey == "identity") return payloadSyntheticColumnHash("aggregate", "identity", payloadType);
+   if (semanticKey.starts_with("unsupported:")) {
+      uint64_t h = hashPayloadString("aggregate_payload");
+      h = combinePayloadHash(h, hashPayloadString("unsupported"));
+      h = combinePayloadHash(h, hashPayloadString(semanticKey));
+      return combinePayloadHash(h, hashPayloadType(payloadType));
+   }
 
    llvm::StringRef kind = "payload";
    if (semanticKey.consume_front("sum:")) kind = "sum";
@@ -5977,7 +6110,8 @@ collectAggregatePayloadMembers(mlir::ModuleOp module, mlir::Value aggregateState
          auto member = mlir::cast<subop::MemberAttr>(reduceOp.getMembers()[i]).getMember();
          tuples::ColumnRefAttr sourceColumn;
          std::string semanticKey = aggregatePayloadSemanticKeyForReturn(reduceOp, i, cm);
-         if (semanticKey != "count:*" && semanticKey != "identity") {
+         if (semanticKey != "count:*" && semanticKey != "identity" &&
+             !llvm::StringRef(semanticKey).starts_with("unsupported:")) {
             sourceColumn = resolveAggregatePayloadSourceColumn(reduceOp, i);
          }
          recordMember(member, std::move(semanticKey), sourceColumn);
@@ -7083,6 +7217,8 @@ static void applySyntheticAggregatePayloadUnion(mlir::ModuleOp synthetic, mlir::
          const auto& p = peerInfos[peerIdx];
          if (producerIndex.containsEquivalentPayload(p)) continue;
          if (p.semanticKey == "count:*") continue;
+         assert(!llvm::StringRef(p.semanticKey).starts_with("unsupported:") &&
+                "unsupported aggregate payload must be present in producer when aggregate match hash aligns");
          tuples::ColumnRefAttr source = cloneColumnRefToContext(p.sourceColumn, ctx);
          auto sourceProducerMap = findMapProducingColumn(buildStep, source, cm);
          if (sourceProducerMap) {
