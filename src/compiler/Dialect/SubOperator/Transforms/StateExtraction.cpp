@@ -4215,6 +4215,7 @@ static bool determineStateReuseEligibility(
           "carrier states are reuse targets only for scan_refs-only buffers");
    assert(!module.writesByState.lookup(stateCanon).empty() &&
           "reuse candidate must be constructed in at least one execution_step");
+   if (mlir::isa<subop::HeapType>(stateCanon.getType())) return false;
 
    outDep = evaluateStateDepEligibility(stateCanon, depGraph, module.transparentStates, tableDescrByTableState);
    if (!outDep.eligible) return false;
