@@ -59,6 +59,7 @@ static std::string normalizeMappingMemberName(llvm::StringRef name) {
 struct StateReuseMatchOptions {
    bool disableHivDisjointClustering = false;
    bool disableAggregateDisjointClustering = false;
+   bool allowAggregateUnionRewrite = false;
 };
 
 static StateReuseMatchOptions readStateReuseMatchOptions() {
@@ -67,6 +68,8 @@ static StateReuseMatchOptions readStateReuseMatchOptions() {
       std::getenv("LINGODB_DISABLE_HIV_DISJOINT_CLUSTERING") != nullptr;
    options.disableAggregateDisjointClustering =
       std::getenv("LINGODB_DISABLE_AGGREGATE_DISJOINT_CLUSTERING") != nullptr;
+   options.allowAggregateUnionRewrite =
+      std::getenv("LINGODB_ALLOW_AGGREGATE_UNION_REWRITE") != nullptr;
    return options;
 }
 
@@ -533,8 +536,11 @@ static StateDependencyGraph buildStateDependencyGraphFromStepRw(
       writes.reserve(stepIt.second.size());
       for (auto& kv : stepIt.second) {
          dag.predecessors.try_emplace(kv.first);
-         if (kv.second.read) reads.push_back(kv.first);
-         if (kv.second.write) writes.push_back(kv.first);
+         if (kv.second.write) {
+            writes.push_back(kv.first);
+         } else if (kv.second.read) {
+            reads.push_back(kv.first);
+         }
       }
       for (mlir::Value w : writes) {
          for (mlir::Value r : reads) {
@@ -878,6 +884,7 @@ static void appendSameStepRwDirectPrereqs(
       }
       if (!writesSelf) continue;
       for (auto& kv : itRw->second) {
+         if (kv.second.write) continue;
          if (!kv.second.read) continue;
          if (kv.first == selfCanon) continue;
          if (seen.insert(kv.first).second) out.push_back(kv.first);
@@ -6599,7 +6606,8 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
          },
          peerOk, aggregateNoFilterMatchKey, enableFilterPredReuse, forceSplitMaterialize);
    };
-   if (!matchOptions.disableAggregateDisjointClustering) {
+   if (matchOptions.allowAggregateUnionRewrite &&
+       !matchOptions.disableAggregateDisjointClustering) {
       appendAggregateNoFilterGroups(
          [&](const StateMatchProfile& a, const StateMatchProfile& b) {
             return profilesAllowAggregateDisjointFilterReuse(a, b, modelByQueryId,
@@ -6614,24 +6622,26 @@ collectCrossQueryStateMatchGroups(llvm::ArrayRef<std::pair<int, mlir::ModuleOp>>
       },
       /*enableFilterPredReuse=*/false, /*forceSplitMaterialize=*/true);
 
-   StateMatchProfileBucketSet aggregateProfilesByMatchHash = buildProfileBuckets(
-      all,
-      [](const StateMatchProfile& p) {
-         if (!profileCanUseAggregateRewriteBucket(p)) return false;
-         assert(!p.aggregateGroupKeyFingerprint.empty() &&
-                "eligible aggregate profile must carry group-key fingerprint");
-         return true;
-      },
-      aggregateMatchKey);
-   appendGroupsFromBucketSet(
-      aggregateProfilesByMatchHash,
-      [&](const StateMatchProfile& p) {
-         return profileCanUseAggregateRewriteBucket(p);
-      },
-      [&](const StateMatchProfile& a, const StateMatchProfile& b) {
-         return profilesAllowAggregateExactReuse(a, b, mixedPredFingerprintForProfile);
-      },
-      aggregateMatchKey, /*enableFilterPredReuse=*/false);
+   if (matchOptions.allowAggregateUnionRewrite) {
+      StateMatchProfileBucketSet aggregateProfilesByMatchHash = buildProfileBuckets(
+         all,
+         [](const StateMatchProfile& p) {
+            if (!profileCanUseAggregateRewriteBucket(p)) return false;
+            assert(!p.aggregateGroupKeyFingerprint.empty() &&
+                   "eligible aggregate profile must carry group-key fingerprint");
+            return true;
+         },
+         aggregateMatchKey);
+      appendGroupsFromBucketSet(
+         aggregateProfilesByMatchHash,
+         [&](const StateMatchProfile& p) {
+            return profileCanUseAggregateRewriteBucket(p);
+         },
+         [&](const StateMatchProfile& a, const StateMatchProfile& b) {
+            return profilesAllowAggregateExactReuse(a, b, mixedPredFingerprintForProfile);
+         },
+         aggregateMatchKey, /*enableFilterPredReuse=*/false);
+   }
 
    appendGroupsFromBucketSet(
       splitMaterializeProfilesByRelaxedHash,

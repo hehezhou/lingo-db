@@ -1371,8 +1371,8 @@ int main(int argc, char** argv) {
    }
 
    // Usage:
-   // - subop-state-reuse <db_dir> <sql_or_json>
-   // - subop-state-reuse <db_dir> <sql_file_a> <sql_file_b> [sql_file_c ...]
+   // - subop-state-reuse [--no-reuse-rewrite] <db_dir> <sql_or_json>
+   // - subop-state-reuse [--no-reuse-rewrite] <db_dir> <sql_file_a> <sql_file_b> [sql_file_c ...]
    assert(positionalArgs.size() >= 3);
    std::string dbDir = positionalArgs[1];
 
