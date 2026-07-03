@@ -620,10 +620,11 @@ static std::string stringifyTypeForAnalysis(mlir::Type type) {
 }
 
 static lingodb::compiler::dialect::subop::BatchReuseStateGroupInfo summarizeMatchGroupForAnalysis(
-   const lingodb::compiler::dialect::subop::CrossQueryStateMatchGroup& group) {
+   const lingodb::compiler::dialect::subop::CrossQueryStateMatchGroup& group,
+   unsigned rewriteIteration) {
    lingodb::compiler::dialect::subop::BatchReuseStateGroupInfo info;
    info.cacheKey = group.cacheKey;
-   info.rewriteIteration = 1;
+   info.rewriteIteration = rewriteIteration;
    info.enableFilterPredReuse = group.enableFilterPredReuse;
    info.requiresJoinLayoutUnion = group.requiresJoinLayoutUnion;
    info.requiresBufferScanRefsUnion = group.requiresBufferScanRefsUnion;
@@ -640,10 +641,11 @@ static lingodb::compiler::dialect::subop::BatchReuseStateGroupInfo summarizeMatc
 
 static llvm::SmallVector<lingodb::compiler::dialect::subop::BatchReuseStateGroupInfo, 64>
 summarizeMatchGroupsForAnalysis(
-   llvm::ArrayRef<lingodb::compiler::dialect::subop::CrossQueryStateMatchGroup> groups) {
+   llvm::ArrayRef<lingodb::compiler::dialect::subop::CrossQueryStateMatchGroup> groups,
+   unsigned rewriteIteration = 1) {
    llvm::SmallVector<lingodb::compiler::dialect::subop::BatchReuseStateGroupInfo, 64> out;
    for (const auto& group : groups) {
-      auto info = summarizeMatchGroupForAnalysis(group);
+      auto info = summarizeMatchGroupForAnalysis(group, rewriteIteration);
       if (info.queries.size() >= 2) out.push_back(std::move(info));
    }
    return out;
@@ -727,7 +729,26 @@ static SubOpStateReuseBatchResult runSubOpStateReuseBatch(
 
    if (opts.analysisOnly) {
       resizeBatchCounters(result, runs.size());
-      result.reuseStateGroups = summarizeMatchGroupsForAnalysis(groups);
+      unsigned analysisIteration = opts.reuseMaxIterations == 0 ? 1 : opts.reuseMaxIterations;
+      if (analysisIteration > 1) {
+         auto tRewrite = std::chrono::high_resolution_clock::now();
+         llvm::SmallVector<mlir::ModuleOp, 8> modules;
+         for (auto& r : runs) modules.push_back(r.module);
+         lingodb::compiler::dialect::subop::BatchReuseRewriteOptions rewriteOptions;
+         rewriteOptions.maxIterations = analysisIteration - 1;
+         (void)lingodb::compiler::dialect::subop::rewritePlansWithSyntheticQueryBatch(
+            modules, groups, catalog, rewriteOptions);
+         result.rewriteMs = millisSince(tRewrite);
+         result.optimizationMs += result.rewriteMs;
+
+         qmods.clear();
+         qmods.reserve(runs.size());
+         for (size_t i = 0; i < runs.size(); i++) {
+            qmods.push_back({static_cast<int>(i), runs[i].module});
+         }
+         groups = lingodb::compiler::dialect::subop::collectCrossQueryStateMatchGroups(qmods);
+      }
+      result.reuseStateGroups = summarizeMatchGroupsForAnalysis(groups, analysisIteration);
       llvm::outs() << "\n// reuse_analysis_only: groups=" << result.reuseStateGroups.size()
                    << " execution_time_ms=0 (skipped)\n";
       return result;
