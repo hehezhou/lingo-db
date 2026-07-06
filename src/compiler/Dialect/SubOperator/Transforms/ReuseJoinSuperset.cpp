@@ -9008,6 +9008,7 @@ void extendSyntheticJoinBuffersToColumnUnionForGroups(
       auto itG = groupByKey.find(t.cacheKey);
       if (itG == groupByKey.end()) continue;
       const CrossQueryStateMatchGroup& group = *itG->second;
+      if (group.requiresSplitMaterialize) continue;
       if (!group.requiresJoinLayoutUnion) continue;
       if (!asHashIndexedViewLayoutType(t.state.getType())) continue;
 

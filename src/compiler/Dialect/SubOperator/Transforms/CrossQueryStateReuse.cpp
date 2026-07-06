@@ -2651,18 +2651,56 @@ static subop::ColumnRefMemberMappingAttr remapResultMaterializeMappingToTargetLa
    subop::ColumnRefMemberMappingAttr sourceMapping,
    mlir::Type targetStateType,
    const llvm::StringMap<tuples::ColumnRefAttr>& colByName) {
+   auto& mm = ctx->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
    llvm::SmallVector<subop::Member> targetMembers = stateMembersForType(targetStateType);
    assert(!targetMembers.empty() && "split-materialize target must have members");
    assert(sourceMapping.getMapping().size() == targetMembers.size() &&
           "split-materialize branch result layout must align by ordinal with donor mapping");
-   llvm::SmallVector<subop::RefMappingPairT> pairs;
-   unsigned ordinal = 0;
-   for (auto& [member, colRef] : sourceMapping.getMapping()) {
-      (void)member;
+
+   auto genericMemberOrdinal = [](llvm::StringRef name) -> std::optional<unsigned> {
+      if (!name.consume_front("member$")) return std::nullopt;
+      unsigned ordinal = 0;
+      if (name.empty() || name.getAsInteger(10, ordinal)) return std::nullopt;
+      return ordinal;
+   };
+   auto remapColumnToBranchStream = [&](tuples::ColumnRefAttr colRef) -> tuples::ColumnRefAttr {
       tuples::ColumnRefAttr mappedCol = lookupSplitColumnByName(colByName, fullNameForColumnRef(colRef));
       if (!mappedCol) mappedCol = lookupSplitColumnByName(colByName, baseNameForColumnRef(colRef));
       assert(mappedCol && "split-materialize result column must exist on branch stream");
-      pairs.push_back({targetMembers[ordinal++], mappedCol});
+      return mappedCol;
+   };
+
+   llvm::StringMap<tuples::ColumnRefAttr> sourceByRole;
+   llvm::SmallVector<std::pair<unsigned, tuples::ColumnRefAttr>, 8> sourcePayloadsByOrdinal;
+   for (auto& [member, colRef] : sourceMapping.getMapping()) {
+      llvm::StringRef memberName = mm.getName(member);
+      if (std::optional<unsigned> ordinal = genericMemberOrdinal(memberName)) {
+         sourcePayloadsByOrdinal.push_back({*ordinal, colRef});
+         continue;
+      }
+      sourceByRole[stripReuseSuffix(memberName)] = colRef;
+   }
+   llvm::sort(sourcePayloadsByOrdinal, [](const auto& a, const auto& b) {
+      return a.first < b.first;
+   });
+
+   llvm::SmallVector<subop::RefMappingPairT> pairs;
+   unsigned ordinal = 0;
+   unsigned payloadOrdinal = 0;
+   for (subop::Member targetMember : targetMembers) {
+      tuples::ColumnRefAttr sourceCol;
+      llvm::StringRef targetName = mm.getName(targetMember);
+      if (genericMemberOrdinal(targetName)) {
+         assert(payloadOrdinal < sourcePayloadsByOrdinal.size() &&
+                "split-materialize target payload ordinal must exist in donor mapping");
+         sourceCol = sourcePayloadsByOrdinal[payloadOrdinal++].second;
+      } else if (auto it = sourceByRole.find(stripReuseSuffix(targetName)); it != sourceByRole.end()) {
+         sourceCol = it->second;
+      } else {
+         sourceCol = sourceMapping.getMapping()[ordinal].second;
+      }
+      pairs.push_back({targetMember, remapColumnToBranchStream(sourceCol)});
+      ++ordinal;
    }
    llvm::SmallVector<subop::RefMappingPairT> attrPairs;
    attrPairs.append(pairs.begin(), pairs.end());
@@ -3033,9 +3071,16 @@ static std::optional<mlir::Value> mergeInputForFinalState(mlir::ModuleOp module,
 
 static mlir::Value resolveSplitMaterializeBuildState(mlir::ModuleOp module, mlir::Value target,
                                                      const ModuleReuseInfo& reuse) {
-   if (auto itShadow = findReuseMap(reuse.mergedFromShadowState, target);
-       itShadow != reuse.mergedFromShadowState.end()) {
-      return itShadow->second;
+   mlir::Value cur = target;
+   llvm::DenseSet<mlir::Value> seen;
+   while (cur && seen.insert(canonicalizeStateValueForReuse(cur)).second) {
+      if (tryFindUniqueMaterializeStepWritingState(module, cur)) return cur;
+      if (auto itShadow = findReuseMap(reuse.mergedFromShadowState, cur);
+          itShadow != reuse.mergedFromShadowState.end()) {
+         cur = itShadow->second;
+         continue;
+      }
+      break;
    }
    if (tryFindUniqueMaterializeStepWritingState(module, target)) return target;
    if (std::optional<mlir::Value> mergeInput = mergeInputForFinalState(module, target)) return *mergeInput;
@@ -3897,6 +3942,11 @@ static llvm::DenseMap<unsigned, unsigned> assignReuseSlotsForGroup(
 
 static bool stateReuseSlotDumpEnabled() {
    const char* v = std::getenv("LINGODB_STATE_REUSE_DUMP_SLOTS");
+   return v && llvm::StringRef(v) != "0" && llvm::StringRef(v) != "false";
+}
+
+static bool forceJoinSplitMaterializeEnabled() {
+   const char* v = std::getenv("LINGODB_FORCE_JOIN_SPLIT_MATERIALIZE");
    return v && llvm::StringRef(v) != "0" && llvm::StringRef(v) != "false";
 }
 
@@ -4764,11 +4814,8 @@ static mlir::Value cloneMergeStepAfter(ExecutionStepOp afterStep,
 
 static std::optional<SplitResidualFilter>
 residualForOriginalMaterializeTarget(mlir::Value target, const ModuleReuseInfo& reuse) {
-   mlir::Value buildState = target;
-   if (auto itShadow = findReuseMap(reuse.mergedFromShadowState, target);
-       itShadow != reuse.mergedFromShadowState.end()) {
-      buildState = itShadow->second;
-   }
+   mlir::ModuleOp module = moduleForValue(target);
+   mlir::Value buildState = resolveSplitMaterializeBuildState(module, target, reuse);
    auto itWriter = findReuseMap(reuse.writerStepsByState, buildState);
    if (itWriter == reuse.writerStepsByState.end()) return std::nullopt;
    assert(itWriter->second.size() == 1 && "split-materialize target must have one materialize writer");
@@ -5452,11 +5499,8 @@ static SyntheticSplitStatePair materializeSyntheticSplitStateForEntry(
       return SyntheticSplitStatePair{syntheticFinalState, syntheticBuildState};
    }
 
-   mlir::Value entryBuildState = entryTarget;
-   if (auto itShadow = findReuseMap(entryReuse.mergedFromShadowState, entryTarget);
-       itShadow != entryReuse.mergedFromShadowState.end()) {
-      entryBuildState = itShadow->second;
-   }
+   mlir::Value entryBuildState =
+      resolveSplitMaterializeBuildState(moduleForValue(entryTarget), entryTarget, entryReuse);
    auto itCreate = findReuseMap(entryReuse.createOnlyStepForState, entryBuildState);
    assert(itCreate != entryReuse.createOnlyStepForState.end() &&
           "split peer build state needs a create-only step");
@@ -5465,12 +5509,32 @@ static SyntheticSplitStatePair materializeSyntheticSplitStateForEntry(
    if (canonicalizeStateValueForReuse(entryBuildState) == canonicalizeStateValueForReuse(entryTarget)) {
       syntheticFinalState = syntheticBuildState;
    } else {
-      auto itMerge = findReuseMap(entryReuse.writerStepsByState, entryTarget);
-      assert(itMerge != entryReuse.writerStepsByState.end() && itMerge->second.size() == 1 &&
-             "split peer final state needs one merge writer");
-      syntheticFinalState =
-         cloneMergeStepAfter(insertCreateBeforeStep, itMerge->second.front(), entryBuildState,
-                             syntheticBuildState, entryTarget);
+      llvm::SmallVector<mlir::Value, 4> statesToClone;
+      mlir::Value cur = entryTarget;
+      while (canonicalizeStateValueForReuse(cur) != canonicalizeStateValueForReuse(entryBuildState)) {
+         statesToClone.push_back(cur);
+         auto itShadow = findReuseMap(entryReuse.mergedFromShadowState, cur);
+         assert(itShadow != entryReuse.mergedFromShadowState.end() &&
+                "split peer final state must be reachable from its build state through shadow links");
+         cur = itShadow->second;
+      }
+      std::reverse(statesToClone.begin(), statesToClone.end());
+
+      ExecutionStepOp insertAfterStep = insertCreateBeforeStep;
+      mlir::Value originalState = entryBuildState;
+      mlir::Value syntheticState = syntheticBuildState;
+      for (mlir::Value nextState : statesToClone) {
+         auto itWriter = findReuseMap(entryReuse.writerStepsByState, nextState);
+         assert(itWriter != entryReuse.writerStepsByState.end() && itWriter->second.size() == 1 &&
+                "split peer shadow-chain state needs one writer");
+         syntheticState = cloneMergeStepAfter(insertAfterStep, itWriter->second.front(), originalState,
+                                              syntheticState, nextState);
+         auto clonedStep = mlir::dyn_cast_or_null<ExecutionStepOp>(syntheticState.getDefiningOp());
+         assert(clonedStep && "split peer cloned shadow-chain writer must be an execution_step result");
+         insertAfterStep = clonedStep;
+         originalState = nextState;
+      }
+      syntheticFinalState = syntheticState;
    }
    return SyntheticSplitStatePair{syntheticFinalState, syntheticBuildState};
 }
@@ -5779,7 +5843,17 @@ static GroupRewriteDecision decideGroupRewrite(
       }
       if (donorBetterThanCurrent(e)) decision.donor = e.entry;
    }
-   if (group.requiresJoinLayoutUnion || group.requiresBufferScanRefsUnion) decision.usesSplitMaterialize = false;
+   bool forceJoinSplitMaterialize =
+      forceJoinSplitMaterializeEnabled() &&
+      llvm::any_of(entries, [](const ResolvedBatchGroupEntry& e) {
+          return mlir::isa<subop::HashIndexedViewType>(e.targetState.getType());
+      });
+   if (forceJoinSplitMaterialize) {
+      decision.usesSplitMaterialize = true;
+   }
+   if (!forceJoinSplitMaterialize &&
+       (group.requiresJoinLayoutUnion || group.requiresBufferScanRefsUnion))
+      decision.usesSplitMaterialize = false;
    if (decision.unsupported) return decision;
 
    if (decision.usesSplitMaterialize && !group.requiresSplitMaterialize) {
@@ -5900,6 +5974,13 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
       GroupRewriteDecision decision = decideGroupRewrite(g, resolvedEntries, queries, reuseEarly);
       if (decision.unsupported) continue;
       if (!decision.donor) continue;
+      if (decision.usesSplitMaterialize &&
+          llvm::any_of(resolvedEntries, [](const ResolvedBatchGroupEntry& e) {
+             return mlir::isa<subop::HashIndexedViewType>(e.targetState.getType());
+          })) {
+         flags.enableFilterPredReuse = false;
+         flags.requiresJoinLayoutUnion = false;
+      }
 
       mlir::Value donorTargetState;
       for (const ResolvedBatchGroupEntry& entry : resolvedEntries) {
