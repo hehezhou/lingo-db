@@ -3950,6 +3950,11 @@ static bool forceJoinSplitMaterializeEnabled() {
    return v && llvm::StringRef(v) != "0" && llvm::StringRef(v) != "false";
 }
 
+static bool stateReuseCardinalityDebugEnabled() {
+   const char* v = std::getenv("LINGODB_STATE_REUSE_DEBUG_CE");
+   return v && llvm::StringRef(v) != "0" && llvm::StringRef(v) != "false";
+}
+
 static void dumpReuseSlotAssignmentForGroup(
    const ReuseRewriteContext& rewriteCtx,
    const CrossQueryStateMatchGroup& group,
@@ -5946,7 +5951,6 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
    lingodb::catalog::Catalog* catalog,
    const CachedJoinBufferLayoutsByKey* priorJoinLayouts,
    unsigned rewriteIteration) {
-   (void)catalog;
    assert(queries.size() >= 2 && "batch reuse needs at least two queries");
 
    BatchReusePlanRewriteResult res;
@@ -5955,6 +5959,7 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
    llvm::SmallVector<ModuleReuseInfo, 8> reuseEarly;
    reuseEarly.reserve(queries.size());
    for (mlir::ModuleOp q : queries) reuseEarly.push_back(collectModuleReuseInfo(q));
+   bool debugCardinalityEstimation = catalog && stateReuseCardinalityDebugEnabled();
 
    llvm::SmallVector<llvm::SmallVector<CacheTarget, 16>, 8> targetsByQuery(queries.size());
    llvm::SmallVector<BatchDonorGroup, 32> donorGroups;
@@ -5971,6 +5976,19 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
       if (resolvedEntries.size() < 2) continue;
       EffectiveGroupRewriteFlags flags =
          computeEffectiveGroupRewriteFlags(g, resolvedEntries, queries, reuseEarly, rewriteCtx);
+      if (debugCardinalityEstimation) {
+         std::optional<HivSourceTableCardinalityEstimate> ce =
+            estimateMergedHivExternalFilterRowsForGroup(queries, g, reuseEarly, *catalog);
+         if (ce) {
+            llvm::errs() << "// state_reuse_ce cache_key=" << g.cacheKey
+                         << " table=" << ce->tableName
+                         << " sources=" << ce->sourceCount
+                         << " estimated_rows=" << ce->estimatedRows << "\n";
+         } else {
+            llvm::errs() << "// state_reuse_ce cache_key=" << g.cacheKey
+                         << " skipped=unsupported_source_table_hiv_group\n";
+         }
+      }
       GroupRewriteDecision decision = decideGroupRewrite(g, resolvedEntries, queries, reuseEarly);
       if (decision.unsupported) continue;
       if (!decision.donor) continue;

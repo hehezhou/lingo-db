@@ -10,6 +10,7 @@
 #include "llvm/ADT/StringSet.h"
 
 #include <optional>
+#include <string>
 
 namespace lingodb::catalog {
 class Catalog;
@@ -69,6 +70,20 @@ double estimateMergedHivExternalFilterRows(mlir::ModuleOp query0, mlir::ModuleOp
                                            mlir::Value hivB, const ModuleReuseInfo& reuse0,
                                            const ModuleReuseInfo& reuse1,
                                            lingodb::catalog::Catalog& catalog);
+
+struct HivSourceTableCardinalityEstimate {
+   std::string tableName;
+   unsigned sourceCount = 0;
+   double estimatedRows = 0.0;
+};
+
+/// Batch form of \c estimateMergedHivExternalFilterRows. Only supports HIV builds that scan one external
+/// source table directly; cached-source and multi-source builds are intentionally skipped.
+std::optional<HivSourceTableCardinalityEstimate> estimateMergedHivExternalFilterRowsForGroup(
+   llvm::ArrayRef<mlir::ModuleOp> queries,
+   const CrossQueryStateMatchGroup& group,
+   llvm::ArrayRef<ModuleReuseInfo> reuseInfos,
+   lingodb::catalog::Catalog& catalog);
 
 /// Current aggregate union rewrite supports a single top-level reduce build step. Nested aggregate builds
 /// require explicit tuple-column threading before they can be safely reused across disjoint filters.
