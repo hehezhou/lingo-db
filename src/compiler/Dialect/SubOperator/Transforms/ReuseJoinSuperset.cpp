@@ -8466,6 +8466,57 @@ std::optional<HivSourceTableCardinalityEstimate> estimateMergedHivExternalFilter
    return estimate;
 }
 
+std::optional<AggregateSourceTableCardinalityEstimate> estimateMergedAggregateExternalFilterRowsForGroup(
+   llvm::ArrayRef<mlir::ModuleOp> queries,
+   const CrossQueryStateMatchGroup& group,
+   llvm::ArrayRef<ModuleReuseInfo> reuseInfos,
+   lingodb::catalog::Catalog& catalog) {
+   llvm::SmallVector<ExternalDatasourceProperty, 8> sources;
+   llvm::SmallVector<mlir::Operation*, 8> maps;
+   llvm::SmallVector<mlir::Operation*, 8> filters;
+   std::string tableName;
+
+   for (const CrossQueryStateMatchEntry& entry : group.entries) {
+      if (entry.query < 0 || static_cast<size_t>(entry.query) >= queries.size() ||
+          static_cast<size_t>(entry.query) >= reuseInfos.size() || !entry.state)
+         return std::nullopt;
+      const ModuleReuseInfo& reuse = reuseInfos[entry.query];
+      mlir::Value target = resolveCacheTargetStateForReuse(entry.state, reuse);
+      if (!target || !mlir::isa<subop::PreAggrHtType>(target.getType())) return std::nullopt;
+
+      subop::ExecutionStepOp buildStep = tryFindAggregateBuildStepForHt(entry.state, reuse);
+      if (!buildStep) return std::nullopt;
+      subop::ScanRefsOp scanOp = findUniqueTableScanRefsInStep(buildStep);
+      if (!scanOp || !mlir::isa<subop::TableType>(scanOp.getState().getType())) return std::nullopt;
+
+      llvm::StringRef resolvedTableName;
+      ExternalDatasourceProperty ds;
+      bool haveDs = false;
+      subop::TableType tableTy;
+      if (!resolveScannedTableExternal(buildStep, scanOp.getState(), reuse, resolvedTableName, ds, haveDs,
+                                       tableTy) ||
+          !haveDs)
+         return std::nullopt;
+      if (tableName.empty()) {
+         tableName = resolvedTableName.str();
+      } else if (resolvedTableName != tableName) {
+         return std::nullopt;
+      }
+
+      auto residual = findResidualTableFilterInBuildStep(buildStep);
+      sources.push_back(ds);
+      maps.push_back(residual ? residual->predMap.getOperation() : nullptr);
+      filters.push_back(residual ? residual->filter.getOperation() : nullptr);
+   }
+
+   if (sources.size() < 2 || tableName.empty()) return std::nullopt;
+   AggregateSourceTableCardinalityEstimate estimate;
+   estimate.tableName = std::move(tableName);
+   estimate.sourceCount = static_cast<unsigned>(sources.size());
+   estimate.estimatedRows = relalg::estimateExternalDatasourceOrRowsFromSample(sources, catalog, maps, filters);
+   return estimate;
+}
+
 bool parseReuseFilterPredSemanticKey(llvm::StringRef semanticKey, unsigned& reuseQueryIndex) {
    size_t sep = semanticKey.find('\x1f');
    if (sep == llvm::StringRef::npos) return false;

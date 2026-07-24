@@ -85,6 +85,20 @@ std::optional<HivSourceTableCardinalityEstimate> estimateMergedHivExternalFilter
    llvm::ArrayRef<ModuleReuseInfo> reuseInfos,
    lingodb::catalog::Catalog& catalog);
 
+struct AggregateSourceTableCardinalityEstimate {
+   std::string tableName;
+   unsigned sourceCount = 0;
+   double estimatedRows = 0.0;
+};
+
+/// Batch aggregate-source CE. Only supports aggregate hash-table builds whose input is one directly
+/// scanned external source table.
+std::optional<AggregateSourceTableCardinalityEstimate> estimateMergedAggregateExternalFilterRowsForGroup(
+   llvm::ArrayRef<mlir::ModuleOp> queries,
+   const CrossQueryStateMatchGroup& group,
+   llvm::ArrayRef<ModuleReuseInfo> reuseInfos,
+   lingodb::catalog::Catalog& catalog);
+
 /// Current aggregate union rewrite supports a single top-level reduce build step. Nested aggregate builds
 /// require explicit tuple-column threading before they can be safely reused across disjoint filters.
 bool aggregateHashTablePayloadUnionSupported(mlir::Value aggregateState, const ModuleReuseInfo& reuse);

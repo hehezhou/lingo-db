@@ -69,7 +69,7 @@ static StateReuseMatchOptions readStateReuseMatchOptions() {
    options.disableAggregateDisjointClustering =
       std::getenv("LINGODB_DISABLE_AGGREGATE_DISJOINT_CLUSTERING") != nullptr;
    options.allowAggregateUnionRewrite =
-      std::getenv("LINGODB_ALLOW_AGGREGATE_UNION_REWRITE") != nullptr;
+      std::getenv("LINGODB_DISABLE_AGGREGATE_UNION_REWRITE") == nullptr;
    return options;
 }
 

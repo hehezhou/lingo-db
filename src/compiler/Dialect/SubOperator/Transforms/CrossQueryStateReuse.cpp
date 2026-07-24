@@ -3955,6 +3955,8 @@ static bool stateReuseCardinalityDebugEnabled() {
    return v && llvm::StringRef(v) != "0" && llvm::StringRef(v) != "false";
 }
 
+static constexpr double kAggregateSplitMaterializeCardinalityThreshold = 1'000'000.0;
+
 static void dumpReuseSlotAssignmentForGroup(
    const ReuseRewriteContext& rewriteCtx,
    const CrossQueryStateMatchGroup& group,
@@ -5804,7 +5806,8 @@ static GroupRewriteDecision decideGroupRewrite(
    const CrossQueryStateMatchGroup& group,
    llvm::ArrayRef<ResolvedBatchGroupEntry> entries,
    llvm::ArrayRef<mlir::ModuleOp> queries,
-   llvm::ArrayRef<ModuleReuseInfo> reuseEarly) {
+   llvm::ArrayRef<ModuleReuseInfo> reuseEarly,
+   const std::optional<AggregateSourceTableCardinalityEstimate>& aggregateCe) {
    GroupRewriteDecision decision;
    decision.usesSplitMaterialize = group.requiresSplitMaterialize;
    auto joinUnionDonorScore = [](mlir::Value state) -> unsigned {
@@ -5847,6 +5850,10 @@ static GroupRewriteDecision decideGroupRewrite(
          }
       }
       if (donorBetterThanCurrent(e)) decision.donor = e.entry;
+   }
+   if (aggregateCe &&
+       aggregateCe->estimatedRows > kAggregateSplitMaterializeCardinalityThreshold) {
+      decision.usesSplitMaterialize = true;
    }
    bool forceJoinSplitMaterialize =
       forceJoinSplitMaterializeEnabled() &&
@@ -5976,20 +5983,38 @@ static BatchReusePlanRewriteResult rewritePlansWithSyntheticQueryBatchOnce(
       if (resolvedEntries.size() < 2) continue;
       EffectiveGroupRewriteFlags flags =
          computeEffectiveGroupRewriteFlags(g, resolvedEntries, queries, reuseEarly, rewriteCtx);
+      std::optional<AggregateSourceTableCardinalityEstimate> aggregateCe;
+      if (catalog) {
+         aggregateCe = estimateMergedAggregateExternalFilterRowsForGroup(queries, g, reuseEarly, *catalog);
+      }
       if (debugCardinalityEstimation) {
-         std::optional<HivSourceTableCardinalityEstimate> ce =
-            estimateMergedHivExternalFilterRowsForGroup(queries, g, reuseEarly, *catalog);
-         if (ce) {
+         if (aggregateCe) {
             llvm::errs() << "// state_reuse_ce cache_key=" << g.cacheKey
-                         << " table=" << ce->tableName
-                         << " sources=" << ce->sourceCount
-                         << " estimated_rows=" << ce->estimatedRows << "\n";
+                         << " kind=aggregate"
+                         << " table=" << aggregateCe->tableName
+                         << " sources=" << aggregateCe->sourceCount
+                         << " estimated_rows=" << aggregateCe->estimatedRows
+                         << " force_split="
+                         << (aggregateCe->estimatedRows > kAggregateSplitMaterializeCardinalityThreshold
+                                ? "true"
+                                : "false")
+                         << "\n";
          } else {
-            llvm::errs() << "// state_reuse_ce cache_key=" << g.cacheKey
-                         << " skipped=unsupported_source_table_hiv_group\n";
+            std::optional<HivSourceTableCardinalityEstimate> ce =
+               estimateMergedHivExternalFilterRowsForGroup(queries, g, reuseEarly, *catalog);
+            if (ce) {
+               llvm::errs() << "// state_reuse_ce cache_key=" << g.cacheKey
+                            << " kind=hiv"
+                            << " table=" << ce->tableName
+                            << " sources=" << ce->sourceCount
+                            << " estimated_rows=" << ce->estimatedRows << "\n";
+            } else {
+               llvm::errs() << "// state_reuse_ce cache_key=" << g.cacheKey
+                            << " skipped=unsupported_source_table_group\n";
+            }
          }
       }
-      GroupRewriteDecision decision = decideGroupRewrite(g, resolvedEntries, queries, reuseEarly);
+      GroupRewriteDecision decision = decideGroupRewrite(g, resolvedEntries, queries, reuseEarly, aggregateCe);
       if (decision.unsupported) continue;
       if (!decision.donor) continue;
       if (decision.usesSplitMaterialize &&
